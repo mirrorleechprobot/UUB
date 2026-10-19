@@ -1,4 +1,4 @@
 Pyrogram==2.0.106
 TgCrypto
-yt-dlp
+yt-dlp[default,curl-cffi]
 requests>=2.31.0

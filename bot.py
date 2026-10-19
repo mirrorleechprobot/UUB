@@ -1,31 +1,105 @@
 import asyncio
-import http.cookiejar
+import html
+import itertools
 import logging
-import mimetypes
-import tempfile
-import os
 import re
+import secrets
+import shutil
+import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
 
 import requests
 import yt_dlp
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelInvalid, ChatWriteForbidden
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
+import downloader as dl
+import store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("url-uploader")
+
 DOWNLOAD_DIR = Path(config.DOWNLOAD_DIR).resolve()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-job_queue = asyncio.Queue()
-state = {"busy": False, "ready": False}
-LOG_DESTINATION = config.LOG_CHANNEL_ID
+Path(config.DATA_DIR).mkdir(parents=True, exist_ok=True)
 
+POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="uub")
+state = {"ready": False, "bot_id": 0, "log_ok": False}
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+PENDING_TTL = 30 * 60
+
+
+# =============================================================================== helpers
+
+def esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def size_text(value):
+    if value is None:
+        return "Unknown"
+    value = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PB"
+
+
+def time_text(seconds):
+    if seconds is None:
+        return "Calculating..."
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+
+
+def date_text(ts):
+    return "Lifetime" if not ts else time.strftime("%d %b %Y", time.gmtime(ts)) + " (UTC)"
+
+
+def progress_text(job, stage, title, current, total, speed, eta, elapsed):
+    percent = min(100, current * 100 / total) if total else 0
+    filled = max(0, min(20, int(percent / 5)))
+    bar = "█" * filled + "░" * (20 - filled)
+    icon = "📥" if stage == "Downloading" else "📤"
+    extra = f" ({job.part_label})" if stage == "Uploading" and job.part_label else ""
+    return (f"{icon} <b>{stage}</b>{extra}  •  #{job.id}\n\n🎬 {esc(title[:130])}\n\n"
+            f"<code>{bar}</code> {percent:.1f}%\n"
+            f"📦 {size_text(current)} / {size_text(total) if total else '?'}\n"
+            f"⚡ Speed: {size_text(speed)}/s\n⏳ ETA: {time_text(eta)}\n"
+            f"🕒 Elapsed: {time_text(elapsed)}")
+
+
+def cancel_markup(job):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cx:{job.id}")]])
+
+
+async def edit_safely(message, text, markup=None):
+    for attempt in range(2):
+        try:
+            await message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+            return
+        except FloodWait as exc:
+            if attempt:
+                return
+            await asyncio.sleep(exc.value)
+        except Exception as exc:  # noqa: BLE001
+            if "MESSAGE_NOT_MODIFIED" not in str(exc):
+                log.debug("edit skipped: %s", exc)
+            return
+
+
+# =============================================================================== health server
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -50,541 +124,605 @@ def start_health_server():
     log.info("Health server listening on 0.0.0.0:%s", config.PORT)
 
 
-def size_text(value):
-    if value is None:
-        return "Unknown"
-    value = float(value)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024:
-            return f"{value:.2f} {unit}"
-        value /= 1024
-    return f"{value:.2f} PB"
+# =============================================================================== Bot API (log channel)
+# The log channel is handled through the Bot API (sendMessage / copyMessage). Unlike MTProto it needs no
+# cached channel access_hash, so "PEER_ID_INVALID" can no longer break logging. Files are *copied* from the
+# user's chat into the log channel (server-side, no second upload => saves time and bandwidth).
+
+_last_log_error = {"text": None}
 
 
-def time_text(seconds):
-    if seconds is None:
-        return "Calculating..."
-    seconds = max(0, int(seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
-
-
-def progress_text(stage, title, current, total, speed, eta, elapsed):
-    percent = min(100, current * 100 / total) if total else 0
-    filled = max(0, min(20, int(percent / 5)))
-    bar = "█" * filled + "░" * (20 - filled)
-    icon = "📥" if stage == "Downloading" else "📤"
-    return (f"{icon} {stage}\n\n🎬 {title[:130]}\n\n{bar} {percent:.1f}%\n"
-            f"📦 {size_text(current)} / {size_text(total)}\n"
-            f"⚡ Speed: {size_text(speed)}/s\n⏳ ETA: {time_text(eta)}\n"
-            f"🕒 Elapsed: {time_text(elapsed)}\n🔄 Refresh: {config.PROGRESS_UPDATE_INTERVAL}s")
-
-
-async def edit_safely(message, text):
+def _bot_api_sync(method, data):
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
     try:
-        await message.edit_text(text)
-    except FloodWait as exc:
-        await asyncio.sleep(exc.value)
+        r = requests.post(url, data=data, timeout=40)
         try:
-            await message.edit_text(text)
-        except Exception:
-            pass
-    except Exception as exc:
-        if "MESSAGE_NOT_MODIFIED" not in str(exc):
-            log.debug("Progress update skipped: %s", exc)
+            return r.json()
+        except ValueError:
+            return {"ok": False, "description": f"HTTP {r.status_code}"}
+    except Exception as exc:  # noqa: BLE001  (never print exc: its text contains the token URL)
+        return {"ok": False, "description": f"network error: {type(exc).__name__}"}
+
+
+async def bot_api(method, **data):
+    return await asyncio.get_running_loop().run_in_executor(POOL, _bot_api_sync, method, data)
+
+
+def explain_log_error(description):
+    d = (description or "").lower()
+    if "chat not found" in d:
+        return ("Channel nahi mila. LOG_CHANNEL_ID galat hai, ya bot channel me add nahi hai. "
+                "ID -100xxxxxxxxxx format me honi chahiye (channel ka koi message @userinfobot / @getidsbot ko forward karke check karein).")
+    if "not enough rights" in d or "have no rights" in d or "administrator" in d or "forbidden" in d:
+        return "Bot ko channel me Admin banao aur 'Post Messages' permission do."
+    if "kicked" in d or "not a member" in d:
+        return "Bot channel se remove/ban hai. Use dobara Admin ke roop me add karein."
+    return description or "unknown error"
 
 
 async def send_log(text):
-    """Send text logs via Telegram Bot API first; this avoids Pyrogram peer-cache errors.
+    if not config.LOG_CHANNEL_ID:
+        return False
+    for i in range(0, len(text), 4000):
+        r = await bot_api("sendMessage", chat_id=str(config.LOG_CHANNEL_ID), text=text[i:i + 4000],
+                          disable_web_page_preview="true")
+        if not r.get("ok"):
+            desc = explain_log_error(r.get("description"))
+            if desc != _last_log_error["text"]:
+                log.error("Log channel send failed: %s", desc)
+                _last_log_error["text"] = desc
+            return False
+    _last_log_error["text"] = None
+    return True
 
-    Bot API accepts a private channel's numeric chat_id directly when the bot has
-    access, while Pyrogram MTProto may need the channel access_hash cached first.
-    """
-    api_url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": str(LOG_DESTINATION), "text": text, "disable_web_page_preview": True}
-    try:
-        response = await asyncio.to_thread(requests.post, api_url, data=payload, timeout=25)
-        data = response.json()
-        if response.ok and data.get("ok"):
-            return True
-        log.error("Bot API log-channel send failed: %s", data.get("description", response.status_code))
-    except Exception as exc:
-        log.warning("Bot API log send raised %s; trying Pyrogram", type(exc).__name__)
-    try:
-        await app.send_message(LOG_DESTINATION, text)
+
+async def copy_to_log(job, sent_message, part_label=""):
+    """Server-side copy of the delivered file into the log channel (best effort, never fails the job)."""
+    if not config.LOG_CHANNEL_ID or sent_message is None:
+        return False
+    caption = (f"👤 {job.user_label}\n🔗 {job.url}\n🎬 {job.title}" + (f"\n📚 {part_label}" if part_label else ""))[:1000]
+    r = await bot_api("copyMessage", chat_id=str(config.LOG_CHANNEL_ID), from_chat_id=str(sent_message.chat.id),
+                      message_id=str(sent_message.id), caption=caption)
+    if r.get("ok"):
         return True
-    except FloodWait as exc:
-        await asyncio.sleep(exc.value)
-        try:
-            await app.send_message(LOG_DESTINATION, text)
-            return True
-        except Exception:
-            log.exception("Pyrogram log send failed after FloodWait")
-    except Exception as exc:
-        log.error("Cannot send to private log channel %s. Check numeric ID and bot admin/post permission: %s",
-                  LOG_DESTINATION, exc)
+    log.error("Copy to log channel failed: %s", explain_log_error(r.get("description")))
+    await send_log(f"⚠️ File log channel me copy nahi ho payi (job #{job.id}): {explain_log_error(r.get('description'))}")
     return False
 
 
-def effective_cookie_path():
-    """Return a usable cookie path; optionally materialize secret env content safely."""
-    configured = Path(config.COOKIE_FILE).expanduser()
-    if config.COOKIES_TEXT.strip():
-        # Do not print or log cookie contents. Restrict file permissions on Unix.
-        secret_path = Path(tempfile.gettempdir()) / "url-uploader-cookies.txt"
-        secret_path.write_text(config.COOKIES_TEXT.strip() + "\n", encoding="utf-8")
-        try:
-            secret_path.chmod(0o600)
-        except OSError:
-            pass
-        return secret_path
-    if configured.is_file() and configured.stat().st_size > 0:
-        return configured
-    return configured
+async def check_log_channel():
+    if not config.LOG_CHANNEL_ID:
+        return False, "LOG_CHANNEL_ID set nahi hai - log channel band hai."
+    r = await bot_api("getChat", chat_id=str(config.LOG_CHANNEL_ID))
+    if not r.get("ok"):
+        return False, explain_log_error(r.get("description"))
+    title = r["result"].get("title", "?")
+    m = await bot_api("getChatMember", chat_id=str(config.LOG_CHANNEL_ID), user_id=str(state["bot_id"]))
+    res = m.get("result") or {}
+    if res.get("status") not in ("administrator", "creator"):
+        return False, f"Channel '{title}' mil gaya par bot Admin nahi hai. Bot ko Admin banao (Post Messages permission)."
+    if res.get("status") == "administrator" and res.get("can_post_messages") is False:
+        return False, f"Bot ko '{title}' me 'Post Messages' permission chahiye."
+    return True, f"Log channel OK: {title}"
 
 
-def _load_cookie_jar(session):
-    cookie_path = effective_cookie_path()
-    if not cookie_path.is_file() or cookie_path.stat().st_size == 0:
+# =============================================================================== jobs
+
+class Job:
+    _ids = itertools.count(1)
+
+    def __init__(self, user, chat_id, url, mode, title, option=None, direct_name=None, direct_size=0):
+        self.id = next(Job._ids)
+        self.user_id = user.id
+        self.chat_id = chat_id
+        name = " ".join(x for x in (user.first_name, user.last_name) if x) or "User"
+        self.user_label = f"{name}" + (f" (@{user.username})" if user.username else "") + f" [{user.id}]"
+        self.url = url
+        self.mode = mode                      # "direct" | "media"
+        self.title = title
+        self.option = option or {"kind": "video", "height": 0, "label": "Best"}
+        self.direct_name = direct_name
+        self.direct_size = direct_size
+        self.cancel = threading.Event()
+        self.progress = {"status": "starting", "current": 0, "total": 0, "speed": 0, "eta": None}
+        self.status_msg = None
+        self.state = "queued"
+        self.part_label = ""
+
+
+jobs = {}                      # id -> Job (queued or running)
+waiting = []                   # queued jobs, in order
+job_queue = asyncio.Queue()
+pending = {}                   # token -> quality-selection session
+
+
+def user_jobs(uid):
+    return [j for j in jobs.values() if j.user_id == uid]
+
+
+async def enqueue(job, status_msg):
+    """Add a job to the queue. Returns False if the user's queue limit is hit."""
+    if not store.is_admin(job.user_id) and len(user_jobs(job.user_id)) >= config.MAX_QUEUE_PER_USER:
+        await edit_safely(status_msg, f"⚠️ Aapki queue full hai (max {config.MAX_QUEUE_PER_USER}). "
+                                      "Pehle wale jobs khatam hone do ya /queue se cancel karo.")
         return False
-    try:
-        jar = http.cookiejar.MozillaCookieJar(str(cookie_path))
-        jar.load(ignore_discard=True, ignore_expires=True)
-        session.cookies.update(jar)
-        return True
-    except Exception as exc:
-        log.warning("Could not load Netscape cookies for direct HTTP fallback: %s", exc)
-        return False
-
-
-def _safe_filename(name):
-    name = unquote(str(name or "download.bin")).replace("\\", "_").replace("/", "_")
-    name = re.sub(r'[\x00-\x1f<>:"|?*]', '_', name).strip(' .')
-    return (name[:180] or "download.bin")
-
-
-def direct_http_download(url, progress):
-    """Fallback downloader for direct file URLs when yt-dlp's Generic extractor fails.
-
-    Uses a browser-like User-Agent, optional Referer and Netscape cookies. Refuses
-    HTML/error pages so a 404 page is never uploaded as if it were a media file.
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": config.DIRECT_USER_AGENT,
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
-    })
-    if config.DIRECT_REFERER:
-        session.headers["Referer"] = config.DIRECT_REFERER
-    cookies_loaded = _load_cookie_jar(session)
-    try:
-        with session.get(url, stream=True, allow_redirects=True, timeout=(20, 60)) as response:
-            response.raise_for_status()
-            content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-            disposition = response.headers.get("Content-Disposition", "")
-            filename = ""
-            match = re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.I)
-            if match:
-                filename = unquote(match.group(1).strip().strip('"'))
-            else:
-                match = re.search(r'filename\s*=\s*"?([^";]+)', disposition, re.I)
-                if match:
-                    filename = unquote(match.group(1).strip())
-            if not filename:
-                filename = Path(urlparse(response.url).path).name
-            if not filename or filename in ("/", "."):
-                filename = "download"
-            if not Path(filename).suffix:
-                extension = mimetypes.guess_extension(content_type) or ".bin"
-                filename += extension
-            filename = _safe_filename(filename)
-            if content_type in ("text/html", "application/xhtml+xml") or "html" in content_type:
-                raise ValueError("Server returned an HTML page, not a downloadable file. Check Referer/cookies or use the actual media URL.")
-            total = int(response.headers.get("Content-Length") or 0)
-            target = DOWNLOAD_DIR / filename
-            if target.exists():
-                target = DOWNLOAD_DIR / f"{int(time.time())}_{filename}"
-            current = 0
-            progress.update({"status": "downloading", "current": 0, "total": total, "speed": 0, "eta": None})
-            started = time.monotonic()
-            last_bytes, last_time = 0, started
-            with target.open("wb") as output:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    output.write(chunk)
-                    current += len(chunk)
-                    now = time.monotonic()
-                    elapsed = now - last_time
-                    if elapsed >= 1:
-                        speed = (current - last_bytes) / elapsed
-                        last_bytes, last_time = current, now
-                        eta = (total - current) / speed if total and speed > 0 else None
-                        progress.update({"status": "downloading", "current": current, "total": total,
-                                         "speed": speed, "eta": eta})
-            if current == 0:
-                target.unlink(missing_ok=True)
-                raise ValueError("Server returned an empty file.")
-            if content_type.startswith("text/") and content_type not in ("text/vtt",):
-                target.unlink(missing_ok=True)
-                raise ValueError(f"Server returned unexpected content type: {content_type}")
-            progress.update({"status": "finished", "current": current, "total": total or current,
-                             "speed": 0, "eta": 0})
-            log.info("Direct HTTP download complete: %s (%s bytes; cookies=%s)", target.name, current, cookies_loaded)
-            return {"path": str(target), "title": target.name}
-    finally:
-        session.close()
-
-
-
-def is_admin(message):
-    return bool(message.from_user and message.from_user.id == config.ADMIN_ID)
-
-
-# Common direct-download extensions. Query strings (signed URLs) are ignored by urlparse().
-DIRECT_FILE_EXTENSIONS = (
-    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".wmv", ".ts", ".m2ts",
-    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma",
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg",
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".pdf", ".txt", ".csv",
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".apk", ".iso", ".epub"
-)
-
-
-def direct_file_url(url):
-    path = urlparse(url).path.lower()
-    return path.endswith(DIRECT_FILE_EXTENSIONS)
-
-
-def download_sync(url, progress):
-    def hook(data):
-        progress["status"] = data.get("status", progress["status"])
-        if data.get("status") == "downloading":
-            progress["current"] = data.get("downloaded_bytes") or 0
-            progress["total"] = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            progress["speed"] = data.get("speed") or 0
-            progress["eta"] = data.get("eta")
-        elif data.get("status") == "finished":
-            progress["status"] = "finished"
-
-    opts = {
-        "format": config.DOWNLOAD_QUALITY,
-        "outtmpl": str(DOWNLOAD_DIR / "%(title).180B [%(id)s].%(ext)s"),
-        "noplaylist": True,
-        "continuedl": True,
-        "retries": config.MAX_RETRIES,
-        "fragment_retries": config.MAX_RETRIES,
-        "file_access_retries": config.MAX_RETRIES,
-        "concurrent_fragment_downloads": 8,
-        # Do not rename containers by hand. yt-dlp keeps the source format where
-        # possible; merged separate streams use MKV for broad codec compatibility.
-        "merge_output_format": "mkv",
-        "progress_hooks": [hook],
-        "quiet": True,
-        "no_warnings": True,
-        "windowsfilenames": True,
-        "overwrites": False,
-        "socket_timeout": 30,
-    }
-    if direct_file_url(url):
-        opts["format"] = "best"
-
-    # Optional Netscape-format cookies.txt. Keep this file private and outside
-    # source control; no cookie contents are written to logs.
-    cookie_path = effective_cookie_path()
-    if cookie_path.is_file() and cookie_path.stat().st_size > 0:
-        opts["cookiefile"] = str(cookie_path.resolve())
-        log.info("yt-dlp cookie file enabled: %s", cookie_path.name)
+    job.status_msg = status_msg
+    jobs[job.id] = job
+    waiting.append(job)
+    await job_queue.put(job)
+    running = sum(1 for j in jobs.values() if j.state not in ("queued",))
+    if running < config.MAX_CONCURRENT_JOBS and len(waiting) == 1:
+        text = f"🚀 <b>Download start ho raha hai...</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
     else:
-        log.info("No cookie file found at %s; continuing without cookies", cookie_path)
-
-    # Try raw HTTP first for every URL. For ordinary webpage URLs this exits as
-    # soon as Content-Type reveals HTML, then yt-dlp handles the extractor. This
-    # also supports signed media URLs that do not end with .mp4/.mkv.
-    direct_error = None
-    try:
-        return direct_http_download(url, progress)
-    except Exception as exc:
-        direct_error = exc
-        log.info("Raw HTTP path not usable (%s); trying yt-dlp", type(exc).__name__)
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            prepared = Path(ydl.prepare_filename(info))
-            candidates = [prepared]
-            # yt-dlp may remux/merge the output and change its extension.
-            for extension in (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts",
-                              ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"):
-                candidates.append(prepared.with_suffix(extension))
-            candidates = [path for path in candidates if path.is_file()]
-            if not candidates:
-                candidates = [path for path in DOWNLOAD_DIR.glob(prepared.stem + ".*")
-                              if path.is_file() and not path.name.endswith((".part", ".ytdl"))]
-            if not candidates:
-                raise FileNotFoundError("Download ended but output file was not found")
-            final_path = max(candidates, key=lambda path: path.stat().st_size)
-            return {"path": str(final_path), "title": info.get("title") or final_path.name}
-    except Exception as ytdlp_error:
-        log.warning("yt-dlp failed (%s)", type(ytdlp_error).__name__)
-        raise RuntimeError(
-            "Download failed. HTTP attempt: " + str(direct_error)[:220] +
-            " | yt-dlp: " + str(ytdlp_error)[:260] +
-            ". If this URL works only in a browser, configure COOKIES_TEXT/cookies.txt and DIRECT_REFERER; "
-            "if the host returns 404/410, confirm the exact signed URL is still valid."
-        ) from ytdlp_error
+        text = (f"✅ <b>Queue me add ho gaya</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                f"⏳ Aapse pehle: {len(waiting) - 1} job(s)")
+    await edit_safely(status_msg, text, cancel_markup(job))
+    return True
 
 
-async def download_with_progress(url, status_message):
-    progress = {"status": "starting", "current": 0, "total": 0, "speed": 0, "eta": None}
-    started = time.monotonic()
-    task = asyncio.get_running_loop().run_in_executor(None, download_sync, url, progress)
-    last_update = 0
-    while not task.done():
-        now = time.monotonic()
-        if now - last_update >= config.PROGRESS_UPDATE_INTERVAL:
-            await edit_safely(status_message, progress_text(
-                "Downloading", "Preparing download", progress["current"], progress["total"],
-                progress["speed"], progress["eta"], now - started))
-            last_update = now
-        await asyncio.sleep(1)
-    result = await task
-    file_path = Path(result["path"])
-    size = file_path.stat().st_size
-    await edit_safely(status_message, progress_text(
-        "Downloading", result["title"], size, size, 0, 0, time.monotonic() - started))
-    return result
+def make_job_from_probe(user, chat_id, url, pr, option=None):
+    if pr["kind"] == "direct":
+        return Job(user, chat_id, url, "direct", pr["title"], direct_name=pr["filename"], direct_size=pr["size"])
+    return Job(user, chat_id, url, "media", pr["title"], option=option)
 
 
-async def upload_file(chat_id, file_path, title, status_message):
-    path = Path(file_path)
-    total = path.stat().st_size
-    loop = asyncio.get_running_loop()
-    state_upload = {"current": 0, "total": total, "speed": 0.0, "last_bytes": 0, "last_time": time.monotonic()}
-    started = time.monotonic()
-    stop_event = asyncio.Event()
+# --------------------------------------------------------------------------- upload
 
-    async def progress_reporter():
-        last_edit = 0.0
-        while not stop_event.is_set():
-            now = time.monotonic()
-            if now - last_edit >= config.PROGRESS_UPDATE_INTERVAL:
-                current = min(total, state_upload["current"])
-                speed = state_upload["speed"]
-                eta = (total - current) / speed if speed > 0 else None
-                await edit_safely(status_message, progress_text(
-                    "Uploading", title, current, total, speed, eta, now - started))
-                last_edit = now
+async def send_item(job, item, caption, cb):
+    path, thumb = str(item["path"]), (str(item["thumb"]) if item["thumb"] else None)
+    kind = item["kind"]
+    size = Path(path).stat().st_size
+    for attempt in range(2):
+        try:
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=1)
+                if kind == "video":
+                    return await app.send_video(job.chat_id, path, caption=caption, duration=item["duration"],
+                                                width=item["width"], height=item["height"], thumb=thumb,
+                                                supports_streaming=True, progress=cb)
+                if kind == "audio":
+                    return await app.send_audio(job.chat_id, path, caption=caption, duration=item["duration"],
+                                                performer=item["artist"] or None,
+                                                title=item["title"] or job.title[:60], progress=cb)
+                if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
+                    return await app.send_photo(job.chat_id, path, caption=caption, progress=cb)
+                return await app.send_document(job.chat_id, path, caption=caption, thumb=thumb, progress=cb)
+            except FloodWait:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if job.cancel.is_set() or kind in ("document",):
+                    raise
+                log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
+                return await app.send_document(job.chat_id, path, caption=caption, progress=cb)
+        except FloodWait as fw:
+            if attempt:
+                raise
+            await asyncio.sleep(fw.value)
+
+
+async def upload_item(job, item, started):
+    path = Path(item["path"])
+    total = path.stat().st_size
+    shared = {"current": 0, "speed": 0.0, "last_bytes": 0, "last_time": time.monotonic()}
+    stop = asyncio.Event()
+
+    def callback(current, total_bytes):
+        if job.cancel.is_set():
+            app.stop_transmission()
+        now = time.monotonic()
+        delta = now - shared["last_time"]
+        if delta >= 0.5:
+            shared["speed"] = max(0.0, current - shared["last_bytes"]) / delta
+            shared["last_bytes"], shared["last_time"] = current, now
+        shared["current"] = current
+
+    async def reporter():
+        last = 0.0
+        while not stop.is_set():
+            now = time.monotonic()
+            if now - last >= config.PROGRESS_UPDATE_INTERVAL:
+                cur, speed = min(total, shared["current"]), shared["speed"]
+                await edit_safely(job.status_msg, progress_text(
+                    job, "Uploading", job.title, cur, total, speed, (total - cur) / speed if speed > 0 else None,
+                    now - started), cancel_markup(job))
+                last = now
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
 
-    # Pyrogram expects a synchronous progress callback; an async callback is
-    # silently ignored by some versions. Update shared state from the callback.
-    def callback(current, total_bytes):
-        now = time.monotonic()
-        previous_time = state_upload["last_time"]
-        delta = now - previous_time
-        if delta >= 0.5:
-            state_upload["speed"] = max(0.0, current - state_upload["last_bytes"]) / delta
-            state_upload["last_bytes"] = current
-            state_upload["last_time"] = now
-        state_upload["current"] = current
-        state_upload["total"] = total_bytes or total
-
-    reporter = asyncio.create_task(progress_reporter())
+    caption = f"🎬 {esc(job.title[:200])}" + (f"\n📚 {job.part_label}" if job.part_label else "")
+    task = asyncio.create_task(reporter())
     try:
-        try:
-            if path.suffix.lower() == ".mp4":
-                result = await app.send_video(chat_id, str(path), caption=f"🎬 {title}",
-                                              supports_streaming=True, progress=callback)
-            else:
-                result = await app.send_document(chat_id, str(path), caption=f"📁 {title}", progress=callback)
-            state_upload["current"] = total
-            return result
-        except Exception as exc:
-            peer_error = isinstance(exc, (PeerIdInvalid, ChannelInvalid)) or "peer id invalid" in str(exc).lower() or "id not found" in str(exc).lower()
-            if not peer_error:
-                raise
-            # Bot API is a fallback only for small files; Bot API upload limit is
-            # lower than MTProto's, so larger files require /setlog peer warming.
-            if str(chat_id) == str(LOG_DESTINATION) and total <= 49 * 1024 * 1024:
-                log.warning("Pyrogram peer unavailable; trying Bot API file upload for small file (%s)", size_text(total))
-                method = "sendVideo" if path.suffix.lower() == ".mp4" else "sendDocument"
-                field = "video" if method == "sendVideo" else "document"
-                api_url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
-                def bot_api_upload():
-                    with path.open("rb") as file_obj:
-                        response = requests.post(api_url, data={"chat_id": str(chat_id), "caption": f"🎬 {title}"},
-                                                 files={field: (path.name, file_obj)}, timeout=(30, 300))
-                    try:
-                        data = response.json()
-                    except ValueError:
-                        data = {}
-                    if not response.ok or not data.get("ok"):
-                        # Never print the request URL; it contains the bot token.
-                        raise RuntimeError(data.get("description", f"Bot API upload failed with HTTP {response.status_code}"))
-                    return data
-                await asyncio.to_thread(bot_api_upload)
-                state_upload["current"] = total
-                return True
-            raise RuntimeError(
-                f"Cannot resolve private log channel peer for {size_text(total)} file. "
-                "Post /setlog in the private channel (bot must receive channel posts), then retry. "
-                f"Original error: {exc}"
-            ) from exc
+        sent = await send_item(job, item, caption, callback)
+        if sent is None or job.cancel.is_set():
+            raise dl.Cancelled()
+        return sent
     finally:
-        stop_event.set()
-        reporter.cancel()
+        stop.set()
+        task.cancel()
         try:
-            await reporter
+            await task
         except asyncio.CancelledError:
             pass
 
 
-async def process_job(message, url):
-    status_message = await message.reply_text("⏳ Processing URL...")
+# --------------------------------------------------------------------------- run one job
+
+async def run_job(job):
+    loop = asyncio.get_running_loop()
     started = time.monotonic()
-    downloaded = None
-    await send_log(f"🆕 URL queued\n👤 Admin ID: {message.from_user.id}\n🔗 {url}")
+    workdir = DOWNLOAD_DIR / f"job{job.id}_{int(time.time())}"
+    job.state = "downloading"
+    await send_log(f"🆕 Job #{job.id} start\n👤 {job.user_label}\n🔗 {job.url}\n🎞 {job.option.get('label', 'direct')}")
+    final_text = None
     try:
-        result = await download_with_progress(url, status_message)
-        downloaded = Path(result["path"])
-        title = result["title"]
-        size = downloaded.stat().st_size
-        await send_log(f"✅ Download complete\n🎬 {title}\n📦 {size_text(size)}")
+        # ---- download
+        await edit_safely(job.status_msg, progress_text(job, "Downloading", job.title, 0, job.direct_size, 0, None, 0),
+                          cancel_markup(job))
+        fut = loop.run_in_executor(POOL, dl.download, job, workdir)
+        last = time.monotonic()
+        while not fut.done():
+            await asyncio.wait({fut}, timeout=1)
+            now = time.monotonic()
+            if now - last >= config.PROGRESS_UPDATE_INTERVAL and not fut.done():
+                p = job.progress
+                await edit_safely(job.status_msg, progress_text(
+                    job, "Downloading", job.title, p["current"], p["total"], p["speed"], p["eta"], now - started),
+                    cancel_markup(job))
+                last = now
+        result = await fut
+        job.title = result["title"] or job.title
+        size = Path(result["path"]).stat().st_size
+        await send_log(f"✅ Download complete #{job.id}\n🎬 {job.title}\n📦 {size_text(size)}")
 
-        # Local file is retained unless both destinations succeed.
-        await upload_file(message.chat.id, str(downloaded), title, status_message)
-        await upload_file(LOG_DESTINATION, str(downloaded), title, status_message)
+        # ---- post-process (remux to mp4, thumbnail, split >2GB)
+        job.state = "processing"
+        await edit_safely(job.status_msg, f"⚙️ <b>Processing</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                                          f"📦 {size_text(size)}", cancel_markup(job))
+        items = await loop.run_in_executor(POOL, dl.prepare_upload, result["path"])
+        if job.cancel.is_set():
+            raise dl.Cancelled()
 
-        if config.AUTO_DELETE_AFTER_UPLOAD:
-            downloaded.unlink(missing_ok=True)
-            Path(str(downloaded) + ".part").unlink(missing_ok=True)
-            Path(str(downloaded) + ".ytdl").unlink(missing_ok=True)
+        # ---- upload (to the user) + server-side copy to the log channel
+        job.state = "uploading"
+        for i, item in enumerate(items, 1):
+            job.part_label = f"Part {i}/{len(items)}" if len(items) > 1 else ""
+            sent = await upload_item(job, item, started)
+            await copy_to_log(job, sent, job.part_label)
 
-        await edit_safely(status_message, f"✅ Completed\n\n🎬 {title}\n📦 {size_text(size)}\n"
-                                           f"🕒 Total time: {time_text(time.monotonic() - started)}\n"
-                                           "🧹 Server file cleaned.")
-        await send_log(f"✅ Delivered to admin and log channel\n🎬 {title}\n"
-                       f"📦 {size_text(size)}\n🕒 {time_text(time.monotonic() - started)}")
-    except Exception as exc:
-        log.exception("Job failed")
-        await edit_safely(status_message, f"❌ Job failed\n🔗 {url}\n⚠️ {str(exc)[:700]}\n"
-                                           "Downloaded files are retained where possible.")
-        await send_log(f"❌ Job failed\n🔗 {url}\n⚠️ {str(exc)[:700]}")
+        elapsed = time.monotonic() - started
+        final_text = (f"✅ <b>Completed</b>  •  #{job.id}\n\n🎬 {esc(job.title[:130])}\n📦 {size_text(size)}"
+                      + (f"\n📚 {len(items)} parts (Telegram 2GB limit)" if len(items) > 1 else "")
+                      + f"\n🕒 Total time: {time_text(elapsed)}")
+        await send_log(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
+    except dl.Cancelled:
+        final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
+        await send_log(f"🚫 Job #{job.id} cancelled by user\n👤 {job.user_label}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Job #%s failed", job.id)
+        final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
+        await send_log(f"❌ Job #{job.id} failed\n👤 {job.user_label}\n🔗 {job.url}\n⚠️ {str(exc)[:700]}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)   # always clean: failed jobs must not fill the disk
+    if final_text:
+        await edit_safely(job.status_msg, final_text)
 
 
 async def queue_worker():
     while True:
-        message, url = await job_queue.get()
-        state["busy"] = True
+        job = await job_queue.get()
+        if job in waiting:
+            waiting.remove(job)
         try:
-            await process_job(message, url)
+            if job.cancel.is_set():
+                await edit_safely(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
+            else:
+                await run_job(job)
+        except Exception:  # noqa: BLE001
+            log.exception("worker error")
         finally:
-            state["busy"] = False
+            job.state = "done"
+            jobs.pop(job.id, None)
             job_queue.task_done()
 
 
-app = Client("url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH,
-             bot_token=config.BOT_TOKEN, workers=4)
+# =============================================================================== Telegram app
+
+_kwargs = dict(name="url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
+               workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=60)
+try:
+    app = Client(**_kwargs, max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS)
+except TypeError:      # very old Pyrogram without this option
+    app = Client(**_kwargs)
 
 
-@app.on_message(filters.command("start"))
-async def start_handler(_, message):
-    if not is_admin(message):
-        return
-    await message.reply_text("🚀 URL Uploader Bot ready. Send a direct file URL or a URL supported by yt-dlp.\n"
-                             "📥 Best quality • 📤 Auto upload • 📊 10s progress\n"
-                             "Commands: /queue /status")
+async def deny(message):
+    await message.reply_text(
+        "🔒 <b>Ye bot sirf Premium users aur Admin ke liye hai.</b>\n\n"
+        f"Aapki Telegram ID: <code>{message.from_user.id}</code>\n"
+        "Premium lene ke liye Admin ko ye ID bhejo.")
 
 
-@app.on_message(filters.command(["queue", "status"]))
-async def status_handler(_, message):
-    if not is_admin(message):
-        return
-    await message.reply_text(f"📌 Status: {'Processing' if state['busy'] else 'Idle'}\n"
-                             f"📋 Waiting jobs: {job_queue.qsize()}\n⚙️ One URL at a time")
-
-
-@app.on_message(filters.text & ~filters.command(["start", "queue", "status"]))
-async def url_handler(_, message):
-    if not is_admin(message):
-        return
-    url = (message.text or "").strip()
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        await message.reply_text("❌ Please send a valid HTTP/HTTPS URL.")
-        return
-    await job_queue.put((message, url))
-    await message.reply_text(f"✅ Added to queue.\n⏳ Waiting jobs: {job_queue.qsize()}")
-
-
-@app.on_message(filters.command("setlog"))
-async def setlog_handler(_, message):
-    """Warm peer cache from a channel post or an admin-forwarded channel message."""
-    global LOG_DESTINATION
-    if message.chat and str(message.chat.type).lower().endswith("channel"):
-        # Channel posts can only be made by channel admins. Accept the configured
-        # target channel and use its full Chat object to warm Pyrogram's peer cache.
-        if message.chat.id != config.LOG_CHANNEL_ID:
+def allowed_only(func):
+    async def wrapper(client, message):
+        if not message.from_user:
             return
-        LOG_DESTINATION = message.chat.id
-        try:
-            await app.send_message(LOG_DESTINATION, "✅ Log channel peer initialized by /setlog.")
-            await message.reply_text("✅ Private log channel initialized.")
-        except Exception as exc:
-            log.exception("/setlog could not send to configured channel: %s", type(exc).__name__)
-        return
+        if not store.is_allowed(message.from_user.id):
+            return await deny(message)
+        return await func(client, message)
+    return wrapper
 
-    if not is_admin(message):
-        return
-    forwarded_chat = getattr(message, "forward_from_chat", None)
-    if forwarded_chat is None and message.reply_to_message is not None:
-        forwarded_chat = getattr(message.reply_to_message, "forward_from_chat", None)
-    if forwarded_chat is None:
-        await message.reply_text(
-            "Forward a message from the private log channel to me, then reply to that forwarded message with /setlog, "
-            "or post /setlog directly in the configured channel."
-        )
-        return
-    LOG_DESTINATION = forwarded_chat.id
+
+def admin_only(func):
+    async def wrapper(client, message):
+        if message.from_user and store.is_admin(message.from_user.id):
+            return await func(client, message)
+    return wrapper
+
+
+PRIVATE = filters.private
+
+
+@app.on_message(PRIVATE & filters.command("id"))
+async def id_handler(_, message):
+    await message.reply_text(f"🆔 Aapki ID: <code>{message.from_user.id}</code>")
+
+
+@app.on_message(PRIVATE & filters.command(["start", "help"]))
+@allowed_only
+async def start_handler(_, message):
+    text = ("🚀 <b>URL Uploader Bot</b>\n\n"
+            "Koi bhi link bhejo:\n"
+            "• <b>Direct file link</b> → turant download + upload start\n"
+            "• <b>Video/Audio site link</b> (YouTube, Instagram, Twitter/X, Facebook, TikTok, Vimeo, "
+            "Dailymotion, Reddit, Twitch, SoundCloud + 1800 sites) → quality buttons aayenge, "
+            "click karte hi queue me add\n\n"
+            "🎬 Har quality • 🎵 MP3/M4A • 📚 2GB+ file auto-split • ⚡ Multi-connection fast download\n\n"
+            "Commands: /queue  /cancel  /myplan  /id")
+    if store.is_admin(message.from_user.id):
+        text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (ya user ke message par reply)\n"
+                 "/removepremium <code>id</code>\n/premiumlist\n/testlog\n/update (yt-dlp update)\n/restart")
+    await message.reply_text(text)
+
+
+@app.on_message(PRIVATE & filters.command("myplan"))
+@allowed_only
+async def myplan_handler(_, message):
+    uid = message.from_user.id
+    if store.is_admin(uid):
+        return await message.reply_text("👑 Aap <b>Admin</b> ho: unlimited access.")
+    rec = store.premium_info(uid)
+    await message.reply_text(f"💎 <b>Premium active</b>\n📅 Expiry: {date_text(rec.get('expires'))}")
+
+
+@app.on_message(PRIVATE & filters.command(["queue", "status"]))
+@allowed_only
+async def status_handler(_, message):
+    mine = user_jobs(message.from_user.id)
+    lines = [f"📋 Total waiting: {len(waiting)} • Running: {sum(1 for j in jobs.values() if j.state not in ('queued',))}"
+             f"/{config.MAX_CONCURRENT_JOBS}"]
+    if not mine:
+        lines.append("\nAapka koi active job nahi hai.")
+    for j in mine:
+        lines.append(f"\n#{j.id} • {esc(j.state)} • {esc(j.title[:60])}")
+    buttons = [[InlineKeyboardButton(f"❌ Cancel #{j.id}", callback_data=f"cx:{j.id}")] for j in mine[:8]]
+    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+
+@app.on_message(PRIVATE & filters.command("cancel"))
+@allowed_only
+async def cancel_cmd(_, message):
+    mine = user_jobs(message.from_user.id)
+    for j in mine:
+        j.cancel.set()
+    await message.reply_text(f"🚫 {len(mine)} job cancel kiye ja rahe hain." if mine else "Koi active job nahi hai.")
+
+
+# ------------------------------------------------------------------- admin: premium management
+
+def parse_target(message):
+    args = message.command[1:]
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id, args
+    if args and args[0].lstrip("-").isdigit():
+        return int(args[0]), args[1:]
+    return None, args
+
+
+@app.on_message(PRIVATE & filters.command(["addpremium", "addprem"]))
+@admin_only
+async def addpremium_handler(_, message):
+    uid, rest = parse_target(message)
+    if uid is None:
+        return await message.reply_text("Usage: /addpremium <code>user_id [days]</code>\n"
+                                        "Days na do to Lifetime. Ya user ke message par reply karke /addpremium <code>[days]</code>")
+    days = int(rest[0]) if rest and rest[0].isdigit() and int(rest[0]) > 0 else None
+    expires = store.add_premium(uid, days, by=message.from_user.id)
+    await message.reply_text(f"✅ <code>{uid}</code> ko Premium mil gaya.\n📅 Expiry: {date_text(expires)}")
     try:
-        await app.send_message(LOG_DESTINATION, "✅ Log channel peer initialized by admin.")
-        await message.reply_text(f"✅ Log channel resolved: {LOG_DESTINATION}")
-    except Exception as exc:
-        LOG_DESTINATION = config.LOG_CHANNEL_ID
-        await message.reply_text(f"❌ Could not initialize this channel: {str(exc)[:300]}")
+        await app.send_message(uid, f"🎉 Aapko <b>Premium</b> access mil gaya!\n📅 Expiry: {date_text(expires)}\n\n/start dabao.")
+    except Exception:  # noqa: BLE001  (user may not have started the bot yet)
+        pass
 
 
-async def resolve_log_channel():
-    """Warm Pyrogram's peer cache using a private invite link when configured."""
-    global LOG_DESTINATION
-    invite_link = config.LOG_CHANNEL_INVITE_LINK.strip()
-    if not invite_link:
-        log.warning("LOG_CHANNEL_INVITE_LINK is not configured; private channel uploads rely on Pyrogram's existing peer cache")
-        return
+@app.on_message(PRIVATE & filters.command(["removepremium", "delpremium", "rempremium"]))
+@admin_only
+async def removepremium_handler(_, message):
+    uid, _ = parse_target(message)
+    if uid is None:
+        return await message.reply_text("Usage: /removepremium <code>user_id</code>")
+    if store.remove_premium(uid):
+        for j in user_jobs(uid):
+            j.cancel.set()
+        await message.reply_text(f"🗑 <code>{uid}</code> ka Premium hata diya.")
+    else:
+        await message.reply_text("Ye user premium list me nahi hai.")
+
+
+@app.on_message(PRIVATE & filters.command(["premiumlist", "premiums"]))
+@admin_only
+async def premiumlist_handler(_, message):
+    users = store.list_premium()
+    if not users:
+        return await message.reply_text("Abhi koi premium user nahi hai.")
+    lines = [f"💎 <b>Premium users ({len(users)})</b>"] + [
+        f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
+    await message.reply_text("\n".join(lines))
+
+
+@app.on_message(PRIVATE & filters.command("testlog"))
+@admin_only
+async def testlog_handler(_, message):
+    ok, info = await check_log_channel()
+    if ok:
+        ok = await send_log("✅ Test message: log channel sahi kaam kar raha hai.")
+        info = info if ok else "Channel mila par message send nahi hua (permissions check karein)."
+    state["log_ok"] = ok
+    await message.reply_text(("✅ " if ok else "❌ ") + esc(info) + f"\n\nConfigured ID: <code>{config.LOG_CHANNEL_ID}</code>")
+
+
+@app.on_message(PRIVATE & filters.command("update"))
+@admin_only
+async def update_handler(_, message):
+    note = await message.reply_text("⏳ yt-dlp update ho raha hai...")
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "yt-dlp[default,curl-cffi]",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    tail = esc(out.decode(errors="ignore")[-400:])
+    await edit_safely(note, ("✅ Update ho gaya. Naya version use karne ke liye /restart karein.\n" if proc.returncode == 0
+                             else "❌ Update fail:\n") + f"<code>{tail}</code>")
+
+
+@app.on_message(PRIVATE & filters.command("restart"))
+@admin_only
+async def restart_handler(_, message):
+    await message.reply_text("♻️ Restart ho raha hai (Docker/Koyeb auto-start karega)...")
+    await asyncio.sleep(1)
+    import os
+    os._exit(0)
+
+
+# ------------------------------------------------------------------- links
+
+def clean_pending():
+    now = time.time()
+    for token in [t for t, v in pending.items() if now - v["ts"] > PENDING_TTL]:
+        pending.pop(token, None)
+
+
+def option_buttons(token, options):
+    rows, row = [], []
+    for opt in options:
+        label = opt["label"] + (f" • ~{size_text(opt['size'])}" if opt.get("size") else "")
+        row.append(InlineKeyboardButton(label, callback_data=f"dl:{token}:{opt['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data=f"dl:{token}:x")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def handle_url(message, url):
+    user = message.from_user
+    status = await message.reply_text("🔎 Link check ho raha hai...", quote=True, disable_web_page_preview=True)
     try:
-        chat = await app.join_chat(invite_link)
-        LOG_DESTINATION = chat.id
-        log.info("Resolved private log channel via invite link: chat_id=%s", LOG_DESTINATION)
-    except Exception as exc:
-        message = str(exc).lower()
-        if "already participant" in message or "user_already_participant" in message:
-            # The bot is already a member; ask Pyrogram to resolve the invite
-            # link directly if supported by this installed version.
-            try:
-                chat = await app.get_chat(invite_link)
-                LOG_DESTINATION = chat.id
-                log.info("Resolved existing private log channel from invite link: chat_id=%s", LOG_DESTINATION)
-            except Exception as nested:
-                log.warning("Bot is already in the private channel but invite-link resolution failed: %s. Bot API will be used for logs and small files.", nested)
-        else:
-            log.warning("Could not resolve LOG_CHANNEL_INVITE_LINK (%s). Verify the invite link and bot membership.", exc)
+        pr = await asyncio.get_running_loop().run_in_executor(POOL, dl.probe, url)
+    except dl.ProbeError as exc:
+        return await edit_safely(status, f"❌ {esc(str(exc)[:600])}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("probe failed")
+        return await edit_safely(status, f"❌ Link check fail: {esc(str(exc)[:400])}")
 
+    if pr["kind"] == "direct":                      # direct link -> start immediately
+        await enqueue(make_job_from_probe(user, message.chat.id, url, pr), status)
+        return
+    if pr["kind"] == "media" and len(pr["options"]) == 1:
+        await enqueue(make_job_from_probe(user, message.chat.id, url, pr, pr["options"][0]), status)
+        return
+
+    clean_pending()
+    token = secrets.token_hex(4)
+    pending[token] = {"uid": user.id, "user": user, "url": url, "pr": pr, "chat_id": message.chat.id, "ts": time.time()}
+    if pr["kind"] == "media":
+        dur = f"\n⏱ {time_text(pr['duration'])}" if pr.get("duration") else ""
+        who = f"\n👤 {esc(pr['uploader'])}" if pr.get("uploader") else ""
+        await edit_safely(status, f"🎬 <b>{esc(pr['title'][:200])}</b>{who}{dur}\n\n👇 Quality chuno (click karte hi queue me add):",
+                          option_buttons(token, pr["options"]))
+    else:
+        n = min(len(pr["entries"]), config.PLAYLIST_LIMIT)
+        opts = [{"id": "pbest", "label": f"🏆 All {n} videos (Best)"}, {"id": "pmp3", "label": f"🎵 All {n} as MP3"}]
+        await edit_safely(status, f"📚 <b>Playlist:</b> {esc(pr['title'][:150])}\n{len(pr['entries'])} items "
+                                  f"(pehle {n} download honge)\n\n👇 Kya chahiye?", option_buttons(token, opts))
+
+
+@app.on_message(PRIVATE & filters.text & ~filters.regex(r"^/"))
+@allowed_only
+async def url_handler(_, message):
+    urls = []
+    for u in URL_RE.findall(message.text or ""):
+        u = u.rstrip(".,;:!?)]}")
+        if u not in urls:
+            urls.append(u)
+    if not urls:
+        return await message.reply_text("❌ Valid HTTP/HTTPS link bhejo.")
+    for u in urls[:10]:
+        asyncio.create_task(handle_url(message, u))
+
+
+@app.on_callback_query(filters.regex(r"^dl:"))
+async def quality_callback(_, cq):
+    uid = cq.from_user.id
+    if not store.is_allowed(uid):
+        return await cq.answer("🔒 Premium required.", show_alert=True)
+    _, token, opt_id = cq.data.split(":", 2)
+    session = pending.get(token)
+    if not session:
+        await cq.answer("Ye request expire ho gayi. Link dobara bhejo.", show_alert=True)
+        return await edit_safely(cq.message, "⌛ Request expire ho gayi. Link dobara bhejo.")
+    if session["uid"] != uid:
+        return await cq.answer("Ye aapka link nahi hai.", show_alert=True)
+    if opt_id == "x":
+        pending.pop(token, None)
+        await cq.answer("Closed")
+        return await edit_safely(cq.message, "✖️ Cancelled.")
+
+    pr, user, url, chat_id = session["pr"], session["user"], session["url"], session["chat_id"]
+    if pr["kind"] == "media":
+        option = next((o for o in pr["options"] if o["id"] == opt_id), None)
+        if not option:
+            return await cq.answer("Option nahi mila.", show_alert=True)
+        pending.pop(token, None)                   # one click -> one job (prevents double add)
+        await cq.answer("✅ Queue me add ho raha hai...")
+        await enqueue(Job(user, chat_id, url, "media", pr["title"], option=option), cq.message)
+    else:
+        pending.pop(token, None)
+        option = ({"kind": "video", "height": 0, "label": "🏆 Best"} if opt_id == "pbest"
+                  else {"kind": "audio", "codec": "mp3", "label": "🎵 MP3"})
+        await cq.answer("✅ Playlist queue me add ho rahi hai...")
+        added = 0
+        for entry in pr["entries"][:config.PLAYLIST_LIMIT]:
+            msg = await app.send_message(chat_id, f"⏳ {esc(entry['title'][:100])}")
+            if not await enqueue(Job(user, chat_id, entry["url"], "media", entry["title"], option=option), msg):
+                break
+            added += 1
+        await edit_safely(cq.message, f"✅ Playlist se {added} item queue me add hue.")
+
+
+@app.on_callback_query(filters.regex(r"^cx:"))
+async def cancel_callback(_, cq):
+    job = jobs.get(int(cq.data.split(":", 1)[1]))
+    if not job:
+        return await cq.answer("Job pehle hi khatam ho chuka hai.")
+    if cq.from_user.id != job.user_id and not store.is_admin(cq.from_user.id):
+        return await cq.answer("Ye aapka job nahi hai.", show_alert=True)
+    job.cancel.set()
+    await cq.answer("🚫 Cancel ho raha hai...")
+
+
+# =============================================================================== main
 
 async def main():
     start_health_server()
@@ -592,30 +730,28 @@ async def main():
         raise RuntimeError("Set BOT_TOKEN")
     if config.ADMIN_ID == 123456789:
         raise RuntimeError("Set ADMIN_ID")
-    if config.LOG_CHANNEL_ID == -1001234567890:
-        raise RuntimeError("Set LOG_CHANNEL_ID")
     if not config.API_ID or not config.API_HASH:
         raise RuntimeError("Set API_ID and API_HASH")
 
     await app.start()
-    await resolve_log_channel()
     me = await app.get_me()
+    state["bot_id"] = me.id
+    ok, info = await check_log_channel()
+    state["log_ok"] = ok
+    (log.info if ok else log.error)("Log channel check: %s", info)
+    if ok:
+        await send_log(f"🟢 Bot @{me.username} online\n⚙️ aria2c: {dl.HAVE_ARIA2} • ffmpeg: {dl.HAVE_FFMPEG} • yt-dlp {yt_dlp.version.__version__}")
     state["ready"] = True
-    log.info("Started as @%s", me.username)
-    log.info("yt-dlp version: %s", yt_dlp.version.__version__)
-    cookie_path = effective_cookie_path()
-    log.info("Cookies configured: %s", bool(cookie_path.is_file() and cookie_path.stat().st_size > 0))
-    log.info("Configured log channel ID: %s", LOG_DESTINATION)
-    worker_task = asyncio.create_task(queue_worker())
+    log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s", me.username, yt_dlp.version.__version__,
+             dl.HAVE_ARIA2, dl.HAVE_FFMPEG)
+    workers = [asyncio.create_task(queue_worker()) for _ in range(config.MAX_CONCURRENT_JOBS)]
     try:
         await idle()
     finally:
         state["ready"] = False
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         await app.stop()
 
 

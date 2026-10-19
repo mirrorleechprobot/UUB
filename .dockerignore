@@ -7,3 +7,6 @@ venv/
 downloads/*
 cookies.txt
 cookies*.txt
+data/
+*.session
+*.session-journal

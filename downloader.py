@@ -1,0 +1,632 @@
+"""Blocking download / media helpers. Everything here runs in worker threads.
+
+- probe():          decide direct-file vs yt-dlp media, and build quality options
+- download():       aria2c (multi-connection) -> requests fallback for direct links,
+                    yt-dlp (+aria2c for plain HTTP, parallel fragments for HLS/DASH) for media
+- prepare_upload(): ffprobe metadata, thumbnail, remux to mp4, split files > 2 GB
+"""
+import http.cookiejar
+import json
+import logging
+import mimetypes
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+import requests
+import yt_dlp
+
+import config
+
+log = logging.getLogger("uub.dl")
+
+
+class Cancelled(Exception):
+    pass
+
+
+class ProbeError(Exception):
+    pass
+
+
+VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".wmv", ".ts", ".m2ts", ".3gp", ".mpg", ".mpeg"}
+AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".oga"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"}
+OTHER_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".pdf", ".txt", ".csv", ".doc", ".docx",
+             ".xls", ".xlsx", ".ppt", ".pptx", ".apk", ".iso", ".epub", ".exe", ".msi", ".dmg", ".json", ".srt", ".vtt"}
+DIRECT_EXT = VIDEO_EXT | AUDIO_EXT | IMAGE_EXT | OTHER_EXT
+TEMP_SUFFIXES = (".part", ".ytdl", ".aria2", ".temp", ".tmp")
+
+HAVE_ARIA2 = shutil.which("aria2c") is not None
+HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+# --------------------------------------------------------------------------- cookies / session
+
+def cookie_path():
+    """Netscape cookie file: COOKIES_TEXT env (secret) wins over the cookies.txt file."""
+    if config.COOKIES_TEXT.strip():
+        path = Path(tempfile.gettempdir()) / "uub-cookies.txt"
+        path.write_text(config.COOKIES_TEXT.strip() + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return path
+    path = Path(config.COOKIE_FILE).expanduser()
+    return path if path.is_file() and path.stat().st_size > 0 else None
+
+
+def _cookies_usable(path):
+    """cookies.txt that only has the '# Netscape HTTP Cookie File' header is not useful."""
+    if not path:
+        return False
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.strip() and not line.startswith("#") or line.startswith("#HttpOnly_"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _session():
+    s = requests.Session()
+    s.headers.update({"User-Agent": config.DIRECT_USER_AGENT, "Accept": "*/*",
+                      "Accept-Encoding": "identity", "Connection": "keep-alive"})
+    if config.DIRECT_REFERER:
+        s.headers["Referer"] = config.DIRECT_REFERER
+    cp = cookie_path()
+    if _cookies_usable(cp):
+        try:
+            jar = http.cookiejar.MozillaCookieJar(str(cp))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            s.cookies.update(jar)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not load cookies for HTTP: %s", exc)
+    return s
+
+
+def safe_filename(name):
+    name = unquote(str(name or "download.bin")).replace("\\", "_").replace("/", "_")
+    name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name).strip(" .")
+    return name[:180] or "download.bin"
+
+
+def _filename_from_headers(response, content_type):
+    disposition = response.headers.get("Content-Disposition", "")
+    filename = ""
+    m = re.search(r"filename\*=(?:UTF-8|utf-8)''([^;]+)", disposition)
+    if m:
+        filename = unquote(m.group(1).strip().strip('"'))
+    else:
+        m = re.search(r'filename\s*=\s*"?([^";]+)', disposition, re.I)
+        if m:
+            filename = unquote(m.group(1).strip())
+    if not filename:
+        filename = Path(urlparse(response.url).path).name
+    if not filename or filename in ("/", "."):
+        filename = "download"
+    if not Path(filename).suffix:
+        filename += mimetypes.guess_extension(content_type) or ".bin"
+    return safe_filename(filename)
+
+
+def _is_media_manifest(content_type):
+    return "mpegurl" in content_type or "dash+xml" in content_type
+
+
+def _probe_http(url):
+    """Look at the response headers only. Returns dict(status, content_type, filename, size)."""
+    s = _session()
+    try:
+        with s.get(url, stream=True, allow_redirects=True, timeout=(10, 20)) as r:
+            ctype = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            return {"status": r.status_code, "content_type": ctype,
+                    "filename": _filename_from_headers(r, ctype),
+                    "size": int(r.headers.get("Content-Length") or 0)}
+    finally:
+        s.close()
+
+
+# --------------------------------------------------------------------------- probing
+
+LADDER = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
+
+
+def _fmt_size(f):
+    return f.get("filesize") or f.get("filesize_approx") or 0
+
+
+def _build_options(info):
+    formats = info.get("formats") or []
+    duration = info.get("duration") or 0
+    video = [f for f in formats if f.get("height") and f.get("vcodec") not in (None, "none")]
+    audio = [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+    best_audio_size = max([_fmt_size(f) for f in audio] or [0])
+    options = []
+
+    def est(f):
+        size = _fmt_size(f)
+        if not size and f.get("tbr") and duration:
+            size = f["tbr"] * 1000 / 8 * duration
+        return size
+
+    if video:
+        for i, rung in enumerate(LADDER):
+            lower = LADDER[i + 1] if i + 1 < len(LADDER) else 0
+            bucket = [f for f in video if lower < f["height"] <= rung]
+            if not bucket:
+                continue
+            top = max(bucket, key=lambda f: (f["height"], f.get("tbr") or 0))
+            size = est(top)
+            if size and top.get("acodec") in (None, "none"):
+                size += best_audio_size
+            options.append({"id": f"v{rung}", "kind": "video", "height": rung,
+                            "label": f"🎬 {top['height']}p", "size": size})
+        options.sort(key=lambda o: -o["height"])
+        options = options[:8]
+        options.insert(0, {"id": "vbest", "kind": "video", "height": 0, "label": "🏆 Best Quality", "size": 0})
+    elif not audio:
+        # Unknown-codec single stream (generic extractor etc.): offer one plain download button.
+        options.append({"id": "vbest", "kind": "video", "height": 0, "label": "⬇️ Download", "size": 0})
+    if video or audio:
+        options.append({"id": "amp3", "kind": "audio", "codec": "mp3", "label": "🎵 MP3 (320k)", "size": 0})
+        options.append({"id": "am4a", "kind": "audio", "codec": "m4a", "label": "🎧 M4A Audio", "size": 0})
+    return options
+
+
+def ytdlp_base_opts():
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+            "retries": config.MAX_RETRIES, "fragment_retries": config.MAX_RETRIES,
+            "extractor_retries": config.MAX_RETRIES, "windowsfilenames": True,
+            "http_headers": {"User-Agent": config.DIRECT_USER_AGENT}}
+    cp = cookie_path()
+    if _cookies_usable(cp):
+        opts["cookiefile"] = str(cp.resolve())
+    if config.DIRECT_REFERER:
+        opts["http_headers"]["Referer"] = config.DIRECT_REFERER
+    return opts
+
+
+def probe(url):
+    """Return {"kind": "direct"|"media"|"playlist", ...}. Raises ProbeError if nothing downloadable."""
+    ext = Path(urlparse(url).path).suffix.lower()
+    http_info, http_err = None, None
+    try:
+        http_info = _probe_http(url)
+    except Exception as exc:  # noqa: BLE001
+        http_err = type(exc).__name__
+
+    if http_info and http_info["status"] < 400:
+        ctype = http_info["content_type"]
+        is_page = ctype.startswith("text/") or "html" in ctype or "json" in ctype or ctype.endswith("xml") and "dash" not in ctype
+        if not is_page and not _is_media_manifest(ctype):
+            return {"kind": "direct", "title": http_info["filename"], "filename": http_info["filename"],
+                    "size": http_info["size"]}
+    elif ext in DIRECT_EXT:
+        # Header probe failed (HEAD-hostile server) but the URL clearly is a file.
+        name = safe_filename(Path(urlparse(url).path).name)
+        return {"kind": "direct", "title": name, "filename": name, "size": 0}
+
+    opts = ytdlp_base_opts()
+    opts.update({"skip_download": True, "extract_flat": "in_playlist", "socket_timeout": 20})
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:300]
+        if http_info is None or http_info["status"] >= 400:
+            # Page unreachable for our probe; let the downloader try anyway (signed/odd URLs).
+            raise ProbeError(f"Link open nahi ho paya ({http_err or 'HTTP ' + str(http_info['status'])}). {msg}")
+        raise ProbeError(f"Is link se koi video/audio/file nahi mili. {msg}")
+    if not info:
+        raise ProbeError("Is link se koi media nahi mila.")
+
+    if info.get("_type") == "playlist":
+        entries = []
+        for e in info.get("entries") or []:
+            if not e:
+                continue
+            eurl = e.get("url") or e.get("webpage_url")
+            if eurl and eurl.startswith("http"):
+                entries.append({"url": eurl, "title": e.get("title") or eurl})
+        if not entries:
+            raise ProbeError("Playlist khali hai ya read nahi ho payi.")
+        return {"kind": "playlist", "title": info.get("title") or "Playlist", "entries": entries}
+
+    options = _build_options(info)
+    if not options:
+        raise ProbeError("Koi downloadable format nahi mila.")
+    return {"kind": "media", "title": info.get("title") or url, "duration": info.get("duration") or 0,
+            "uploader": info.get("uploader") or "", "options": options}
+
+
+# --------------------------------------------------------------------------- downloading
+
+def _unit_bytes(value, unit):
+    mult = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4,
+            "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}.get(unit, 1)
+    return float(value) * mult
+
+
+_ARIA_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)\((\d+)%\).*?DL:([\d.]+)(B|KiB|MiB|GiB)")
+
+
+def _aria2(url, target, progress, cancel, expected_size):
+    cmd = ["aria2c", f"-x{config.ARIA2_CONNECTIONS}", f"-s{config.ARIA2_CONNECTIONS}", "-k1M", "-j1",
+           "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true", "-c",
+           "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
+           f"--max-tries={config.MAX_RETRIES + 2}", "--retry-wait=3", "--connect-timeout=20", "--timeout=60",
+           "--user-agent=" + config.DIRECT_USER_AGENT, "-d", str(target.parent), "-o", target.name]
+    if config.DIRECT_REFERER:
+        cmd.append("--referer=" + config.DIRECT_REFERER)
+    cp = cookie_path()
+    if _cookies_usable(cp):
+        cmd.append("--load-cookies=" + str(cp))
+    cmd.append(url)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    done = threading.Event()
+
+    def watcher():
+        while not done.wait(0.5):
+            if cancel.is_set() and proc.poll() is None:
+                proc.terminate()
+                return
+
+    threading.Thread(target=watcher, daemon=True).start()
+    tail = []
+    started = time.monotonic()
+    try:
+        for line in proc.stdout:
+            m = _ARIA_RE.search(line)
+            if m:
+                cur = _unit_bytes(m.group(1), m.group(2))
+                tot = _unit_bytes(m.group(3), m.group(4))
+                speed = _unit_bytes(m.group(6), m.group(7))
+                progress.update({"status": "downloading", "current": cur, "total": tot or expected_size,
+                                 "speed": speed, "eta": (tot - cur) / speed if speed > 0 else None})
+            elif line.strip():
+                tail.append(line.strip())
+                tail = tail[-5:]
+        proc.wait()
+    finally:
+        done.set()
+        if proc.poll() is None:
+            proc.kill()
+    if cancel.is_set():
+        raise Cancelled()
+    if proc.returncode != 0 or not target.is_file():
+        raise RuntimeError("aria2c failed: " + " | ".join(tail)[-250:])
+    log.info("aria2c finished %s in %.0fs", target.name, time.monotonic() - started)
+
+
+def _requests_download(url, target, progress, cancel):
+    s = _session()
+    try:
+        with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60)) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or 0)
+            current, last_bytes, last_time = 0, 0, time.monotonic()
+            with target.open("wb") as out:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if cancel.is_set():
+                        raise Cancelled()
+                    if not chunk:
+                        continue
+                    out.write(chunk)
+                    current += len(chunk)
+                    now = time.monotonic()
+                    if now - last_time >= 1:
+                        speed = (current - last_bytes) / (now - last_time)
+                        last_bytes, last_time = current, now
+                        progress.update({"status": "downloading", "current": current, "total": total,
+                                         "speed": speed, "eta": (total - current) / speed if total and speed else None})
+    finally:
+        s.close()
+
+
+def _looks_like_html(path):
+    try:
+        if path.stat().st_size > 3 * 1024 * 1024:
+            return False
+        head = path.read_bytes()[:512].lstrip().lower()
+        return head.startswith((b"<!doctype html", b"<html", b"<?xml")) or b"<html" in head
+    except OSError:
+        return False
+
+
+def download_direct(url, workdir, progress, cancel, filename=None, size=0):
+    if not filename:
+        info = _probe_http(url)
+        filename = info["filename"]
+        size = info["size"]
+    target = workdir / safe_filename(filename)
+    progress.update({"status": "downloading", "current": 0, "total": size, "speed": 0, "eta": None})
+    errors = []
+    if HAVE_ARIA2:
+        try:
+            _aria2(url, target, progress, cancel, size)
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+            log.warning("aria2c path failed (%s); falling back to requests", str(exc)[:120])
+            target.unlink(missing_ok=True)
+            Path(str(target) + ".aria2").unlink(missing_ok=True)
+    if not target.is_file():
+        try:
+            _requests_download(url, target, progress, cancel)
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+            raise RuntimeError("Download fail: " + " | ".join(e[:200] for e in errors)) from exc
+    if not target.is_file() or target.stat().st_size == 0:
+        raise RuntimeError("Server ne khali file di.")
+    if _looks_like_html(target) and target.suffix.lower() not in (".html", ".htm", ".txt"):
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Server ne file ki jagah HTML page diya (link expire / login / Referer chahiye).")
+    progress.update({"status": "finished", "current": target.stat().st_size, "total": target.stat().st_size})
+    return {"path": target, "title": target.name}
+
+
+def _video_selector(height):
+    if not height:
+        return "bv*+ba/b"
+    return f"bv*[height<={height}]+ba/b[height<={height}]/bv*+ba/b"
+
+
+def download_media(url, option, workdir, progress, cancel):
+    def hook(d):
+        if cancel.is_set():
+            raise Cancelled()
+        st = d.get("status")
+        if st == "downloading":
+            progress.update({"status": "downloading", "current": d.get("downloaded_bytes") or 0,
+                             "total": d.get("total_bytes") or d.get("total_bytes_estimate") or 0,
+                             "speed": d.get("speed") or 0, "eta": d.get("eta")})
+        elif st == "finished":
+            progress["status"] = "processing"
+
+    def run(use_aria):
+        opts = ytdlp_base_opts()
+        opts.update({
+            "outtmpl": str(workdir / "%(title).150B [%(id)s].%(ext)s"),
+            "continuedl": True, "overwrites": False, "file_access_retries": config.MAX_RETRIES,
+            "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS,
+            "progress_hooks": [hook], "http_chunk_size": 10 * 1024 * 1024,
+            "ignoreerrors": False,
+        })
+        if option["kind"] == "audio":
+            opts["format"] = "ba/b"
+            opts["postprocessors"] = [
+                {"key": "FFmpegExtractAudio", "preferredcodec": option["codec"],
+                 "preferredquality": "320" if option["codec"] == "mp3" else "0"},
+                {"key": "FFmpegMetadata"},
+            ]
+        else:
+            opts["format"] = _video_selector(option.get("height"))
+            # Prefer H.264/AAC in MP4 (plays everywhere on Telegram) within the chosen resolution.
+            opts["format_sort"] = ["res", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]
+            opts["merge_output_format"] = "mp4"
+        if use_aria and HAVE_ARIA2:
+            n = config.ARIA2_CONNECTIONS
+            opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
+            opts["external_downloader_args"] = {"aria2c": [f"-x{n}", f"-s{n}", "-k1M", "--file-allocation=none"]}
+            opts.pop("http_chunk_size", None)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        files = [Path(d["filepath"]) for d in (info.get("requested_downloads") or []) if d.get("filepath")]
+        files = [p for p in files if p.is_file()]
+        if not files:
+            files = _scan(workdir)
+        if not files:
+            raise FileNotFoundError("Download ho gaya par output file nahi mili.")
+        final = max(files, key=lambda p: p.stat().st_size)
+        return {"path": final, "title": info.get("title") or final.stem}
+
+    errors = []
+    for use_aria in ([True, False] if HAVE_ARIA2 else [False]):
+        try:
+            return run(use_aria)
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if cancel.is_set():
+                raise Cancelled() from exc
+            errors.append(re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:280])
+            log.warning("yt-dlp attempt (aria2=%s) failed: %s", use_aria, errors[-1][:120])
+    raise RuntimeError("Download fail: " + errors[-1])
+
+
+def _scan(workdir):
+    files = [p for p in workdir.iterdir() if p.is_file() and not p.name.endswith(TEMP_SUFFIXES)]
+    media = [p for p in files if p.suffix.lower() in VIDEO_EXT | AUDIO_EXT]
+    return media or files
+
+
+def download(job, workdir):
+    """job needs: url, mode, option, direct_name, direct_size, progress, cancel."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    if job.mode == "direct":
+        return download_direct(job.url, workdir, job.progress, job.cancel, job.direct_name, job.direct_size)
+    return download_media(job.url, job.option, workdir, job.progress, job.cancel)
+
+
+# --------------------------------------------------------------------------- post-processing
+
+def _run(cmd, timeout=None):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+
+def ffprobe(path):
+    meta = {"duration": 0, "width": 0, "height": 0, "has_video": False, "has_audio": False,
+            "title": "", "artist": ""}
+    if not HAVE_FFMPEG:
+        return meta
+    try:
+        r = _run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)], 60)
+        data = json.loads(r.stdout or b"{}")
+    except Exception:  # noqa: BLE001
+        return meta
+    fmt = data.get("format", {})
+    try:
+        meta["duration"] = int(float(fmt.get("duration") or 0))
+    except ValueError:
+        pass
+    tags = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+    meta["title"], meta["artist"] = tags.get("title", ""), tags.get("artist", "")
+    for st in data.get("streams", []):
+        if st.get("codec_type") == "video" and not (st.get("disposition") or {}).get("attached_pic"):
+            meta["has_video"] = True
+            w, h = st.get("width") or 0, st.get("height") or 0
+            rot = 0
+            try:
+                rot = int((st.get("tags") or {}).get("rotate") or 0)
+                for sd in st.get("side_data_list") or []:
+                    if "rotation" in sd:
+                        rot = int(sd["rotation"])
+            except (TypeError, ValueError):
+                pass
+            if abs(rot) in (90, 270):
+                w, h = h, w
+            meta["width"], meta["height"] = w, h
+            if not meta["duration"]:
+                try:
+                    meta["duration"] = int(float(st.get("duration") or 0))
+                except ValueError:
+                    pass
+        elif st.get("codec_type") == "audio":
+            meta["has_audio"] = True
+    return meta
+
+
+def make_thumb(path, duration):
+    if not HAVE_FFMPEG:
+        return None
+    out = path.with_name(path.stem + ".thumb.jpg")
+    seek = max(1, min(int(duration * 0.1), 60)) if duration else 1
+    for ss in (seek, 0):
+        try:
+            _run(["ffmpeg", "-y", "-ss", str(ss), "-i", str(path), "-frames:v", "1",
+                  "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", str(out)], 60)
+        except Exception:  # noqa: BLE001
+            continue
+        if out.is_file() and out.stat().st_size > 0:
+            return out
+    return None
+
+
+def _remux_mp4(path):
+    out = path.with_suffix(".mp4")
+    if out == path:
+        return path
+    tmp = path.with_name(path.stem + ".remux.mp4")
+    try:
+        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                  "-sn", "-dn", "-movflags", "+faststart", str(tmp)])
+    except Exception:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        return path
+    if r.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+        path.unlink(missing_ok=True)
+        tmp.replace(out)
+        return out
+    tmp.unlink(missing_ok=True)
+    return path
+
+
+def _byte_split(path, max_bytes):
+    parts = []
+    with path.open("rb") as src:
+        index = 1
+        while True:
+            part = path.with_name(f"{path.name}.{index:03d}")
+            written = 0
+            with part.open("wb") as dst:
+                while written < max_bytes:
+                    chunk = src.read(min(8 * 1024 * 1024, max_bytes - written))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+            if written == 0:
+                part.unlink(missing_ok=True)
+                break
+            parts.append(part)
+            index += 1
+    return parts
+
+
+def _video_split(path, max_bytes, duration):
+    size = path.stat().st_size
+    for factor in (0.9, 0.7, 0.5):
+        seg = max(5, int(duration * max_bytes / size * factor))
+        pattern = path.with_name(path.stem + ".part%03d.mp4")
+        for old in path.parent.glob(path.stem + ".part*.mp4"):
+            old.unlink(missing_ok=True)
+        try:
+            r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
+                      "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1", str(pattern)])
+        except Exception:  # noqa: BLE001
+            return None
+        parts = sorted(path.parent.glob(path.stem + ".part*.mp4"))
+        if r.returncode == 0 and parts and all(p.stat().st_size <= max_bytes for p in parts):
+            return parts
+    for old in path.parent.glob(path.stem + ".part*.mp4"):
+        old.unlink(missing_ok=True)
+    return None
+
+
+def prepare_upload(path, cancel=None):
+    """Return a list of upload items: {path, kind, duration, width, height, thumb, title, artist}."""
+    path = Path(path)
+    ext = path.suffix.lower()
+    meta = ffprobe(path) if ext in VIDEO_EXT | AUDIO_EXT else {
+        "duration": 0, "width": 0, "height": 0, "has_video": False, "has_audio": False, "title": "", "artist": ""}
+    if ext in IMAGE_EXT:
+        kind = "image"
+    elif meta["has_video"] and ext in VIDEO_EXT:
+        kind = "video"
+    elif meta["has_audio"] and ext in VIDEO_EXT | AUDIO_EXT:
+        kind = "audio"
+    else:
+        kind = "document"
+
+    if kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
+        new = _remux_mp4(path)
+        if new != path:
+            path, ext = new, ".mp4"
+            meta = ffprobe(path)
+    if kind == "audio" and ext in VIDEO_EXT and ext != ".mp4":
+        kind = "document"
+
+    max_bytes = int(config.SPLIT_SIZE_MB * 1024 * 1024)
+    paths = [path]
+    if path.stat().st_size > max_bytes:
+        parts = _video_split(path, max_bytes, meta["duration"]) if kind == "video" and meta["duration"] and HAVE_FFMPEG else None
+        if parts:
+            path.unlink(missing_ok=True)
+            paths = parts
+        else:
+            paths = _byte_split(path, max_bytes)
+            path.unlink(missing_ok=True)
+            kind = "document"
+
+    items = []
+    for p in paths:
+        item = {"path": p, "kind": kind, "duration": 0, "width": 0, "height": 0, "thumb": None,
+                "title": meta["title"], "artist": meta["artist"]}
+        if kind in ("video", "audio") and p.suffix.lower() in VIDEO_EXT | AUDIO_EXT:
+            m = meta if len(paths) == 1 else ffprobe(p)
+            item.update(duration=m["duration"], width=m["width"], height=m["height"])
+            if kind == "video":
+                item["thumb"] = make_thumb(p, m["duration"])
+        items.append(item)
+    return items

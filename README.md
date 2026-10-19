@@ -1,41 +1,45 @@
-# URL Uploader Bot — Fixed Build
+# URL Uploader Bot (v2)
 
-Admin-only Telegram URL uploader using Pyrogram and yt-dlp.
+Telegram URL uploader — Pyrogram + yt-dlp + aria2c + ffmpeg. Sirf **Admin + Premium users** use kar sakte hain.
 
 ## Features
-- Admin-only URL handling and sequential in-memory queue
-- Best available yt-dlp quality and concurrent fragment downloads
-- Optional Netscape-format `cookies.txt` support for sites requiring login cookies
-- Progress, speed, completed bytes, ETA and elapsed time about every 10 seconds
-- Sends the file to the admin chat and configured log channel
-- Deletes the local file only after both uploads succeed
-- HTTP health endpoint on port 8080 (`/health`, `/healthz`, `/`)
-- Docker support for Koyeb and Ubuntu VPS
+- **Direct link** → turant download start (aria2c, 16 connections) → upload
+- **Video/Audio site link** (yt-dlp: YouTube, Instagram, X/Twitter, Facebook, TikTok, Vimeo, Reddit, Twitch, SoundCloud, 1800+ sites) → **quality buttons** (Best, 2160p…144p, MP3 320k, M4A). Button dabate hi job **queue me add**
+- Har format: video (mp4/mkv/webm/avi/…), audio, images, zip/pdf/apk etc. Non-mp4 video auto mp4 me remux (Telegram streaming), thumbnail + duration + resolution
+- **2GB+ files auto-split** (video keyframe-split, baaki byte-split)
+- Playlist support (buttons: all Best / all MP3, limit `PLAYLIST_LIMIT`)
+- Multiple links ek message me, parallel jobs (`MAX_CONCURRENT_JOBS`), per-user queue limit
+- Progress (speed, ETA) + ❌ Cancel button
+- **Log channel**: text logs + har delivered file ki copy (Bot API `copyMessage`, dobara upload nahi, peer errors nahi)
 
-## Configure
-1. Copy `.env.example` to `.env`.
-2. Fill in BOT_TOKEN, ADMIN_ID, LOG_CHANNEL_ID, API_ID and API_HASH.
-3. Add the bot to the private log channel as administrator with permission to post. Set `LOG_CHANNEL_ID` to the channel's numeric ID. If the channel peer cache is missing, post `/setlog` directly in that private channel (bot must receive channel posts), or forward a message from the channel to the bot and send `/setlog` as an admin. This warms Pyrogram's peer cache for large uploads. `LOG_CHANNEL_INVITE_LINK` is optional; never share a private invite link publicly.
-4. If a supported site requires login, export cookies in **Netscape `cookies.txt` format** and place the file beside `docker-compose.yml` as `cookies.txt`. The container mounts it read-only at `/app/cookies.txt`. On Koyeb, where you may not be able to mount a file, set `COOKIES_TEXT` as a secret environment variable containing the Netscape cookie file contents. Do not log or share the value. Cookies are optional.
-5. Start a private chat with the bot and send `/start`.
+## Premium system (Admin commands)
+| Command | Kaam |
+|---|---|
+| `/addpremium <id> [days]` | Premium do (days na do = lifetime). User ke message par reply bhi chalega |
+| `/removepremium <id>` | Premium hatao |
+| `/premiumlist` | Sab premium users + expiry |
+| `/testlog` | Log channel check + test message |
+| `/update` , `/restart` | yt-dlp update / bot restart |
 
-## Cookie safety
-- Never share or commit your real `cookies.txt`; it can grant access to your logged-in account. `.gitignore` and `.dockerignore` exclude it.
-- Do not paste cookies into Telegram messages or logs. Use only cookies for accounts/content you are authorized to access, and replace the file when cookies expire.
-- Cookie support helps only when the site is compatible with yt-dlp; it cannot fix expired media URLs, deleted content, or every site's login/anti-bot restrictions.
+User commands: `/start /queue /cancel /myplan /id` (non-premium user ko apni ID dikhti hai jo admin ko bhejni hai).
+Premium data `data/premium.json` me save hota hai — Docker me `./data` volume mount rakho, warna redeploy par list reset hogi.
 
-## Deploy
-`docker compose up -d --build`
-`docker compose logs -f`
+## Setup
+1. `.env.example` → `.env`, values bharo (BOT_TOKEN, API_ID, API_HASH, ADMIN_ID, LOG_CHANNEL_ID).
+2. Bot ko log channel me **Admin** banao (Post Messages). `/testlog` se check karo.
+3. `docker compose up -d --build` · logs: `docker compose logs -f`
 
-For Koyeb, configure the service to listen on port 8080. If using an HTTP health check, use `/health`.
+Koyeb: port 8080, health check `/health`. Persistent volume `/app/data` laga sako to premium list bachi rahegi; cookies ke liye `COOKIES_TEXT` secret.
 
-## Direct-file fallback
-For URLs whose path has a known file extension, the bot tries raw HTTP streaming first, then yt-dlp. It uses a browser-like User-Agent, optional `DIRECT_REFERER`, and the Netscape cookie file or `COOKIES_TEXT`. For webpage URLs, it tries yt-dlp first and then the HTTP fallback. It refuses HTML error pages. If a URL works only in a browser, the host may require the correct Referer/cookies or may provide an expiring signed URL; a genuine HTTP 404/410 still needs a URL the server accepts.
+## Log channel errors — kya fix hua
+- `LOG_CHANNEL_ID` bina `-100` ke daalne par ab auto-fix hota hai.
+- Bot API se logging/copy hoti hai, isliye "PEER_ID_INVALID" / `/setlog` ki zarurat nahi.
+- Log channel fail hone par ab user ka job fail nahi hota (pehle hota tha).
+- Bots `join_chat` nahi kar sakte, isliye invite-link wala step hata diya.
+- `/setlog` handler pehle kabhi chalta hi nahi tha (URL handler use pehle pakad leta tha) — hata diya.
 
-## Notes
-- HTTP 410 Gone is a remote-server response. If a signed URL expired or the resource was removed, obtain a fresh valid URL; retrying cannot restore an expired link.
-- Bot API text logging reports the Telegram API's failure reason without printing the bot token. Large channel file uploads require Pyrogram to resolve the channel peer; use `/setlog` as described above.
-- The in-memory queue loses waiting jobs if the process restarts. Progress callbacks are synchronous-compatible and status edits are throttled to avoid flooding Telegram.
-- Failed jobs retain the downloaded file where possible.
-- Use yt-dlp only for content you are authorized to download.
+## Speed tips
+`ARIA2_CONNECTIONS`, `CONCURRENT_FRAGMENTS`, `MAX_CONCURRENT_TRANSMISSIONS` badha sakte ho (server/host allow kare to). TgCrypto installed hona zaruri hai (requirements me hai).
+
+## Cookies
+Login-wale sites ke liye Netscape `cookies.txt` (ya `COOKIES_TEXT`). Kabhi share/commit mat karo. Sirf apne authorized content ke liye use karo.
