@@ -3,11 +3,16 @@ services:
     build: .
     container_name: url-uploader-bot
     restart: unless-stopped
+    ports:
+      - "8080:8080"
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       ADMIN_ID: ${ADMIN_ID}
       LOG_CHANNEL_ID: ${LOG_CHANNEL_ID}
       API_ID: ${API_ID}
       API_HASH: ${API_HASH}
+      PORT: 8080
+      COOKIE_FILE: /app/cookies.txt
     volumes:
       - ./downloads:/app/downloads
+      - ./cookies.txt:/app/cookies.txt:ro

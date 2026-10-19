@@ -1,0 +1,1 @@
+# Export Netscape-format cookies here. Keep this file private.
