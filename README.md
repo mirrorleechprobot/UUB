@@ -15,8 +15,8 @@ Admin-only Telegram URL uploader using Pyrogram and yt-dlp.
 ## Configure
 1. Copy `.env.example` to `.env`.
 2. Fill in BOT_TOKEN, ADMIN_ID, LOG_CHANNEL_ID, API_ID and API_HASH.
-3. Add the bot to the log channel as administrator with permission to post.
-4. If a supported site requires login, export cookies in **Netscape `cookies.txt` format** and place the file beside `docker-compose.yml` as `cookies.txt`. The container mounts it read-only at `/app/cookies.txt`. Cookies are optional; without the file, the bot continues without cookies.
+3. Add the bot to the private log channel as administrator with permission to post. Set `LOG_CHANNEL_ID` to the channel's numeric ID. If the channel peer cache is missing, post `/setlog` directly in that private channel (bot must receive channel posts), or forward a message from the channel to the bot and send `/setlog` as an admin. This warms Pyrogram's peer cache for large uploads. `LOG_CHANNEL_INVITE_LINK` is optional; never share a private invite link publicly.
+4. If a supported site requires login, export cookies in **Netscape `cookies.txt` format** and place the file beside `docker-compose.yml` as `cookies.txt`. The container mounts it read-only at `/app/cookies.txt`. On Koyeb, where you may not be able to mount a file, set `COOKIES_TEXT` as a secret environment variable containing the Netscape cookie file contents. Do not log or share the value. Cookies are optional.
 5. Start a private chat with the bot and send `/start`.
 
 ## Cookie safety
@@ -30,9 +30,12 @@ Admin-only Telegram URL uploader using Pyrogram and yt-dlp.
 
 For Koyeb, configure the service to listen on port 8080. If using an HTTP health check, use `/health`.
 
+## Direct-file fallback
+For URLs whose path has a known file extension, the bot tries raw HTTP streaming first, then yt-dlp. It uses a browser-like User-Agent, optional `DIRECT_REFERER`, and the Netscape cookie file or `COOKIES_TEXT`. For webpage URLs, it tries yt-dlp first and then the HTTP fallback. It refuses HTML error pages. If a URL works only in a browser, the host may require the correct Referer/cookies or may provide an expiring signed URL; a genuine HTTP 404/410 still needs a URL the server accepts.
+
 ## Notes
 - HTTP 410 Gone is a remote-server response. If a signed URL expired or the resource was removed, obtain a fresh valid URL; retrying cannot restore an expired link.
-- The log-channel error is non-fatal for logging, but delivery to the channel requires a correct channel ID and permissions.
-- The in-memory queue loses waiting jobs if the process restarts.
+- Bot API text logging reports the Telegram API's failure reason without printing the bot token. Large channel file uploads require Pyrogram to resolve the channel peer; use `/setlog` as described above.
+- The in-memory queue loses waiting jobs if the process restarts. Progress callbacks are synchronous-compatible and status edits are throttled to avoid flooding Telegram.
 - Failed jobs retain the downloaded file where possible.
 - Use yt-dlp only for content you are authorized to download.

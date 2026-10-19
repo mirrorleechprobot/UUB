@@ -9,10 +9,15 @@ services:
       BOT_TOKEN: ${BOT_TOKEN}
       ADMIN_ID: ${ADMIN_ID}
       LOG_CHANNEL_ID: ${LOG_CHANNEL_ID}
+      LOG_CHANNEL_INVITE_LINK: ${LOG_CHANNEL_INVITE_LINK:-}
+      DIRECT_REFERER: ${DIRECT_REFERER:-}
       API_ID: ${API_ID}
       API_HASH: ${API_HASH}
       PORT: 8080
       COOKIE_FILE: /app/cookies.txt
+      COOKIES_TEXT: ${COOKIES_TEXT:-}
+      PROGRESS_UPDATE_INTERVAL: ${PROGRESS_UPDATE_INTERVAL:-10}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
     volumes:
       - ./downloads:/app/downloads
       - ./cookies.txt:/app/cookies.txt:ro
