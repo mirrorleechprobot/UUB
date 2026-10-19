@@ -8,7 +8,7 @@ Telegram URL uploader — Pyrogram + yt-dlp + aria2c + ffmpeg. Sirf **Admin + Pr
 - Har format: video (mp4/mkv/webm/avi/…), audio, images, zip/pdf/apk etc. Non-mp4 video auto mp4 me remux (Telegram streaming), thumbnail + duration + resolution
 - **2GB+ files auto-split** (video keyframe-split, baaki byte-split)
 - Playlist support (buttons: all Best / all MP3, limit `PLAYLIST_LIMIT`)
-- Multiple links ek message me, parallel jobs (`MAX_CONCURRENT_JOBS`), per-user queue limit
+- Ek message me 25 links tak. Link analysis aur quality-selection queue me count nahi hoti; **format select karne par hi** job waiting list me jati hai (**har user ke liye: 5 running + 20 waiting = 25 jobs**; global cap `MAX_CONCURRENT_JOBS`)
 - Progress (speed, ETA) + ❌ Cancel button
 - **Log channel**: text logs + har delivered file ki copy (Bot API `copyMessage`, dobara upload nahi, peer errors nahi)
 

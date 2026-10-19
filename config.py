@@ -29,10 +29,10 @@ def _norm_channel(value):
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 API_ID = env_int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "")
-ADMIN_ID = env_int("ADMIN_ID", 7413682152)
+ADMIN_ID = env_int("ADMIN_ID", 123456789)
 # Optional: extra admins, comma separated (e.g. "111,222")
 EXTRA_ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
-LOG_CHANNEL_ID = _norm_channel(env_int("LOG_CHANNEL_ID", 2256697098))
+LOG_CHANNEL_ID = _norm_channel(env_int("LOG_CHANNEL_ID", 0))
 DIRECT_REFERER = os.getenv("DIRECT_REFERER", "")
 DIRECT_USER_AGENT = os.getenv(
     "DIRECT_USER_AGENT",
@@ -51,8 +51,11 @@ PORT = env_int("PORT", 8080)
 # ---- speed / limits ----
 ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", 16)))      # connections per download
 CONCURRENT_FRAGMENTS = max(1, min(32, env_int("CONCURRENT_FRAGMENTS", 16))) # HLS/DASH fragments in parallel
-MAX_CONCURRENT_JOBS = max(1, min(8, env_int("MAX_CONCURRENT_JOBS", 2)))     # jobs processed at once
+MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
 MAX_CONCURRENT_TRANSMISSIONS = max(1, min(16, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
-MAX_QUEUE_PER_USER = max(1, env_int("MAX_QUEUE_PER_USER", 10))              # premium users (admin = unlimited)
+MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 5))          # per user: jobs running at the same time
+MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 20))        # per user: jobs waiting (format already chosen)
+MAX_URLS_PER_MESSAGE = max(1, min(50, env_int("MAX_URLS_PER_MESSAGE", 25)))  # links handled from one message
+PROBE_CONCURRENCY = max(1, min(10, env_int("PROBE_CONCURRENCY", 5)))         # link analysis in parallel
 PLAYLIST_LIMIT = max(1, min(50, env_int("PLAYLIST_LIMIT", 15)))

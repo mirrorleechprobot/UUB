@@ -232,32 +232,53 @@ class Job:
 
 jobs = {}                      # id -> Job (queued or running)
 waiting = []                   # queued jobs, in order
-job_queue = asyncio.Queue()
-pending = {}                   # token -> quality-selection session
+running_jobs = set()           # jobs currently running
+wake = asyncio.Event()         # set whenever a job is added or finishes
+pending = {}                   # token -> quality-selection session (NOT counted in the waiting list)
+probe_sem = asyncio.Semaphore(config.PROBE_CONCURRENCY)
 
 
 def user_jobs(uid):
     return [j for j in jobs.values() if j.user_id == uid]
 
 
+def running_count(uid):
+    return sum(1 for j in running_jobs if j.user_id == uid)
+
+
+def waiting_count(uid):
+    return sum(1 for j in waiting if j.user_id == uid)
+
+
 async def enqueue(job, status_msg):
-    """Add a job to the queue. Returns False if the user's queue limit is hit."""
-    if not store.is_admin(job.user_id) and len(user_jobs(job.user_id)) >= config.MAX_QUEUE_PER_USER:
-        await edit_safely(status_msg, f"⚠️ Aapki queue full hai (max {config.MAX_QUEUE_PER_USER}). "
-                                      "Pehle wale jobs khatam hone do ya /queue se cancel karo.")
+    """Per-user rules: max MAX_RUNNING_PER_USER run together, max MAX_WAITING_PER_USER wait (5 + 20 = 25)."""
+    uid = job.user_id
+    if running_count(uid) >= config.MAX_RUNNING_PER_USER and waiting_count(uid) >= config.MAX_WAITING_PER_USER:
+        await edit_safely(status_msg, f"⚠️ Aapki limit poori ho gayi: {config.MAX_RUNNING_PER_USER} running + "
+                                      f"{config.MAX_WAITING_PER_USER} waiting. Kuch jobs khatam hone do ya /queue se cancel karo, "
+                                      "phir dobara quality chuno.")
         return False
     job.status_msg = status_msg
     jobs[job.id] = job
     waiting.append(job)
-    await job_queue.put(job)
-    running = sum(1 for j in jobs.values() if j.state not in ("queued",))
-    if running < config.MAX_CONCURRENT_JOBS and len(waiting) == 1:
-        text = f"🚀 <b>Download start ho raha hai...</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
-    else:
-        text = (f"✅ <b>Queue me add ho gaya</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
-                f"⏳ Aapse pehle: {len(waiting) - 1} job(s)")
-    await edit_safely(status_msg, text, cancel_markup(job))
+    wake.set()
+    await asyncio.sleep(0)                      # let the dispatcher start it right away if a slot is free
+    if job in waiting:
+        text = (f"✅ <b>Waiting list me add ho gaya</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                f"⏳ Aapke waiting jobs: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER} • "
+                f"Running: {running_count(uid)}/{config.MAX_RUNNING_PER_USER}")
+        await edit_safely(status_msg, text, cancel_markup(job))
     return True
+
+
+async def cancel_job(job):
+    """Cancel a job; a job still waiting is removed at once and frees its waiting slot."""
+    job.cancel.set()
+    if job in waiting:
+        waiting.remove(job)
+        jobs.pop(job.id, None)
+        job.state = "done"
+        await edit_safely(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
 
 
 def make_job_from_probe(user, chat_id, url, pr, option=None):
@@ -352,7 +373,6 @@ async def run_job(job):
     loop = asyncio.get_running_loop()
     started = time.monotonic()
     workdir = DOWNLOAD_DIR / f"job{job.id}_{int(time.time())}"
-    job.state = "downloading"
     await send_log(f"🆕 Job #{job.id} start\n👤 {job.user_label}\n🔗 {job.url}\n🎞 {job.option.get('label', 'direct')}")
     final_text = None
     try:
@@ -408,22 +428,34 @@ async def run_job(job):
         await edit_safely(job.status_msg, final_text)
 
 
-async def queue_worker():
+async def run_wrapper(job):
+    try:
+        if job.cancel.is_set():
+            await edit_safely(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
+        else:
+            await run_job(job)
+    except Exception:  # noqa: BLE001
+        log.exception("job runner error")
+    finally:
+        job.state = "done"
+        running_jobs.discard(job)
+        jobs.pop(job.id, None)
+        wake.set()
+
+
+async def dispatcher():
+    """Start the oldest waiting job whose owner has a free running slot (and global cap allows)."""
     while True:
-        job = await job_queue.get()
-        if job in waiting:
+        await wake.wait()
+        wake.clear()
+        while len(running_jobs) < config.MAX_CONCURRENT_JOBS:
+            job = next((j for j in waiting if running_count(j.user_id) < config.MAX_RUNNING_PER_USER), None)
+            if job is None:
+                break
             waiting.remove(job)
-        try:
-            if job.cancel.is_set():
-                await edit_safely(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
-            else:
-                await run_job(job)
-        except Exception:  # noqa: BLE001
-            log.exception("worker error")
-        finally:
-            job.state = "done"
-            jobs.pop(job.id, None)
-            job_queue.task_done()
+            running_jobs.add(job)
+            job.state = "downloading"
+            asyncio.create_task(run_wrapper(job))
 
 
 # =============================================================================== Telegram app
@@ -499,8 +531,9 @@ async def myplan_handler(_, message):
 @allowed_only
 async def status_handler(_, message):
     mine = user_jobs(message.from_user.id)
-    lines = [f"📋 Total waiting: {len(waiting)} • Running: {sum(1 for j in jobs.values() if j.state not in ('queued',))}"
-             f"/{config.MAX_CONCURRENT_JOBS}"]
+    uid = message.from_user.id
+    lines = [f"📋 Aapke Running: {running_count(uid)}/{config.MAX_RUNNING_PER_USER} • "
+             f"Waiting: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER}"]
     if not mine:
         lines.append("\nAapka koi active job nahi hai.")
     for j in mine:
@@ -514,7 +547,7 @@ async def status_handler(_, message):
 async def cancel_cmd(_, message):
     mine = user_jobs(message.from_user.id)
     for j in mine:
-        j.cancel.set()
+        await cancel_job(j)
     await message.reply_text(f"🚫 {len(mine)} job cancel kiye ja rahe hain." if mine else "Koi active job nahi hai.")
 
 
@@ -553,7 +586,7 @@ async def removepremium_handler(_, message):
         return await message.reply_text("Usage: /removepremium <code>user_id</code>")
     if store.remove_premium(uid):
         for j in user_jobs(uid):
-            j.cancel.set()
+            await cancel_job(j)
         await message.reply_text(f"🗑 <code>{uid}</code> ka Premium hata diya.")
     else:
         await message.reply_text("Ye user premium list me nahi hai.")
@@ -629,7 +662,8 @@ async def handle_url(message, url):
     user = message.from_user
     status = await message.reply_text("🔎 Link check ho raha hai...", quote=True, disable_web_page_preview=True)
     try:
-        pr = await asyncio.get_running_loop().run_in_executor(POOL, dl.probe, url)
+        async with probe_sem:      # limit parallel link analysis (25 links at once must not overload the server)
+            pr = await asyncio.get_running_loop().run_in_executor(POOL, dl.probe, url)
     except dl.ProbeError as exc:
         return await edit_safely(status, f"❌ {esc(str(exc)[:600])}")
     except Exception as exc:  # noqa: BLE001
@@ -668,7 +702,9 @@ async def url_handler(_, message):
             urls.append(u)
     if not urls:
         return await message.reply_text("❌ Valid HTTP/HTTPS link bhejo.")
-    for u in urls[:10]:
+    if len(urls) > config.MAX_URLS_PER_MESSAGE:
+        await message.reply_text(f"⚠️ Ek baar me max {config.MAX_URLS_PER_MESSAGE} links. Pehle {config.MAX_URLS_PER_MESSAGE} le raha hu.")
+    for u in urls[:config.MAX_URLS_PER_MESSAGE]:
         asyncio.create_task(handle_url(message, u))
 
 
@@ -718,7 +754,7 @@ async def cancel_callback(_, cq):
         return await cq.answer("Job pehle hi khatam ho chuka hai.")
     if cq.from_user.id != job.user_id and not store.is_admin(cq.from_user.id):
         return await cq.answer("Ye aapka job nahi hai.", show_alert=True)
-    job.cancel.set()
+    await cancel_job(job)
     await cq.answer("🚫 Cancel ho raha hai...")
 
 
@@ -744,7 +780,7 @@ async def main():
     state["ready"] = True
     log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s", me.username, yt_dlp.version.__version__,
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG)
-    workers = [asyncio.create_task(queue_worker()) for _ in range(config.MAX_CONCURRENT_JOBS)]
+    workers = [asyncio.create_task(dispatcher())]
     try:
         await idle()
     finally:
