@@ -349,7 +349,7 @@ def waiting_count(uid):
 
 
 async def enqueue(job, status_msg):
-    """Per-user rules: max MAX_RUNNING_PER_USER run together, max MAX_WAITING_PER_USER wait (5 + 20 = 25)."""
+    """Per-user rules: MAX_RUNNING_PER_USER (default 1) run at a time, MAX_WAITING_PER_USER (default 50) wait in line (FIFO)."""
     uid = job.user_id
     if running_count(uid) >= config.MAX_RUNNING_PER_USER and waiting_count(uid) >= config.MAX_WAITING_PER_USER:
         await edit_safely(status_msg, f"⚠️ Limit reached: {config.MAX_RUNNING_PER_USER} running + "
@@ -362,8 +362,9 @@ async def enqueue(job, status_msg):
     wake.set()
     await asyncio.sleep(0)                      # let the dispatcher start it right away if a slot is free
     if job in waiting:
-        text = (f"✅ <b>Added to waiting list</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
-                f"⏳ Your waiting jobs: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER} • "
+        position = [j for j in waiting if j.user_id == uid].index(job) + 1
+        text = (f"✅ <b>Added to your queue</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                f"🔢 Position: <b>{position}</b> • Waiting: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER} • "
                 f"Running: {running_count(uid)}/{config.MAX_RUNNING_PER_USER}")
         await edit_safely(status_msg, text, cancel_markup(job))
     return True
@@ -1045,11 +1046,20 @@ def option_buttons(token, options):
     return InlineKeyboardMarkup(rows)
 
 
-async def handle_url(message, url):
+async def handle_url(message, url, prev_done=None, my_done=None):
+    """prev_done / my_done: links of one message are analysed in parallel (fast) but queued strictly in the order sent."""
+    try:
+        await _handle_url(message, url, prev_done)
+    finally:
+        if my_done is not None and not my_done.done():
+            my_done.set_result(None)
+
+
+async def _handle_url(message, url, prev_done):
     user = message.from_user
     status = await message.reply_text("🔎 Checking link...", quote=True, disable_web_page_preview=True)
     try:
-        async with probe_sem:      # limit parallel link analysis (25 links at once must not overload the server)
+        async with probe_sem:      # limit parallel link analysis (50 links at once must not overload the server)
             pr = await asyncio.get_running_loop().run_in_executor(POOL, dl.probe, url)
     except dl.ProbeError as exc:
         return await edit_safely(status, f"❌ {esc(str(exc)[:600])}")
@@ -1057,11 +1067,13 @@ async def handle_url(message, url):
         log.exception("probe failed")
         return await edit_safely(status, f"❌ Link check fail: {esc(str(exc)[:400])}")
 
-    if pr["kind"] == "direct":                      # direct link -> start immediately
-        await enqueue(make_job_from_probe(user, message.chat.id, url, pr), status)
-        return
-    if pr["kind"] == "media" and len(pr["options"]) == 1:
-        await enqueue(make_job_from_probe(user, message.chat.id, url, pr, pr["options"][0]), status)
+    if pr["kind"] == "direct" or (pr["kind"] == "media" and len(pr["options"]) == 1):
+        if prev_done is not None:
+            await prev_done                         # wait until the link before this one has taken its place in the queue
+        if pr["kind"] == "direct":                  # direct link -> queued right away
+            await enqueue(make_job_from_probe(user, message.chat.id, url, pr), status)
+        else:
+            await enqueue(make_job_from_probe(user, message.chat.id, url, pr, pr["options"][0]), status)
         return
 
     clean_pending()
@@ -1091,8 +1103,12 @@ async def url_handler(_, message):
         return await message.reply_text("❌ Please send a valid HTTP/HTTPS link.")
     if len(urls) > config.MAX_URLS_PER_MESSAGE:
         await message.reply_text(f"⚠️ Max {config.MAX_URLS_PER_MESSAGE} links per message. Taking the first {config.MAX_URLS_PER_MESSAGE}.")
+    loop = asyncio.get_running_loop()
+    prev = None
     for u in urls[:config.MAX_URLS_PER_MESSAGE]:
-        asyncio.create_task(handle_url(message, u))
+        mine = loop.create_future()
+        asyncio.create_task(handle_url(message, u, prev, mine))
+        prev = mine
 
 
 @app.on_callback_query(filters.regex(r"^dl:"))
@@ -1125,13 +1141,14 @@ async def quality_callback(_, cq):
         option = ({"kind": "video", "height": 0, "label": "🏆 Best"} if opt_id == "pbest"
                   else {"kind": "audio", "codec": "mp3", "label": "🎵 MP3"})
         await cq.answer("✅ Adding playlist to queue...")
-        added = 0
-        for entry in pr["entries"][:config.PLAYLIST_LIMIT]:
+        added, entries = 0, pr["entries"][:config.PLAYLIST_LIMIT]
+        for entry in entries:
             msg = await app.send_message(chat_id, f"⏳ {esc(entry['title'][:100])}")
             if not await enqueue(Job(user, chat_id, entry["url"], "media", entry["title"], option=option), msg):
                 break
             added += 1
-        await edit_safely(cq.message, f"✅ {added} playlist item(s) added to the queue.")
+        tail = "" if added == len(entries) else f"\n⚠️ Queue limit reached: {len(entries) - added} item(s) were not added."
+        await edit_final(cq.message, f"✅ {added} playlist item(s) added to your queue (downloaded one by one).{tail}")
 
 
 @app.on_callback_query(filters.regex(r"^cx:"))

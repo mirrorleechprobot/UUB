@@ -57,9 +57,9 @@ UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, env_int("UPLOAD_WORKERS_PER_CONNEC
 MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
 MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
-MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 5))          # per user: jobs running at the same time
-MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 20))        # per user: jobs waiting (format already chosen)
-MAX_URLS_PER_MESSAGE = max(1, min(50, env_int("MAX_URLS_PER_MESSAGE", 25)))  # links handled from one message
+MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 1))          # per user: jobs running at the same time
+MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 50))        # per user: jobs waiting (format already chosen)
+MAX_URLS_PER_MESSAGE = max(1, min(50, env_int("MAX_URLS_PER_MESSAGE", 50)))  # links handled from one message
 PROBE_CONCURRENCY = max(1, min(10, env_int("PROBE_CONCURRENCY", 5)))         # link analysis in parallel
 PLAYLIST_LIMIT = max(1, min(50, env_int("PLAYLIST_LIMIT", 15)))
 
