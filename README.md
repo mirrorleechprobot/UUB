@@ -39,6 +39,7 @@ Koyeb: port 8080, health check `/health`. Persistent volume `/app/data` laga sak
 - `/setlog` handler pehle kabhi chalta hi nahi tha (URL handler use pehle pakad leta tha) — hata diya.
 
 ## Speed tips
+Uploads use `fastupload.py`: several MTProto connections per file (`UPLOAD_CONNECTIONS` x `UPLOAD_WORKERS_PER_CONNECTION`, default 4x4) instead of Pyrogram's single connection (~5-6 MB/s cap). Raise connections to 6-8 for more speed if Telegram does not throttle you.
 `ARIA2_CONNECTIONS`, `CONCURRENT_FRAGMENTS`, `MAX_CONCURRENT_TRANSMISSIONS` badha sakte ho (server/host allow kare to). TgCrypto installed hona zaruri hai (requirements me hai).
 
 ## Cookies

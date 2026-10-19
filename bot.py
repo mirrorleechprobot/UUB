@@ -22,6 +22,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
 import downloader as dl
+import fastupload
 import store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -472,6 +473,7 @@ async def dispatcher():
 
 # =============================================================================== Telegram app
 
+fastupload.install()      # multi-connection uploads (stock Pyrogram is single-connection, ~5-6 MB/s)
 _kwargs = dict(name="url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
                workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=60)
 try:
