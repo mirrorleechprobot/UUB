@@ -14,10 +14,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
-try:                                   # uvloop = faster event loop (less CPU per MB uploaded). Must run before Pyrogram's Client is created.
+try:                                   # uvloop = faster event loop (less CPU per MB uploaded). Must run BEFORE pyrogram is imported.
     import uvloop
-    uvloop.install()
-except Exception:  # noqa: BLE001
+    # Newer uvloop no longer creates a loop implicitly, and Pyrogram calls asyncio.get_event_loop() at import time,
+    # so create + set one explicitly (install() alone gives "There is no current event loop").
+    asyncio.set_event_loop(uvloop.new_event_loop())
+except Exception:  # noqa: BLE001  (uvloop missing / unsupported -> plain asyncio, still works)
     pass
 
 import requests
