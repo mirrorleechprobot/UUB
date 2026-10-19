@@ -185,7 +185,9 @@ def ytdlp_base_opts():
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
             "retries": config.MAX_RETRIES, "fragment_retries": config.MAX_RETRIES,
             "extractor_retries": config.MAX_RETRIES, "windowsfilenames": True,
-            "http_headers": {"User-Agent": config.DIRECT_USER_AGENT}}
+            "http_headers": {"User-Agent": config.DIRECT_USER_AGENT},
+            # YouTube needs a JS runtime (deno, see requirements) + EJS solver scripts for full-speed, all-quality formats.
+            "remote_components": ["ejs:github"]}
     cp = cookie_path()
     if _cookies_usable(cp):
         opts["cookiefile"] = str(cp.resolve())
@@ -223,10 +225,10 @@ def probe(url):
         msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:300]
         if http_info is None or http_info["status"] >= 400:
             # Page unreachable for our probe; let the downloader try anyway (signed/odd URLs).
-            raise ProbeError(f"Link open nahi ho paya ({http_err or 'HTTP ' + str(http_info['status'])}). {msg}")
-        raise ProbeError(f"Is link se koi video/audio/file nahi mili. {msg}")
+            raise ProbeError(f"Could not open this link ({http_err or 'HTTP ' + str(http_info['status'])}). {msg}")
+        raise ProbeError(f"No downloadable video, audio or file found at this link. {msg}")
     if not info:
-        raise ProbeError("Is link se koi media nahi mila.")
+        raise ProbeError("No media found at this link.")
 
     if info.get("_type") == "playlist":
         entries = []
@@ -237,12 +239,12 @@ def probe(url):
             if eurl and eurl.startswith("http"):
                 entries.append({"url": eurl, "title": e.get("title") or eurl})
         if not entries:
-            raise ProbeError("Playlist khali hai ya read nahi ho payi.")
+            raise ProbeError("The playlist is empty or could not be read.")
         return {"kind": "playlist", "title": info.get("title") or "Playlist", "entries": entries}
 
     options = _build_options(info)
     if not options:
-        raise ProbeError("Koi downloadable format nahi mila.")
+        raise ProbeError("No downloadable format found.")
     return {"kind": "media", "title": info.get("title") or url, "duration": info.get("duration") or 0,
             "uploader": info.get("uploader") or "", "options": options}
 
@@ -366,12 +368,12 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
             raise
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
-            raise RuntimeError("Download fail: " + " | ".join(e[:200] for e in errors)) from exc
+            raise RuntimeError("Download failed: " + " | ".join(e[:200] for e in errors)) from exc
     if not target.is_file() or target.stat().st_size == 0:
-        raise RuntimeError("Server ne khali file di.")
+        raise RuntimeError("The server returned an empty file.")
     if _looks_like_html(target) and target.suffix.lower() not in (".html", ".htm", ".txt"):
         target.unlink(missing_ok=True)
-        raise RuntimeError("Server ne file ki jagah HTML page diya (link expire / login / Referer chahiye).")
+        raise RuntimeError("The server returned an HTML page instead of a file (link expired, login required, or a Referer is needed).")
     progress.update({"status": "finished", "current": target.stat().st_size, "total": target.stat().st_size})
     return {"path": target, "title": target.name}
 
@@ -404,7 +406,7 @@ def download_media(url, option, workdir, progress, cancel):
             "ignoreerrors": False,
         })
         if option["kind"] == "audio":
-            opts["format"] = "ba/b"
+            opts["format"] = "ba[ext=m4a]/ba/b" if option["codec"] == "m4a" else "ba/b"   # m4a: no re-encode
             opts["postprocessors"] = [
                 {"key": "FFmpegExtractAudio", "preferredcodec": option["codec"],
                  "preferredquality": "320" if option["codec"] == "mp3" else "0"},
@@ -427,7 +429,7 @@ def download_media(url, option, workdir, progress, cancel):
         if not files:
             files = _scan(workdir)
         if not files:
-            raise FileNotFoundError("Download ho gaya par output file nahi mili.")
+            raise FileNotFoundError("Download finished but the output file was not found.")
         final = max(files, key=lambda p: p.stat().st_size)
         return {"path": final, "title": info.get("title") or final.stem}
 
@@ -442,7 +444,7 @@ def download_media(url, option, workdir, progress, cancel):
                 raise Cancelled() from exc
             errors.append(re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:280])
             log.warning("yt-dlp attempt (aria2=%s) failed: %s", use_aria, errors[-1][:120])
-    raise RuntimeError("Download fail: " + errors[-1])
+    raise RuntimeError("Download failed: " + errors[-1])
 
 
 def _scan(workdir):
@@ -529,8 +531,10 @@ def _remux_mp4(path):
         return path
     tmp = path.with_name(path.stem + ".remux.mp4")
     try:
+        # +faststart needs a 2nd full pass over the file; only worth it for small files.
+        fast = ["-movflags", "+faststart"] if path.stat().st_size <= 200 * 1024 * 1024 else []
         r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-                  "-sn", "-dn", "-movflags", "+faststart", str(tmp)])
+                  "-sn", "-dn", *fast, str(tmp)])
     except Exception:  # noqa: BLE001
         tmp.unlink(missing_ok=True)
         return path

@@ -130,6 +130,18 @@ def start_health_server():
 # user's chat into the log channel (server-side, no second upload => saves time and bandwidth).
 
 _last_log_error = {"text": None}
+_bg_tasks = set()
+
+
+def bg(coro):
+    """Fire-and-forget: log-channel traffic must never slow a job down."""
+    task = asyncio.ensure_future(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def log_bg(text):
+    bg(send_log(text))
 
 
 def _bot_api_sync(method, data):
@@ -151,12 +163,12 @@ async def bot_api(method, **data):
 def explain_log_error(description):
     d = (description or "").lower()
     if "chat not found" in d:
-        return ("Channel nahi mila. LOG_CHANNEL_ID galat hai, ya bot channel me add nahi hai. "
-                "ID -100xxxxxxxxxx format me honi chahiye (channel ka koi message @userinfobot / @getidsbot ko forward karke check karein).")
+        return ("Channel not found. LOG_CHANNEL_ID is wrong or the bot is not added to the channel. "
+                "The ID must look like -100xxxxxxxxxx (forward a channel post to @userinfobot / @getidsbot to check it).")
     if "not enough rights" in d or "have no rights" in d or "administrator" in d or "forbidden" in d:
-        return "Bot ko channel me Admin banao aur 'Post Messages' permission do."
+        return "Make the bot an Admin of the channel with the 'Post Messages' permission."
     if "kicked" in d or "not a member" in d:
-        return "Bot channel se remove/ban hai. Use dobara Admin ke roop me add karein."
+        return "The bot was removed/banned from the channel. Add it again as an Admin."
     return description or "unknown error"
 
 
@@ -186,13 +198,13 @@ async def copy_to_log(job, sent_message, part_label=""):
     if r.get("ok"):
         return True
     log.error("Copy to log channel failed: %s", explain_log_error(r.get("description")))
-    await send_log(f"⚠️ File log channel me copy nahi ho payi (job #{job.id}): {explain_log_error(r.get('description'))}")
+    await send_log(f"⚠️ Could not copy the file to the log channel (job #{job.id}): {explain_log_error(r.get('description'))}")
     return False
 
 
 async def check_log_channel():
     if not config.LOG_CHANNEL_ID:
-        return False, "LOG_CHANNEL_ID set nahi hai - log channel band hai."
+        return False, "LOG_CHANNEL_ID is not set - the log channel is disabled."
     r = await bot_api("getChat", chat_id=str(config.LOG_CHANNEL_ID))
     if not r.get("ok"):
         return False, explain_log_error(r.get("description"))
@@ -200,9 +212,9 @@ async def check_log_channel():
     m = await bot_api("getChatMember", chat_id=str(config.LOG_CHANNEL_ID), user_id=str(state["bot_id"]))
     res = m.get("result") or {}
     if res.get("status") not in ("administrator", "creator"):
-        return False, f"Channel '{title}' mil gaya par bot Admin nahi hai. Bot ko Admin banao (Post Messages permission)."
+        return False, f"Channel '{title}' found, but the bot is not an Admin. Make it an Admin (Post Messages permission)."
     if res.get("status") == "administrator" and res.get("can_post_messages") is False:
-        return False, f"Bot ko '{title}' me 'Post Messages' permission chahiye."
+        return False, f"The bot needs the 'Post Messages' permission in '{title}'."
     return True, f"Log channel OK: {title}"
 
 
@@ -254,9 +266,9 @@ async def enqueue(job, status_msg):
     """Per-user rules: max MAX_RUNNING_PER_USER run together, max MAX_WAITING_PER_USER wait (5 + 20 = 25)."""
     uid = job.user_id
     if running_count(uid) >= config.MAX_RUNNING_PER_USER and waiting_count(uid) >= config.MAX_WAITING_PER_USER:
-        await edit_safely(status_msg, f"⚠️ Aapki limit poori ho gayi: {config.MAX_RUNNING_PER_USER} running + "
-                                      f"{config.MAX_WAITING_PER_USER} waiting. Kuch jobs khatam hone do ya /queue se cancel karo, "
-                                      "phir dobara quality chuno.")
+        await edit_safely(status_msg, f"⚠️ Limit reached: {config.MAX_RUNNING_PER_USER} running + "
+                                      f"{config.MAX_WAITING_PER_USER} waiting. Wait for some jobs to finish or cancel them with /queue, "
+                                      "then choose the quality again.")
         return False
     job.status_msg = status_msg
     jobs[job.id] = job
@@ -264,8 +276,8 @@ async def enqueue(job, status_msg):
     wake.set()
     await asyncio.sleep(0)                      # let the dispatcher start it right away if a slot is free
     if job in waiting:
-        text = (f"✅ <b>Waiting list me add ho gaya</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
-                f"⏳ Aapke waiting jobs: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER} • "
+        text = (f"✅ <b>Added to waiting list</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                f"⏳ Your waiting jobs: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER} • "
                 f"Running: {running_count(uid)}/{config.MAX_RUNNING_PER_USER}")
         await edit_safely(status_msg, text, cancel_markup(job))
     return True
@@ -373,7 +385,7 @@ async def run_job(job):
     loop = asyncio.get_running_loop()
     started = time.monotonic()
     workdir = DOWNLOAD_DIR / f"job{job.id}_{int(time.time())}"
-    await send_log(f"🆕 Job #{job.id} start\n👤 {job.user_label}\n🔗 {job.url}\n🎞 {job.option.get('label', 'direct')}")
+    log_bg(f"🆕 Job #{job.id} start\n👤 {job.user_label}\n🔗 {job.url}\n🎞 {job.option.get('label', 'direct')}")
     final_text = None
     try:
         # ---- download
@@ -393,7 +405,7 @@ async def run_job(job):
         result = await fut
         job.title = result["title"] or job.title
         size = Path(result["path"]).stat().st_size
-        await send_log(f"✅ Download complete #{job.id}\n🎬 {job.title}\n📦 {size_text(size)}")
+        log_bg(f"✅ Download complete #{job.id}\n🎬 {job.title}\n📦 {size_text(size)}")
 
         # ---- post-process (remux to mp4, thumbnail, split >2GB)
         job.state = "processing"
@@ -408,20 +420,20 @@ async def run_job(job):
         for i, item in enumerate(items, 1):
             job.part_label = f"Part {i}/{len(items)}" if len(items) > 1 else ""
             sent = await upload_item(job, item, started)
-            await copy_to_log(job, sent, job.part_label)
+            bg(copy_to_log(job, sent, job.part_label))
 
         elapsed = time.monotonic() - started
         final_text = (f"✅ <b>Completed</b>  •  #{job.id}\n\n🎬 {esc(job.title[:130])}\n📦 {size_text(size)}"
                       + (f"\n📚 {len(items)} parts (Telegram 2GB limit)" if len(items) > 1 else "")
                       + f"\n🕒 Total time: {time_text(elapsed)}")
-        await send_log(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
+        log_bg(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
     except dl.Cancelled:
         final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
-        await send_log(f"🚫 Job #{job.id} cancelled by user\n👤 {job.user_label}")
+        log_bg(f"🚫 Job #{job.id} cancelled by user\n👤 {job.user_label}")
     except Exception as exc:  # noqa: BLE001
         log.exception("Job #%s failed", job.id)
         final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
-        await send_log(f"❌ Job #{job.id} failed\n👤 {job.user_label}\n🔗 {job.url}\n⚠️ {str(exc)[:700]}")
+        log_bg(f"❌ Job #{job.id} failed\n👤 {job.user_label}\n🔗 {job.url}\n⚠️ {str(exc)[:700]}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)   # always clean: failed jobs must not fill the disk
     if final_text:
@@ -470,9 +482,9 @@ except TypeError:      # very old Pyrogram without this option
 
 async def deny(message):
     await message.reply_text(
-        "🔒 <b>Ye bot sirf Premium users aur Admin ke liye hai.</b>\n\n"
-        f"Aapki Telegram ID: <code>{message.from_user.id}</code>\n"
-        "Premium lene ke liye Admin ko ye ID bhejo.")
+        "🔒 <b>This bot is only for Premium users and the Admin.</b>\n\n"
+        f"Your Telegram ID: <code>{message.from_user.id}</code>\n"
+        "Send this ID to the Admin to get Premium access.")
 
 
 def allowed_only(func):
@@ -497,22 +509,22 @@ PRIVATE = filters.private
 
 @app.on_message(PRIVATE & filters.command("id"))
 async def id_handler(_, message):
-    await message.reply_text(f"🆔 Aapki ID: <code>{message.from_user.id}</code>")
+    await message.reply_text(f"🆔 Your ID: <code>{message.from_user.id}</code>")
 
 
 @app.on_message(PRIVATE & filters.command(["start", "help"]))
 @allowed_only
 async def start_handler(_, message):
     text = ("🚀 <b>URL Uploader Bot</b>\n\n"
-            "Koi bhi link bhejo:\n"
-            "• <b>Direct file link</b> → turant download + upload start\n"
+            "Send any link:\n"
+            "• <b>Direct file link</b> → download + upload starts instantly\n"
             "• <b>Video/Audio site link</b> (YouTube, Instagram, Twitter/X, Facebook, TikTok, Vimeo, "
-            "Dailymotion, Reddit, Twitch, SoundCloud + 1800 sites) → quality buttons aayenge, "
-            "click karte hi queue me add\n\n"
-            "🎬 Har quality • 🎵 MP3/M4A • 📚 2GB+ file auto-split • ⚡ Multi-connection fast download\n\n"
+            "Dailymotion, Reddit, Twitch, SoundCloud + 1800 sites) → quality buttons appear, "
+            "click one and it is queued\n\n"
+            "🎬 Every quality • 🎵 MP3/M4A • 📚 2GB+ files auto-split • ⚡ Multi-connection fast download\n\n"
             "Commands: /queue  /cancel  /myplan  /id")
     if store.is_admin(message.from_user.id):
-        text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (ya user ke message par reply)\n"
+        text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
                  "/removepremium <code>id</code>\n/premiumlist\n/testlog\n/update (yt-dlp update)\n/restart")
     await message.reply_text(text)
 
@@ -522,7 +534,7 @@ async def start_handler(_, message):
 async def myplan_handler(_, message):
     uid = message.from_user.id
     if store.is_admin(uid):
-        return await message.reply_text("👑 Aap <b>Admin</b> ho: unlimited access.")
+        return await message.reply_text("👑 You are the <b>Admin</b>: unlimited access.")
     rec = store.premium_info(uid)
     await message.reply_text(f"💎 <b>Premium active</b>\n📅 Expiry: {date_text(rec.get('expires'))}")
 
@@ -532,10 +544,10 @@ async def myplan_handler(_, message):
 async def status_handler(_, message):
     mine = user_jobs(message.from_user.id)
     uid = message.from_user.id
-    lines = [f"📋 Aapke Running: {running_count(uid)}/{config.MAX_RUNNING_PER_USER} • "
+    lines = [f"📋 Your Running: {running_count(uid)}/{config.MAX_RUNNING_PER_USER} • "
              f"Waiting: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER}"]
     if not mine:
-        lines.append("\nAapka koi active job nahi hai.")
+        lines.append("\nYou have no active jobs.")
     for j in mine:
         lines.append(f"\n#{j.id} • {esc(j.state)} • {esc(j.title[:60])}")
     buttons = [[InlineKeyboardButton(f"❌ Cancel #{j.id}", callback_data=f"cx:{j.id}")] for j in mine[:8]]
@@ -548,7 +560,7 @@ async def cancel_cmd(_, message):
     mine = user_jobs(message.from_user.id)
     for j in mine:
         await cancel_job(j)
-    await message.reply_text(f"🚫 {len(mine)} job cancel kiye ja rahe hain." if mine else "Koi active job nahi hai.")
+    await message.reply_text(f"🚫 Cancelling {len(mine)} job(s)." if mine else "No active jobs.")
 
 
 # ------------------------------------------------------------------- admin: premium management
@@ -568,12 +580,12 @@ async def addpremium_handler(_, message):
     uid, rest = parse_target(message)
     if uid is None:
         return await message.reply_text("Usage: /addpremium <code>user_id [days]</code>\n"
-                                        "Days na do to Lifetime. Ya user ke message par reply karke /addpremium <code>[days]</code>")
+                                        "Leave days out for Lifetime. Or reply to a user's message with /addpremium <code>[days]</code>")
     days = int(rest[0]) if rest and rest[0].isdigit() and int(rest[0]) > 0 else None
     expires = store.add_premium(uid, days, by=message.from_user.id)
-    await message.reply_text(f"✅ <code>{uid}</code> ko Premium mil gaya.\n📅 Expiry: {date_text(expires)}")
+    await message.reply_text(f"✅ Premium granted to <code>{uid}</code>.\n📅 Expiry: {date_text(expires)}")
     try:
-        await app.send_message(uid, f"🎉 Aapko <b>Premium</b> access mil gaya!\n📅 Expiry: {date_text(expires)}\n\n/start dabao.")
+        await app.send_message(uid, f"🎉 You now have <b>Premium</b> access!\n📅 Expiry: {date_text(expires)}\n\nSend /start to begin.")
     except Exception:  # noqa: BLE001  (user may not have started the bot yet)
         pass
 
@@ -587,9 +599,9 @@ async def removepremium_handler(_, message):
     if store.remove_premium(uid):
         for j in user_jobs(uid):
             await cancel_job(j)
-        await message.reply_text(f"🗑 <code>{uid}</code> ka Premium hata diya.")
+        await message.reply_text(f"🗑 Premium removed for <code>{uid}</code>.")
     else:
-        await message.reply_text("Ye user premium list me nahi hai.")
+        await message.reply_text("This user is not in the premium list.")
 
 
 @app.on_message(PRIVATE & filters.command(["premiumlist", "premiums"]))
@@ -597,7 +609,7 @@ async def removepremium_handler(_, message):
 async def premiumlist_handler(_, message):
     users = store.list_premium()
     if not users:
-        return await message.reply_text("Abhi koi premium user nahi hai.")
+        return await message.reply_text("There are no premium users yet.")
     lines = [f"💎 <b>Premium users ({len(users)})</b>"] + [
         f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
     await message.reply_text("\n".join(lines))
@@ -608,8 +620,8 @@ async def premiumlist_handler(_, message):
 async def testlog_handler(_, message):
     ok, info = await check_log_channel()
     if ok:
-        ok = await send_log("✅ Test message: log channel sahi kaam kar raha hai.")
-        info = info if ok else "Channel mila par message send nahi hua (permissions check karein)."
+        ok = await send_log("✅ Test message: the log channel is working.")
+        info = info if ok else "Channel found, but the message could not be sent (check permissions)."
     state["log_ok"] = ok
     await message.reply_text(("✅ " if ok else "❌ ") + esc(info) + f"\n\nConfigured ID: <code>{config.LOG_CHANNEL_ID}</code>")
 
@@ -617,20 +629,20 @@ async def testlog_handler(_, message):
 @app.on_message(PRIVATE & filters.command("update"))
 @admin_only
 async def update_handler(_, message):
-    note = await message.reply_text("⏳ yt-dlp update ho raha hai...")
+    note = await message.reply_text("⏳ Updating yt-dlp...")
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "yt-dlp[default,curl-cffi]",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     out, _ = await proc.communicate()
     tail = esc(out.decode(errors="ignore")[-400:])
-    await edit_safely(note, ("✅ Update ho gaya. Naya version use karne ke liye /restart karein.\n" if proc.returncode == 0
-                             else "❌ Update fail:\n") + f"<code>{tail}</code>")
+    await edit_safely(note, ("✅ Updated. Use /restart to load the new version.\n" if proc.returncode == 0
+                             else "❌ Update failed:\n") + f"<code>{tail}</code>")
 
 
 @app.on_message(PRIVATE & filters.command("restart"))
 @admin_only
 async def restart_handler(_, message):
-    await message.reply_text("♻️ Restart ho raha hai (Docker/Koyeb auto-start karega)...")
+    await message.reply_text("♻️ Restarting (Docker/Koyeb will start it again)...")
     await asyncio.sleep(1)
     import os
     os._exit(0)
@@ -660,7 +672,7 @@ def option_buttons(token, options):
 
 async def handle_url(message, url):
     user = message.from_user
-    status = await message.reply_text("🔎 Link check ho raha hai...", quote=True, disable_web_page_preview=True)
+    status = await message.reply_text("🔎 Checking link...", quote=True, disable_web_page_preview=True)
     try:
         async with probe_sem:      # limit parallel link analysis (25 links at once must not overload the server)
             pr = await asyncio.get_running_loop().run_in_executor(POOL, dl.probe, url)
@@ -683,13 +695,13 @@ async def handle_url(message, url):
     if pr["kind"] == "media":
         dur = f"\n⏱ {time_text(pr['duration'])}" if pr.get("duration") else ""
         who = f"\n👤 {esc(pr['uploader'])}" if pr.get("uploader") else ""
-        await edit_safely(status, f"🎬 <b>{esc(pr['title'][:200])}</b>{who}{dur}\n\n👇 Quality chuno (click karte hi queue me add):",
+        await edit_safely(status, f"🎬 <b>{esc(pr['title'][:200])}</b>{who}{dur}\n\n👇 Choose a quality (it is queued as soon as you click):",
                           option_buttons(token, pr["options"]))
     else:
         n = min(len(pr["entries"]), config.PLAYLIST_LIMIT)
         opts = [{"id": "pbest", "label": f"🏆 All {n} videos (Best)"}, {"id": "pmp3", "label": f"🎵 All {n} as MP3"}]
         await edit_safely(status, f"📚 <b>Playlist:</b> {esc(pr['title'][:150])}\n{len(pr['entries'])} items "
-                                  f"(pehle {n} download honge)\n\n👇 Kya chahiye?", option_buttons(token, opts))
+                                  f"(first {n} will be downloaded)\n\n👇 What do you want?", option_buttons(token, opts))
 
 
 @app.on_message(PRIVATE & filters.text & ~filters.regex(r"^/"))
@@ -701,9 +713,9 @@ async def url_handler(_, message):
         if u not in urls:
             urls.append(u)
     if not urls:
-        return await message.reply_text("❌ Valid HTTP/HTTPS link bhejo.")
+        return await message.reply_text("❌ Please send a valid HTTP/HTTPS link.")
     if len(urls) > config.MAX_URLS_PER_MESSAGE:
-        await message.reply_text(f"⚠️ Ek baar me max {config.MAX_URLS_PER_MESSAGE} links. Pehle {config.MAX_URLS_PER_MESSAGE} le raha hu.")
+        await message.reply_text(f"⚠️ Max {config.MAX_URLS_PER_MESSAGE} links per message. Taking the first {config.MAX_URLS_PER_MESSAGE}.")
     for u in urls[:config.MAX_URLS_PER_MESSAGE]:
         asyncio.create_task(handle_url(message, u))
 
@@ -716,10 +728,10 @@ async def quality_callback(_, cq):
     _, token, opt_id = cq.data.split(":", 2)
     session = pending.get(token)
     if not session:
-        await cq.answer("Ye request expire ho gayi. Link dobara bhejo.", show_alert=True)
-        return await edit_safely(cq.message, "⌛ Request expire ho gayi. Link dobara bhejo.")
+        await cq.answer("This request expired. Send the link again.", show_alert=True)
+        return await edit_safely(cq.message, "⌛ Request expired. Send the link again.")
     if session["uid"] != uid:
-        return await cq.answer("Ye aapka link nahi hai.", show_alert=True)
+        return await cq.answer("This is not your link.", show_alert=True)
     if opt_id == "x":
         pending.pop(token, None)
         await cq.answer("Closed")
@@ -729,33 +741,33 @@ async def quality_callback(_, cq):
     if pr["kind"] == "media":
         option = next((o for o in pr["options"] if o["id"] == opt_id), None)
         if not option:
-            return await cq.answer("Option nahi mila.", show_alert=True)
+            return await cq.answer("Option not found.", show_alert=True)
         pending.pop(token, None)                   # one click -> one job (prevents double add)
-        await cq.answer("✅ Queue me add ho raha hai...")
+        await cq.answer("✅ Adding to queue...")
         await enqueue(Job(user, chat_id, url, "media", pr["title"], option=option), cq.message)
     else:
         pending.pop(token, None)
         option = ({"kind": "video", "height": 0, "label": "🏆 Best"} if opt_id == "pbest"
                   else {"kind": "audio", "codec": "mp3", "label": "🎵 MP3"})
-        await cq.answer("✅ Playlist queue me add ho rahi hai...")
+        await cq.answer("✅ Adding playlist to queue...")
         added = 0
         for entry in pr["entries"][:config.PLAYLIST_LIMIT]:
             msg = await app.send_message(chat_id, f"⏳ {esc(entry['title'][:100])}")
             if not await enqueue(Job(user, chat_id, entry["url"], "media", entry["title"], option=option), msg):
                 break
             added += 1
-        await edit_safely(cq.message, f"✅ Playlist se {added} item queue me add hue.")
+        await edit_safely(cq.message, f"✅ {added} playlist item(s) added to the queue.")
 
 
 @app.on_callback_query(filters.regex(r"^cx:"))
 async def cancel_callback(_, cq):
     job = jobs.get(int(cq.data.split(":", 1)[1]))
     if not job:
-        return await cq.answer("Job pehle hi khatam ho chuka hai.")
+        return await cq.answer("This job has already finished.")
     if cq.from_user.id != job.user_id and not store.is_admin(cq.from_user.id):
-        return await cq.answer("Ye aapka job nahi hai.", show_alert=True)
+        return await cq.answer("This is not your job.", show_alert=True)
     await cancel_job(job)
-    await cq.answer("🚫 Cancel ho raha hai...")
+    await cq.answer("🚫 Cancelling...")
 
 
 # =============================================================================== main
