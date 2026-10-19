@@ -260,8 +260,10 @@ def _unit_bytes(value, unit):
 _ARIA_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)\((\d+)%\).*?DL:([\d.]+)(B|KiB|MiB|GiB)")
 
 
-def _aria2(url, target, progress, cancel, expected_size):
-    cmd = ["aria2c", f"-x{config.ARIA2_CONNECTIONS}", f"-s{config.ARIA2_CONNECTIONS}", "-k1M", "-j1",
+def _aria2(url, target, progress, cancel, expected_size, connections=None):
+    n = connections or config.ARIA2_CONNECTIONS
+    cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
+           f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", "--enable-http-keep-alive=true", "--http-accept-gzip=false",
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true", "-c",
            "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
            f"--max-tries={config.MAX_RETRIES + 2}", "--retry-wait=3", "--connect-timeout=20", "--timeout=60",
@@ -352,15 +354,19 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
     progress.update({"status": "downloading", "current": 0, "total": size, "speed": 0, "eta": None})
     errors = []
     if HAVE_ARIA2:
-        try:
-            _aria2(url, target, progress, cancel, size)
-        except Cancelled:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
-            log.warning("aria2c path failed (%s); falling back to requests", str(exc)[:120])
-            target.unlink(missing_ok=True)
-            Path(str(target) + ".aria2").unlink(missing_ok=True)
+        # Some servers refuse many parallel connections (403/429): retry with fewer before the 1-connection fallback.
+        ladder = [config.ARIA2_CONNECTIONS] + ([4] if config.ARIA2_CONNECTIONS > 4 else [])
+        for conns in ladder:
+            try:
+                _aria2(url, target, progress, cancel, size, conns)
+                break
+            except Cancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc))
+                log.warning("aria2c (%s conn) failed (%s)", conns, str(exc)[:120])
+                target.unlink(missing_ok=True)
+                Path(str(target) + ".aria2").unlink(missing_ok=True)
     if not target.is_file():
         try:
             _requests_download(url, target, progress, cancel)
@@ -420,7 +426,8 @@ def download_media(url, option, workdir, progress, cancel):
         if use_aria and HAVE_ARIA2:
             n = config.ARIA2_CONNECTIONS
             opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
-            opts["external_downloader_args"] = {"aria2c": [f"-x{n}", f"-s{n}", "-k1M", "--file-allocation=none"]}
+            opts["external_downloader_args"] = {"aria2c": [f"-x{n}", f"-s{n}", "-k1M", "--file-allocation=none",
+                                                            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M"]}
             opts.pop("http_chunk_size", None)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)

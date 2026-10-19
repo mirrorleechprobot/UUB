@@ -2,6 +2,7 @@ import asyncio
 import html
 import itertools
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -12,6 +13,12 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+
+try:                                   # uvloop = faster event loop (less CPU per MB uploaded). Must run before Pyrogram's Client is created.
+    import uvloop
+    uvloop.install()
+except Exception:  # noqa: BLE001
+    pass
 
 import requests
 import yt_dlp
@@ -32,7 +39,8 @@ DOWNLOAD_DIR = Path(config.DOWNLOAD_DIR).resolve()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 Path(config.DATA_DIR).mkdir(parents=True, exist_ok=True)
 
-POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="uub")
+POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="uub")          # downloads / ffmpeg (one thread per running job)
+API_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="uub-api")   # Bot API calls: never starved by long downloads
 state = {"ready": False, "bot_id": 0, "log_ok": False}
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 PENDING_TTL = 30 * 60
@@ -85,18 +93,53 @@ def cancel_markup(job):
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cx:{job.id}")]])
 
 
+_edit_block = {}       # chat_id -> monotonic time before which progress edits are skipped (FloodWait / slow edits)
+_edit_penalty = {}     # chat_id -> current back-off in seconds
+
+
+def _chat_of(message):
+    return getattr(getattr(message, "chat", None), "id", 0)
+
+
+async def _try_edit(message, text, markup):
+    """One edit attempt. True = done (or nothing more to do), False = flood-waited / too slow (back-off set)."""
+    chat = _chat_of(message)
+    try:
+        await asyncio.wait_for(message.edit_text(text, reply_markup=markup, disable_web_page_preview=True),
+                               config.EDIT_TIMEOUT)
+        _edit_penalty.pop(chat, None)
+        return True
+    except FloodWait as exc:
+        _edit_block[chat] = time.monotonic() + exc.value + 1
+        log.warning("Edit FloodWait in chat %s: pausing progress edits for %ss", chat, exc.value)
+        return False
+    except asyncio.TimeoutError:
+        # Pyrogram is probably sleeping through a long FloodWait: stop touching this chat for a while.
+        penalty = min(300, max(20, _edit_penalty.get(chat, 10) * 2))
+        _edit_penalty[chat] = penalty
+        _edit_block[chat] = time.monotonic() + penalty
+        log.warning("Edit timed out in chat %s: pausing progress edits for %ss", chat, penalty)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        if "MESSAGE_NOT_MODIFIED" not in str(exc):
+            log.debug("edit skipped: %s", exc)
+        return True
+
+
 async def edit_safely(message, text, markup=None):
-    for attempt in range(2):
-        try:
-            await message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
-            return
-        except FloodWait as exc:
-            if attempt:
-                return
-            await asyncio.sleep(exc.value)
-        except Exception as exc:  # noqa: BLE001
-            if "MESSAGE_NOT_MODIFIED" not in str(exc):
-                log.debug("edit skipped: %s", exc)
+    """Progress edit: never blocks a job and never fails it. Silently skipped while the chat is in a flood back-off."""
+    if time.monotonic() < _edit_block.get(_chat_of(message), 0):
+        return
+    await _try_edit(message, text, markup)
+
+
+async def edit_final(message, text, markup=None):
+    """Final status (Completed / Failed / Cancelled): waits out a flood back-off instead of being skipped."""
+    for _ in range(8):
+        wait = _edit_block.get(_chat_of(message), 0) - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(min(wait, 60))
+        if await _try_edit(message, text, markup):
             return
 
 
@@ -132,6 +175,8 @@ def start_health_server():
 
 _last_log_error = {"text": None}
 _bg_tasks = set()
+_log_lock = asyncio.Lock()
+LOG_GAP = 1.0          # seconds between log-channel requests (channels accept ~20 messages/minute)
 
 
 def bg(coro):
@@ -145,10 +190,10 @@ def log_bg(text):
     bg(send_log(text))
 
 
-def _bot_api_sync(method, data):
-    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
+def _bot_api_sync(method, data, token=None):
+    url = f"https://api.telegram.org/bot{token or config.BOT_TOKEN}/{method}"
     try:
-        r = requests.post(url, data=data, timeout=40)
+        r = requests.post(url, data=data, timeout=60)
         try:
             return r.json()
         except ValueError:
@@ -157,8 +202,28 @@ def _bot_api_sync(method, data):
         return {"ok": False, "description": f"network error: {type(exc).__name__}"}
 
 
-async def bot_api(method, **data):
-    return await asyncio.get_running_loop().run_in_executor(POOL, _bot_api_sync, method, data)
+async def bot_api(method, _token=None, **data):
+    """Bot API call with automatic flood handling: HTTP 429 -> wait retry_after seconds and try again."""
+    loop = asyncio.get_running_loop()
+    r = {}
+    for _ in range(6):
+        r = await loop.run_in_executor(API_POOL, _bot_api_sync, method, data, _token)
+        if r.get("ok") or r.get("error_code") != 429:
+            return r
+        wait = int((r.get("parameters") or {}).get("retry_after") or 5) + 1
+        if wait > config.FLOOD_MAX_WAIT:
+            return r
+        log.warning("Bot API FloodWait on %s: sleeping %ss", method, wait)
+        await asyncio.sleep(wait)
+    return r
+
+
+async def _log_call(method, **data):
+    """All log-channel requests go through one lock + a small gap, so a burst of finished jobs cannot flood the channel."""
+    async with _log_lock:
+        r = await bot_api(method, **data)
+        await asyncio.sleep(LOG_GAP)
+    return r
 
 
 def explain_log_error(description):
@@ -177,8 +242,8 @@ async def send_log(text):
     if not config.LOG_CHANNEL_ID:
         return False
     for i in range(0, len(text), 4000):
-        r = await bot_api("sendMessage", chat_id=str(config.LOG_CHANNEL_ID), text=text[i:i + 4000],
-                          disable_web_page_preview="true")
+        r = await _log_call("sendMessage", chat_id=str(config.LOG_CHANNEL_ID), text=text[i:i + 4000],
+                            disable_web_page_preview="true")
         if not r.get("ok"):
             desc = explain_log_error(r.get("description"))
             if desc != _last_log_error["text"]:
@@ -193,14 +258,22 @@ async def copy_to_log(job, sent_message, part_label=""):
     """Server-side copy of the delivered file into the log channel (best effort, never fails the job)."""
     if not config.LOG_CHANNEL_ID or sent_message is None:
         return False
-    caption = (f"👤 {job.user_label}\n🔗 {job.url}\n🎬 {job.title}" + (f"\n📚 {part_label}" if part_label else ""))[:1000]
-    r = await bot_api("copyMessage", chat_id=str(config.LOG_CHANNEL_ID), from_chat_id=str(sent_message.chat.id),
-                      message_id=str(sent_message.id), caption=caption)
+    caption = log_caption(job, part_label)
+    r = await _log_call("copyMessage", chat_id=str(config.LOG_CHANNEL_ID), from_chat_id=str(sent_message.chat.id),
+                        message_id=str(sent_message.id), caption=caption)
     if r.get("ok"):
         return True
     log.error("Copy to log channel failed: %s", explain_log_error(r.get("description")))
     await send_log(f"⚠️ Could not copy the file to the log channel (job #{job.id}): {explain_log_error(r.get('description'))}")
     return False
+
+
+async def copy_to_user(job, stored_message, caption):
+    """Helper-bot path: the file already sits in the storage channel -> the main bot copies it to the user (instant, no upload)."""
+    r = await bot_api("copyMessage", chat_id=str(job.chat_id), from_chat_id=str(config.LOG_CHANNEL_ID),
+                      message_id=str(stored_message.id), caption=caption, parse_mode="HTML")
+    if not r.get("ok"):
+        raise RuntimeError("Could not deliver the file from the storage channel: " + explain_log_error(r.get("description")))
 
 
 async def check_log_channel():
@@ -217,6 +290,14 @@ async def check_log_channel():
     if res.get("status") == "administrator" and res.get("can_post_messages") is False:
         return False, f"The bot needs the 'Post Messages' permission in '{title}'."
     return True, f"Log channel OK: {title}"
+
+
+def log_caption(job, part_label=""):
+    return (f"👤 {job.user_label}\n🔗 {job.url}\n🎬 {job.title}" + (f"\n📚 {part_label}" if part_label else ""))[:1000]
+
+
+def user_caption(job, part_label=""):
+    return f"🎬 {esc(job.title[:200])}" + (f"\n📚 {part_label}" if part_label else "")
 
 
 # =============================================================================== jobs
@@ -241,6 +322,8 @@ class Job:
         self.status_msg = None
         self.state = "queued"
         self.part_label = ""
+        self.up_total = 0              # upload progress over ALL parts of this job
+        self.up_cur = {}               # part slot -> bytes uploaded so far
 
 
 jobs = {}                      # id -> Job (queued or running)
@@ -291,7 +374,7 @@ async def cancel_job(job):
         waiting.remove(job)
         jobs.pop(job.id, None)
         job.state = "done"
-        await edit_safely(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
+        bg(edit_final(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}"))
 
 
 def make_job_from_probe(user, chat_id, url, pr, option=None):
@@ -301,81 +384,234 @@ def make_job_from_probe(user, chat_id, url, pr, option=None):
 
 
 # --------------------------------------------------------------------------- upload
+# Uploaders: the main bot plus optional helper bots (HELPER_BOT_TOKENS).
+#   main bot   -> uploads straight into the user's chat (then a server-side copy goes to the log channel)
+#   helper bot -> uploads into the storage (= log) channel; the main bot copies it to the user (instant, no re-upload)
+# A job picks the least busy uploader, so parallel jobs spread over several accounts / connection sets and FloodWaits
+# of one bot do not stop the others. For files that must be split (>2 GB) the parts are uploaded by several helpers at once.
 
-async def send_item(job, item, caption, cb):
+PERMANENT_HELPER_ERRORS = {"PeerIdInvalid", "ChannelInvalid", "ChannelPrivate", "ChatAdminRequired", "ChatWriteForbidden",
+                           "UserBannedInChannel", "ChatForbidden"}
+
+
+class UploadClient:
+    def __init__(self, client, name, is_main, token=None):
+        self.client, self.name, self.is_main, self.token = client, name, is_main, token
+        self.id, self.username = 0, ""
+        self.active = 0              # uploads running right now
+        self.uploaded = 0            # files delivered
+        self.ok = True               # False = disabled (bad token / not admin / cannot reach the channel)
+        self.note = ""
+        self.flood_until = 0.0       # monotonic time until which this bot is in a FloodWait
+
+    @property
+    def usable(self):
+        return self.ok and time.monotonic() >= self.flood_until
+
+
+uploaders = []                       # filled after the Telegram clients exist (main_uc first)
+
+
+def pick_uploader(exclude=(), helpers_only=False):
+    cands = [u for u in uploaders if u.usable and u not in exclude and not (helpers_only and u.is_main)]
+    if not cands:
+        return None if helpers_only else main_uc
+    return min(cands, key=lambda u: (u.active, 0 if u.is_main else 1))      # least busy; main wins ties (no copy needed)
+
+
+def ready_helpers():
+    return [u for u in uploaders if not u.is_main and u.usable]
+
+
+async def sleep_cancellable(job, seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if job.cancel.is_set():
+            raise dl.Cancelled()
+        await asyncio.sleep(max(0.05, min(1.0, end - time.monotonic())))
+
+
+async def flood_retry(job, uc, factory, what):
+    """Run factory(); on a FloodWait that Pyrogram did not absorb itself, wait it out (cancellable) and retry."""
+    for attempt in range(5):
+        try:
+            return await factory()
+        except FloodWait as fw:
+            wait = fw.value + 1
+            if wait > config.FLOOD_MAX_WAIT or attempt == 4:
+                raise RuntimeError(f"Telegram FloodWait: {fw.value}s required ({what}). Please try again later.") from fw
+            uc.flood_until = time.monotonic() + wait
+            log.warning("[%s] FloodWait %ss during %s (job #%s)", uc.name, wait, what, job.id)
+            await edit_safely(job.status_msg, f"⏳ <b>Telegram FloodWait</b>  •  #{job.id}\n"
+                                              f"Resuming automatically in {time_text(wait)}...", cancel_markup(job))
+            await sleep_cancellable(job, wait)
+
+
+async def send_item(uc, chat_id, job, item, caption, cb):
+    client = uc.client
     path, thumb = str(item["path"]), (str(item["thumb"]) if item["thumb"] else None)
     kind = item["kind"]
     size = Path(path).stat().st_size
-    for attempt in range(2):
+
+    async def attempt():
         try:
-            try:
-                if kind == "video":
-                    return await app.send_video(job.chat_id, path, caption=caption, duration=item["duration"],
-                                                width=item["width"], height=item["height"], thumb=thumb,
-                                                supports_streaming=True, progress=cb)
-                if kind == "audio":
-                    return await app.send_audio(job.chat_id, path, caption=caption, duration=item["duration"],
-                                                performer=item["artist"] or None,
-                                                title=item["title"] or job.title[:60], progress=cb)
-                if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
-                    return await app.send_photo(job.chat_id, path, caption=caption, progress=cb)
-                return await app.send_document(job.chat_id, path, caption=caption, thumb=thumb, progress=cb)
-            except FloodWait:
+            if kind == "video":
+                return await client.send_video(chat_id, path, caption=caption, duration=item["duration"],
+                                               width=item["width"], height=item["height"], thumb=thumb,
+                                               supports_streaming=True, progress=cb)
+            if kind == "audio":
+                return await client.send_audio(chat_id, path, caption=caption, duration=item["duration"],
+                                               performer=item["artist"] or None,
+                                               title=item["title"] or job.title[:60], progress=cb)
+            if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
+                return await client.send_photo(chat_id, path, caption=caption, progress=cb)
+            return await client.send_document(chat_id, path, caption=caption, thumb=thumb, progress=cb)
+        except FloodWait:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if job.cancel.is_set() or kind in ("document",):
                 raise
-            except Exception as exc:  # noqa: BLE001
-                if job.cancel.is_set() or kind in ("document",):
-                    raise
-                log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
-                return await app.send_document(job.chat_id, path, caption=caption, progress=cb)
-        except FloodWait as fw:
-            if attempt:
-                raise
-            await asyncio.sleep(fw.value)
+            log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
+            return await client.send_document(chat_id, path, caption=caption, progress=cb)
+
+    return await flood_retry(job, uc, attempt, "upload")
 
 
-async def upload_item(job, item, started):
-    path = Path(item["path"])
-    total = path.stat().st_size
-    shared = {"current": 0, "speed": 0.0, "last_bytes": 0, "last_time": time.monotonic()}
-    stop = asyncio.Event()
+async def upload_one(job, uc, item, slot, chat_id, caption):
+    """Upload one file with one client into chat_id. Progress goes into job.up_cur[slot]."""
+    size = Path(item["path"]).stat().st_size
 
     def callback(current, total_bytes):
         if job.cancel.is_set():
-            app.stop_transmission()
-        now = time.monotonic()
-        delta = now - shared["last_time"]
-        if delta >= 0.5:
-            shared["speed"] = max(0.0, current - shared["last_bytes"]) / delta
-            shared["last_bytes"], shared["last_time"] = current, now
-        shared["current"] = current
+            uc.client.stop_transmission()
+        job.up_cur[slot] = current
 
-    async def reporter():
-        last = 0.0
-        while not stop.is_set():
-            now = time.monotonic()
-            if now - last >= config.PROGRESS_UPDATE_INTERVAL:
-                cur, speed = min(total, shared["current"]), shared["speed"]
-                await edit_safely(job.status_msg, progress_text(
-                    job, "Uploading", job.title, cur, total, speed, (total - cur) / speed if speed > 0 else None,
-                    now - started), cancel_markup(job))
-                last = now
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=1)
-            except asyncio.TimeoutError:
-                pass
+    job.up_cur[slot] = 0
+    sent = await send_item(uc, chat_id, job, item, caption, callback)
+    if sent is None or job.cancel.is_set():
+        raise dl.Cancelled()
+    job.up_cur[slot] = size
+    return sent
 
-    caption = f"🎬 {esc(job.title[:200])}" + (f"\n📚 {job.part_label}" if job.part_label else "")
-    task = asyncio.create_task(reporter())
+
+def note_helper_failure(uc, exc):
+    name = type(exc).__name__
+    log.warning("[%s] upload via helper failed: %s: %s", uc.name, name, str(exc)[:200])
+    if name in PERMANENT_HELPER_ERRORS or "Peer id invalid" in str(exc):
+        uc.ok = False
+        uc.note = f"disabled: {name} (check admin rights in the storage channel, then /helpers)"
+        log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) disabled: {name}. Make sure it is Admin (Post Messages) of this channel, then run /helpers.")
+
+
+async def deliver_item(job, item, uc, slot, label):
+    """Upload one file to the user. Returns (message_in_user_chat or None, already_in_log_channel)."""
+    caption = user_caption(job, label)
+    if not uc.is_main:
+        uc.active += 1
+        try:
+            stored = await upload_one(job, uc, item, slot, config.LOG_CHANNEL_ID, log_caption(job, label))
+            await copy_to_user(job, stored, caption)
+            uc.uploaded += 1
+            return None, True
+        except dl.Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if job.cancel.is_set():
+                raise dl.Cancelled() from exc
+            note_helper_failure(uc, exc)           # helper trouble must never fail the job: fall back to the main bot
+        finally:
+            uc.active -= 1
+    main_uc.active += 1
     try:
-        sent = await send_item(job, item, caption, callback)
-        if sent is None or job.cancel.is_set():
-            raise dl.Cancelled()
-        return sent
+        sent = await upload_one(job, main_uc, item, slot, job.chat_id, caption)
+        main_uc.uploaded += 1
+        return sent, False
+    finally:
+        main_uc.active -= 1
+
+
+async def upload_parts_parallel(job, items, helpers):
+    """Split files: several helpers upload different parts at the same time, the user still gets them in order."""
+    n = len(items)
+    gate = asyncio.Semaphore(len(helpers))
+
+    async def stage(i, item):
+        async with gate:
+            tried = set()
+            while True:
+                uc = pick_uploader(exclude=tried, helpers_only=True)
+                if uc is None:
+                    raise RuntimeError("All helper bots failed while uploading the parts.")
+                uc.active += 1
+                try:
+                    stored = await upload_one(job, uc, item, i, config.LOG_CHANNEL_ID, log_caption(job, f"Part {i}/{n}"))
+                    uc.uploaded += 1
+                    return stored
+                except dl.Cancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if job.cancel.is_set():
+                        raise dl.Cancelled() from exc
+                    note_helper_failure(uc, exc)
+                    tried.add(uc)
+                finally:
+                    uc.active -= 1
+
+    tasks = [asyncio.create_task(stage(i, item)) for i, item in enumerate(items, 1)]
+    try:
+        for i, task in enumerate(tasks, 1):
+            stored = await task
+            job.part_label = f"Part {i}/{n}"
+            await copy_to_user(job, stored, user_caption(job, f"Part {i}/{n}"))
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def upload_reporter(job, started, stop):
+    last, prev_b, prev_t, speed = 0.0, 0, time.monotonic(), 0.0
+    while not stop.is_set():
+        now = time.monotonic()
+        cur = min(job.up_total, sum(job.up_cur.values()))
+        if now - prev_t >= 1.0:
+            inst = max(0, cur - prev_b) / (now - prev_t)
+            speed = inst if speed == 0 else 0.6 * speed + 0.4 * inst
+            prev_b, prev_t = cur, now
+        if now - last >= config.PROGRESS_UPDATE_INTERVAL:
+            await edit_safely(job.status_msg, progress_text(
+                job, "Uploading", job.title, cur, job.up_total, speed,
+                (job.up_total - cur) / speed if speed > 0 else None, now - started), cancel_markup(job))
+            last = now
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def upload_all(job, items, started):
+    n = len(items)
+    job.up_total = sum(Path(i["path"]).stat().st_size for i in items)
+    job.up_cur = {}
+    stop = asyncio.Event()
+    reporter = asyncio.create_task(upload_reporter(job, started, stop))
+    try:
+        helpers = ready_helpers()
+        if n > 1 and helpers:
+            job.part_label = f"{n} parts"
+            await upload_parts_parallel(job, items, helpers)
+            return
+        for i, item in enumerate(items, 1):
+            label = f"Part {i}/{n}" if n > 1 else ""
+            job.part_label = label
+            sent, in_log = await deliver_item(job, item, pick_uploader(), i, label)
+            if not in_log:
+                bg(copy_to_log(job, sent, label))
     finally:
         stop.set()
-        task.cancel()
+        reporter.cancel()
         try:
-            await task
+            await reporter
         except asyncio.CancelledError:
             pass
 
@@ -418,10 +654,7 @@ async def run_job(job):
 
         # ---- upload (to the user) + server-side copy to the log channel
         job.state = "uploading"
-        for i, item in enumerate(items, 1):
-            job.part_label = f"Part {i}/{len(items)}" if len(items) > 1 else ""
-            sent = await upload_item(job, item, started)
-            bg(copy_to_log(job, sent, job.part_label))
+        await upload_all(job, items, started)
 
         elapsed = time.monotonic() - started
         final_text = (f"✅ <b>Completed</b>  •  #{job.id}\n\n🎬 {esc(job.title[:130])}\n📦 {size_text(size)}"
@@ -438,13 +671,13 @@ async def run_job(job):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)   # always clean: failed jobs must not fill the disk
     if final_text:
-        await edit_safely(job.status_msg, final_text)
+        await edit_final(job.status_msg, final_text)
 
 
 async def run_wrapper(job):
     try:
         if job.cancel.is_set():
-            await edit_safely(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
+            await edit_final(job.status_msg, f"🚫 <b>Cancelled</b>  •  #{job.id}")
         else:
             await run_job(job)
     except Exception:  # noqa: BLE001
@@ -475,11 +708,90 @@ async def dispatcher():
 
 fastupload.install()      # multi-connection uploads (stock Pyrogram is single-connection, ~5-6 MB/s)
 _kwargs = dict(name="url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
-               workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=60)
+               workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=config.FLOOD_SLEEP_THRESHOLD)
 try:
     app = Client(**_kwargs, max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS)
 except TypeError:      # very old Pyrogram without this option
     app = Client(**_kwargs)
+
+main_uc = UploadClient(app, "main", True)
+uploaders.append(main_uc)
+
+
+def make_helper_client(token, idx):
+    kwargs = dict(name=f"helper{idx}", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=token, in_memory=True,
+                  workers=2, parse_mode=ParseMode.HTML, sleep_threshold=config.FLOOD_SLEEP_THRESHOLD)
+    try:
+        return Client(**kwargs, max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS)
+    except TypeError:
+        return Client(**kwargs)
+
+
+async def verify_helper(uc):
+    """A helper is usable only if it is an Admin of the storage channel AND its own MTProto session can address that channel."""
+    r = await bot_api("getChatMember", _token=uc.token, chat_id=str(config.LOG_CHANNEL_ID), user_id=str(uc.id))
+    res = r.get("result") or {}
+    if not r.get("ok"):
+        return False, explain_log_error(r.get("description"))
+    if res.get("status") not in ("administrator", "creator"):
+        return False, "not an Admin of the log channel - add it as Admin (Post Messages)"
+    if res.get("status") == "administrator" and res.get("can_post_messages") is False:
+        return False, "needs the 'Post Messages' permission in the log channel"
+    return True, ""
+
+
+async def helper_knows_channel(uc):
+    try:
+        await uc.client.get_chat(config.LOG_CHANNEL_ID)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.info("[%s] cannot address the channel yet: %s", uc.name, type(exc).__name__)
+        return False
+
+
+async def check_helpers(retry_wait=12):
+    """(Re)verify every helper. Returns list of (uc, ok, note)."""
+    helpers = [u for u in uploaders if not u.is_main]
+    for uc in helpers:
+        ok, note = await verify_helper(uc) if state["log_ok"] else (False, "log channel is not working (see /testlog)")
+        uc.ok, uc.note = ok, note
+    unknown = [uc for uc in helpers if uc.ok and not await helper_knows_channel(uc)]
+    if unknown:
+        # A bot only learns a channel's access_hash from an update. Post one message so every helper receives it.
+        await send_log("🔧 Helper bots are syncing with this channel (you can ignore this message).")
+        for _ in range(retry_wait):
+            await asyncio.sleep(1)
+            unknown = [uc for uc in unknown if not await helper_knows_channel(uc)]
+            if not unknown:
+                break
+        for uc in unknown:
+            uc.ok = False
+            uc.note = "cannot address the log channel (post any message there, then /helpers)"
+    return [(uc, uc.ok, uc.note) for uc in helpers]
+
+
+async def start_helpers():
+    tokens = []
+    for t in config.HELPER_BOT_TOKENS:
+        if t != config.BOT_TOKEN and t not in tokens:
+            tokens.append(t)
+
+    async def boot(idx, token):
+        uc = UploadClient(make_helper_client(token, idx), f"helper{idx}", False, token)
+        try:
+            await uc.client.start()
+            me = await uc.client.get_me()
+            uc.id, uc.username = me.id, me.username or str(me.id)
+        except Exception as exc:  # noqa: BLE001
+            uc.ok, uc.note = False, f"start failed: {type(exc).__name__}"
+            log.error("[%s] could not start: %s", uc.name, type(exc).__name__)
+        return uc
+
+    for uc in await asyncio.gather(*(boot(i, t) for i, t in enumerate(tokens, 1))):
+        uploaders.append(uc)
+    if len(uploaders) > 1:
+        for uc, ok, note in await check_helpers():
+            (log.info if ok else log.error)("Helper %s (@%s): %s", uc.name, uc.username, "ready" if ok else note)
 
 
 async def deny(message):
@@ -527,7 +839,8 @@ async def start_handler(_, message):
             "Commands: /queue  /cancel  /myplan  /id")
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
-                 "/removepremium <code>id</code>\n/premiumlist\n/testlog\n/update (yt-dlp update)\n/restart")
+                 "/removepremium <code>id</code>\n/premiumlist\n/testlog\n/helpers (helper bots status)\n"
+                 "/speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp update)\n/restart")
     await message.reply_text(text)
 
 
@@ -626,6 +939,64 @@ async def testlog_handler(_, message):
         info = info if ok else "Channel found, but the message could not be sent (check permissions)."
     state["log_ok"] = ok
     await message.reply_text(("✅ " if ok else "❌ ") + esc(info) + f"\n\nConfigured ID: <code>{config.LOG_CHANNEL_ID}</code>")
+
+
+@app.on_message(PRIVATE & filters.command("helpers"))
+@admin_only
+async def helpers_handler(_, message):
+    if not config.HELPER_BOT_TOKENS:
+        return await message.reply_text("ℹ️ No helper bots configured. Set <code>HELPER_BOT_TOKENS</code> "
+                                        "(comma separated) and make every helper an Admin of the log channel.")
+    note = await message.reply_text("🔎 Checking helper bots...")
+    await check_helpers()
+    lines = ["🤖 <b>Uploaders</b>"]
+    for u in uploaders:
+        state_txt = "🟢 ready" if u.usable else ("🟡 FloodWait" if u.ok else "🔴 " + esc(u.note or "disabled"))
+        who = "main" if u.is_main else f"{u.name} @{esc(u.username)}"
+        lines.append(f"• {who}: {state_txt} • active {u.active} • delivered {u.uploaded}")
+    await edit_safely(note, "\n".join(lines))
+
+
+def _make_test_file(path, mb):
+    with open(path, "wb") as fh:
+        for _ in range(mb):
+            fh.write(os.urandom(1024 * 1024))       # random data: cannot be compressed, so the result is honest
+
+
+@app.on_message(PRIVATE & filters.command("speedtest"))
+@admin_only
+async def speedtest_handler(_, message):
+    """/speedtest [MB] [connections] [workers] - uploads random data to this chat and reports the real speed."""
+    args = [int(a) for a in message.command[1:4] if a.isdigit()]
+    mb = max(10, min(500, args[0] if args else 200))
+    old = (config.UPLOAD_CONNECTIONS, config.UPLOAD_WORKERS_PER_CONNECTION, config.UPLOAD_ADAPTIVE)
+    if len(args) > 1:
+        config.UPLOAD_CONNECTIONS = max(1, min(16, args[1]))
+        config.UPLOAD_ADAPTIVE = False               # test exactly the requested number of connections
+    if len(args) > 2:
+        config.UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, args[2]))
+    note = await message.reply_text(f"⏳ Creating a {mb} MB test file...")
+    path = DOWNLOAD_DIR / f"speedtest_{int(time.time())}.bin"
+    try:
+        await asyncio.get_running_loop().run_in_executor(POOL, _make_test_file, path, mb)
+        conns = f"{config.UPLOAD_CONNECTIONS} x {config.UPLOAD_WORKERS_PER_CONNECTION}"
+        await edit_safely(note, f"📤 Uploading {mb} MB ({conns} connections x workers)...")
+        t0 = time.monotonic()
+        sent = await app.send_document(message.chat.id, str(path), caption="speedtest", force_document=True)
+        took = max(0.001, time.monotonic() - t0)
+        try:
+            await sent.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await edit_final(note, f"⚡ <b>Upload speed test</b>\n📦 {mb} MB in {took:.1f}s\n🚀 <b>{mb / took:.1f} MB/s</b> "
+                               f"({mb * 8 / took:.0f} Mbit/s)\n🔧 {conns} (connections x workers)\n\n"
+                               "Try: <code>/speedtest 400 12 4</code> and compare (use 400+ MB so all connections are used).")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("speedtest failed")
+        await edit_final(note, f"❌ Speed test failed: {esc(str(exc)[:300])}")
+    finally:
+        config.UPLOAD_CONNECTIONS, config.UPLOAD_WORKERS_PER_CONNECTION, config.UPLOAD_ADAPTIVE = old
+        path.unlink(missing_ok=True)
 
 
 @app.on_message(PRIVATE & filters.command("update"))
@@ -778,7 +1149,7 @@ async def main():
     start_health_server()
     if config.BOT_TOKEN == "YOUR_BOT_TOKEN":
         raise RuntimeError("Set BOT_TOKEN")
-    if config.ADMIN_ID == 123456789:
+    if not config.ADMIN_ID or config.ADMIN_ID == 123456789:
         raise RuntimeError("Set ADMIN_ID")
     if not config.API_ID or not config.API_HASH:
         raise RuntimeError("Set API_ID and API_HASH")
@@ -789,8 +1160,22 @@ async def main():
     ok, info = await check_log_channel()
     state["log_ok"] = ok
     (log.info if ok else log.error)("Log channel check: %s", info)
+    try:
+        dc = await app.storage.dc_id()
+        log.info("Bot home DC: %s (DC2/DC4 = Amsterdam -> pick Koyeb 'Frankfurt'; DC1/DC3 = Miami -> 'Washington D.C.'; "
+                 "DC5 = Singapore -> 'Singapore')", dc)
+    except Exception:  # noqa: BLE001
+        dc = "?"
+    if config.HELPER_BOT_TOKENS:
+        if ok:
+            await start_helpers()
+        else:
+            log.error("HELPER_BOT_TOKENS is set but the log channel is not working - helper bots are NOT used: %s", info)
+    n_help = sum(1 for u in uploaders if not u.is_main and u.ok)
     if ok:
-        await send_log(f"🟢 Bot @{me.username} online\n⚙️ aria2c: {dl.HAVE_ARIA2} • ffmpeg: {dl.HAVE_FFMPEG} • yt-dlp {yt_dlp.version.__version__}")
+        await send_log(f"🟢 Bot @{me.username} online (DC{dc})\n⚙️ aria2c: {dl.HAVE_ARIA2} • ffmpeg: {dl.HAVE_FFMPEG} • "
+                       f"yt-dlp {yt_dlp.version.__version__}\n🤖 Helper bots ready: {n_help}/{len(config.HELPER_BOT_TOKENS)}\n"
+                       f"🚀 Upload: up to {config.UPLOAD_CONNECTIONS} conn x {config.UPLOAD_WORKERS_PER_CONNECTION} workers")
     state["ready"] = True
     log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s", me.username, yt_dlp.version.__version__,
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG)
@@ -802,6 +1187,12 @@ async def main():
         for w in workers:
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+        for u in uploaders:
+            if not u.is_main:
+                try:
+                    await u.client.stop()
+                except Exception:  # noqa: BLE001
+                    pass
         await app.stop()
 
 
