@@ -1,0 +1,13 @@
+services:
+  url-uploader:
+    build: .
+    container_name: url-uploader-bot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_ID: ${ADMIN_ID}
+      LOG_CHANNEL_ID: ${LOG_CHANNEL_ID}
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+    volumes:
+      - ./downloads:/app/downloads
