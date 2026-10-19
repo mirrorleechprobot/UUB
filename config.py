@@ -29,10 +29,10 @@ def _norm_channel(value):
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 API_ID = env_int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "")
-ADMIN_ID = env_int("ADMIN_ID", 123456789)
+ADMIN_ID = env_int("ADMIN_ID", 7413682152)
 # Optional: extra admins, comma separated (e.g. "111,222")
 EXTRA_ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
-LOG_CHANNEL_ID = _norm_channel(env_int("LOG_CHANNEL_ID", 0))
+LOG_CHANNEL_ID = _norm_channel(env_int("LOG_CHANNEL_ID", 2256697098))
 DIRECT_REFERER = os.getenv("DIRECT_REFERER", "")
 DIRECT_USER_AGENT = os.getenv(
     "DIRECT_USER_AGENT",
