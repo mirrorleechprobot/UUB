@@ -1,3 +1,9 @@
-.git\n__pycache__\n*.pyc\n.env\nvenv\n.venv\ndownloads/*\n
+.git
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+downloads/*
 cookies.txt
 cookies*.txt

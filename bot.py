@@ -148,10 +148,9 @@ def download_sync(url, progress):
         "fragment_retries": config.MAX_RETRIES,
         "file_access_retries": config.MAX_RETRIES,
         "concurrent_fragment_downloads": 8,
-        # Do not force every download into MKV. yt-dlp keeps the source container when
-        # possible; for separate audio/video streams, prefer MP4 when compatible and
-        # fall back to MKV/WebM rather than lying about the file extension.
-        "merge_output_format": "mp4/mkv/webm",
+        # Do not rename containers by hand. yt-dlp keeps the source format where
+        # possible; merged separate streams use MKV for broad codec compatibility.
+        "merge_output_format": "mkv",
         "progress_hooks": [hook],
         "quiet": True,
         "no_warnings": True,

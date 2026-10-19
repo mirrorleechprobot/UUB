@@ -1,1 +1,3 @@
-pyrogram==2.0.106\ntgcrypto\nyt-dlp\n
+Pyrogram==2.0.106
+TgCrypto
+yt-dlp
