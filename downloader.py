@@ -441,10 +441,29 @@ def _audio_only_formats(info):
             if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")]
 
 
+def _fetch_format(url, workdir, fmt, tag):
+    """Download ONE yt-dlp format selector into workdir as '<id>.<tag>.<ext>'; returns the files."""
+    opts = ytdlp_base_opts()
+    opts.update({"outtmpl": str(workdir / f"%(id)s.{tag}.%(ext)s"), "format": fmt, "overwrites": True,
+                 "file_access_retries": config.MAX_RETRIES, "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ainfo = ydl.extract_info(url, download=True)
+    files = [Path(d["filepath"]) for d in (ainfo.get("requested_downloads") or []) if d.get("filepath")]
+    return [p for p in files if p.is_file()] or sorted(workdir.glob(f"*.{tag}.*"))
+
+
+# Tried in this order when a downloaded video has no sound. The site's own format labels are NOT trusted (Instagram /
+# Facebook often leave acodec empty), only what ffprobe finds inside the downloaded files.
+AUDIO_FALLBACKS = (("audio", "ba/bestaudio", "separate audio stream"),
+                   ("audio2", "ba*", "audio taken from a format that also contains video"),
+                   ("muxed", "b/best", "a complete video+audio file"))
+
+
 def _ensure_audio(url, result, info, workdir, progress, cancel):
-    """Instagram / Facebook / Reels often deliver video and audio as separate streams. If the downloaded file has a video
-    track but NO audio track (while the site does offer an audio stream), download the audio separately and mux it in
-    (video copied, audio -> AAC so every Telegram player has sound). A genuinely silent video is left alone."""
+    """Instagram / Facebook / Reels often deliver video and audio separately, or label them wrongly. If the downloaded
+    file has a video track but NO audio track, try (1) the separate audio stream, (2) the audio of any format that has
+    sound, (3) a complete muxed file, and mux the sound into the video (video copied, audio -> AAC so every Telegram
+    player has sound). Only a video for which no strategy finds audio is treated as really silent."""
     path = Path(result["path"])
     if not HAVE_FFMPEG:
         return result
@@ -452,33 +471,42 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
     if not meta["has_video"] or meta["has_audio"]:
         return result
     chosen = [(f.get("format_id"), f.get("vcodec"), f.get("acodec")) for f in (info.get("requested_formats") or [])]
-    if not _audio_only_formats(info):
-        log.warning("video has no audio track and the site offers no separate audio stream (formats used: %s)", chosen)
-        return result
-    log.warning("downloaded video is MUTE although the site has an audio stream (formats used: %s) - adding the audio", chosen)
+    log.warning("downloaded video has NO audio track (formats used: %s, site lists %d audio-only formats) - looking for sound",
+                chosen, len(_audio_only_formats(info)))
     progress["status"] = "processing"
-    opts = ytdlp_base_opts()
-    opts.update({"outtmpl": str(workdir / "%(id)s.audio.%(ext)s"), "format": "ba/bestaudio", "overwrites": True,
-                 "file_access_retries": config.MAX_RETRIES, "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS})
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ainfo = ydl.extract_info(url, download=True)
-    audio = [Path(d["filepath"]) for d in (ainfo.get("requested_downloads") or []) if d.get("filepath")]
-    audio = [p for p in audio if p.is_file()] or sorted(workdir.glob("*.audio.*"))
-    if not audio or cancel.is_set():
+    for tag, fmt, what in AUDIO_FALLBACKS:
         if cancel.is_set():
             raise Cancelled()
-        return result
-    out = path.with_name(path.stem + ".muxed.mp4")
-    r = _run(["ffmpeg", "-y", "-i", str(path), "-i", str(audio[0]), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-              "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)], 3600)
-    if r.returncode == 0 and out.is_file() and out.stat().st_size > 0 and ffprobe(out)["has_audio"]:
-        for p in (path, *audio):
+        try:
+            files = _fetch_format(url, workdir, fmt, tag)
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001  ("format not available" = this strategy has nothing)
+            log.info("audio strategy '%s' found nothing: %s", tag, str(exc)[:120])
+            continue
+        src = next((p for p in files if ffprobe(p)["has_audio"]), None)
+        if src is None:
+            for p in files:
+                p.unlink(missing_ok=True)
+            continue
+        out = path.with_name(path.stem + ".muxed.mp4")
+        r = _run(["ffmpeg", "-y", "-i", str(path), "-i", str(src), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                  "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)], 3600)
+        if r.returncode == 0 and out.is_file() and out.stat().st_size > 0 and ffprobe(out)["has_audio"]:
+            for p in (path, *files):
+                p.unlink(missing_ok=True)
+            final = path.with_suffix(".mp4")
+            out.replace(final)
+            log.info("sound added using: %s", what)
+            return {"path": final, "title": result["title"]}
+        out.unlink(missing_ok=True)
+        log.warning("muxing audio from '%s' failed: %s", tag, (r.stderr or b"")[-160:].decode(errors="ignore"))
+        if tag == "muxed" and ffprobe(src)["has_video"]:       # last resort: use the complete file as it is
+            path.unlink(missing_ok=True)
+            return {"path": src, "title": result["title"]}
+        for p in files:
             p.unlink(missing_ok=True)
-        final = path.with_suffix(".mp4")
-        out.replace(final)
-        return {"path": final, "title": result["title"]}
-    out.unlink(missing_ok=True)
-    log.warning("muxing the missing audio failed: %s", (r.stderr or b"")[-200:].decode(errors="ignore"))
+    log.warning("no audio found by any strategy: this video is really silent (or the site needs login cookies)")
     return result
 
 

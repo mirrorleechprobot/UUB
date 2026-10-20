@@ -72,7 +72,7 @@ Setup: Atlas me free cluster → *Database Access* me user banao → *Network Ac
 |---|---|
 | **Queue restart-proof** | Har job DB me save hota hai. Redeploy/restart ke baad queue usi order me wapas aati hai, user ko message milta hai. 3 baar crash karne wali job ya 24h se purani job drop ho jati hai. |
 | **Download ∥ Upload (PIPELINE)** | File N upload hote waqt N+1 download hoti hai. Per user max 2 files disk par. Upload order hamesha queue order me. `PIPELINE=false` = pura ek-ek. |
-| **URL cache** | Same link + same quality dobara bhejo → `file_id` se turant resend (0 download/upload). Custom thumb/rename wale jobs cache bypass karte hain. `/clearcache` (admin). Sirf main bot ke file_id (helper-delivered files bhi cache hote hain). |
+| **URL cache** | Same link + same quality dobara bhejo → `file_id` se turant resend (0 download/upload). Custom thumb/rename wale jobs cache bypass karte hain. `/clearlinks` (admin; sirf saved links + orphan queue records saaf karta hai, baaki DB nahi). Sirf main bot ke file_id (helper-delivered files bhi cache hote hain). |
 | **Auto-tune upload** | Part 8s se zyada le (timeouts) → connections 30% kam; 2 clean uploads → +1. 2..`UPLOAD_CONNECTIONS` ke beech. Warm connections reuse hote hain. |
 | **Disk guard** | Download se pehle size check (split wali files ~2x). Doosri jobs chal rahi hon to space ka intezaar (10 min), warna saaf error. Download ke dauran disk bhar rahi ho to rok kar admin ko alert. |
 | **SSRF block** | localhost / private IP / 169.254.x.x (cloud metadata) / redirects — sab block (`SSRF_PROTECTION`). |

@@ -1280,7 +1280,7 @@ async def start_handler(_, message):
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
-                 "/stats  /userstats <code>id</code>  /topusers  /clearcache\n"
+                 "/stats  /userstats <code>id</code>  /topusers  /clearlinks\n"
                  "/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
     await message.reply_text(text)
 
@@ -1740,13 +1740,53 @@ async def setquota_cmd(_, message):
     await message.reply_text(f"✅ Daily quota for <code>{uid}</code>: {gb:g} GB" + (f" • {files} files" if files is not None else "") + " (0 = unlimited)")
 
 
-@app.on_message(PRIVATE & filters.command("clearcache"))
+async def _orphan_queue_docs():
+    """Stored queue records that no live job owns (left behind by a crash / old restart)."""
+    live = {j.key for j in jobs.values()}
+    return [d for d in await db.all("queue") if str(d["_id"]) not in live]
+
+
+@app.on_message(PRIVATE & filters.command(["clearlinks", "clearcache"]))
 @admin_only
-async def clearcache_cmd(_, message):
-    docs = await db.all("cache")
-    for d in docs:
+async def clearlinks_cmd(_, message):
+    """Cleans ONLY the saved links in MongoDB (the URL cache + orphaned queue records).
+    Premium users, settings, usage, stats, thumbnails and the live queue are never touched.
+      /clearlinks              all saved links (cache)
+      /clearlinks old [days]   only links saved more than N days ago (default 7)
+      /clearlinks <url>        only that link
+      /clearlinks queue        orphaned queue records only
+      /clearlinks all          cache + orphaned queue records"""
+    args = message.command[1:]
+    what = args[0].lower() if args else "cache"
+    cache = await db.all("cache")
+    targets, orphans = [], []
+    if what in ("cache", "all"):
+        targets = cache
+    elif what == "old":
+        days = int(args[1]) if len(args) > 1 and args[1].isdigit() else 7
+        cutoff = time.time() - days * 86400
+        targets = [d for d in cache if d.get("ts", 0) < cutoff]
+    elif what == "queue":
+        pass
+    elif args[0].lower().startswith(("http", "magnet:")):
+        targets = [d for d in cache if d.get("url") == args[0][:300]]
+    else:
+        return await message.reply_text(
+            "🧹 <b>/clearlinks</b> – cleans only the saved links in MongoDB\n\n"
+            "/clearlinks – all saved links (cache)\n/clearlinks <code>old 7</code> – older than 7 days\n"
+            "/clearlinks <code>https://link</code> – just that link\n/clearlinks <code>queue</code> – orphaned queue records\n"
+            "/clearlinks <code>all</code> – cache + orphaned queue records\n\n"
+            "✅ Premium users, settings, usage, stats and the running queue are NOT touched.")
+    if what in ("queue", "all"):
+        orphans = await _orphan_queue_docs()
+    for d in targets:
         db.delete("cache", d["_id"])
-    await message.reply_text(f"🧹 {len(docs)} cached link(s) removed.")
+    for d in orphans:
+        db.delete("queue", d["_id"])
+    await db.flush()
+    await message.reply_text(f"🧹 <b>Cleaned</b>\n🔗 Saved links removed: {len(targets)} (of {len(cache)})\n"
+                             f"📋 Orphaned queue records removed: {len(orphans)}\n\n"
+                             "Nothing else in the database was touched.")
 
 
 async def update_ytdlp():
