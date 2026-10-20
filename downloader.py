@@ -436,6 +436,52 @@ def _video_selector(height):
     return f"bv*[height<={height}]+ba/b[height<={height}]/bv*+ba/b"
 
 
+def _audio_only_formats(info):
+    return [f for f in (info.get("formats") or [])
+            if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")]
+
+
+def _ensure_audio(url, result, info, workdir, progress, cancel):
+    """Instagram / Facebook / Reels often deliver video and audio as separate streams. If the downloaded file has a video
+    track but NO audio track (while the site does offer an audio stream), download the audio separately and mux it in
+    (video copied, audio -> AAC so every Telegram player has sound). A genuinely silent video is left alone."""
+    path = Path(result["path"])
+    if not HAVE_FFMPEG:
+        return result
+    meta = ffprobe(path)
+    if not meta["has_video"] or meta["has_audio"]:
+        return result
+    chosen = [(f.get("format_id"), f.get("vcodec"), f.get("acodec")) for f in (info.get("requested_formats") or [])]
+    if not _audio_only_formats(info):
+        log.warning("video has no audio track and the site offers no separate audio stream (formats used: %s)", chosen)
+        return result
+    log.warning("downloaded video is MUTE although the site has an audio stream (formats used: %s) - adding the audio", chosen)
+    progress["status"] = "processing"
+    opts = ytdlp_base_opts()
+    opts.update({"outtmpl": str(workdir / "%(id)s.audio.%(ext)s"), "format": "ba/bestaudio", "overwrites": True,
+                 "file_access_retries": config.MAX_RETRIES, "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ainfo = ydl.extract_info(url, download=True)
+    audio = [Path(d["filepath"]) for d in (ainfo.get("requested_downloads") or []) if d.get("filepath")]
+    audio = [p for p in audio if p.is_file()] or sorted(workdir.glob("*.audio.*"))
+    if not audio or cancel.is_set():
+        if cancel.is_set():
+            raise Cancelled()
+        return result
+    out = path.with_name(path.stem + ".muxed.mp4")
+    r = _run(["ffmpeg", "-y", "-i", str(path), "-i", str(audio[0]), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+              "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)], 3600)
+    if r.returncode == 0 and out.is_file() and out.stat().st_size > 0 and ffprobe(out)["has_audio"]:
+        for p in (path, *audio):
+            p.unlink(missing_ok=True)
+        final = path.with_suffix(".mp4")
+        out.replace(final)
+        return {"path": final, "title": result["title"]}
+    out.unlink(missing_ok=True)
+    log.warning("muxing the missing audio failed: %s", (r.stderr or b"")[-200:].decode(errors="ignore"))
+    return result
+
+
 def download_media(url, option, workdir, progress, cancel):
     def hook(d):
         if cancel.is_set():
@@ -484,7 +530,10 @@ def download_media(url, option, workdir, progress, cancel):
         if not files:
             raise FileNotFoundError("Download finished but the output file was not found.")
         final = max(files, key=lambda p: p.stat().st_size)
-        return {"path": final, "title": info.get("title") or final.stem}
+        result = {"path": final, "title": info.get("title") or final.stem}
+        if option["kind"] != "audio":
+            result = _ensure_audio(url, result, info, workdir, progress, cancel)
+        return result
 
     errors = []
     for use_aria in ([True, False] if HAVE_ARIA2 else [False]):
@@ -528,7 +577,7 @@ def _run(cmd, timeout=None):
 
 def ffprobe(path):
     meta = {"duration": 0, "width": 0, "height": 0, "has_video": False, "has_audio": False,
-            "title": "", "artist": ""}
+            "title": "", "artist": "", "acodec": "", "vcodec": ""}
     if not HAVE_FFMPEG:
         return meta
     try:
@@ -546,6 +595,7 @@ def ffprobe(path):
     for st in data.get("streams", []):
         if st.get("codec_type") == "video" and not (st.get("disposition") or {}).get("attached_pic"):
             meta["has_video"] = True
+            meta["vcodec"] = st.get("codec_name") or ""
             w, h = st.get("width") or 0, st.get("height") or 0
             rot = 0
             try:
@@ -563,8 +613,9 @@ def ffprobe(path):
                     meta["duration"] = int(float(st.get("duration") or 0))
                 except ValueError:
                     pass
-        elif st.get("codec_type") == "audio":
+        elif st.get("codec_type") == "audio" and not meta["has_audio"]:
             meta["has_audio"] = True
+            meta["acodec"] = st.get("codec_name") or ""
     return meta
 
 
@@ -584,6 +635,26 @@ def make_thumb(path, duration):
     return None
 
 
+TG_AUDIO_OK = {"aac", "mp3"}            # audio codecs that reliably play inside an MP4 on Telegram
+
+
+def _fix_mp4_audio(path):
+    """An .mp4 whose audio is Opus/Vorbis/etc. is converted to AAC (video copied, fast)."""
+    tmp = path.with_name(path.stem + ".aac.mp4")
+    try:
+        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac",
+                  "-b:a", "192k", "-sn", "-dn", "-movflags", "+faststart", str(tmp)])
+    except Exception:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        return path
+    if r.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0 and ffprobe(tmp)["has_audio"]:
+        path.unlink(missing_ok=True)
+        tmp.replace(path)
+    else:
+        tmp.unlink(missing_ok=True)
+    return path
+
+
 def _remux_mp4(path):
     out = path.with_suffix(".mp4")
     if out == path:
@@ -592,7 +663,10 @@ def _remux_mp4(path):
     try:
         # +faststart needs a 2nd full pass over the file; only worth it for small files.
         fast = ["-movflags", "+faststart"] if path.stat().st_size <= 200 * 1024 * 1024 else []
-        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+        # Opus / Vorbis inside MP4 plays SILENT in Telegram's players -> convert such audio to AAC (video stays untouched).
+        acodec = ffprobe(path).get("acodec", "")
+        audio = ["-c:a", "copy"] if (not acodec or acodec in TG_AUDIO_OK) else ["-c:a", "aac", "-b:a", "192k"]
+        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
                   "-sn", "-dn", *fast, str(tmp)])
     except Exception:  # noqa: BLE001
         tmp.unlink(missing_ok=True)
@@ -667,6 +741,10 @@ def prepare_upload(path, cancel=None):
         if new != path:
             path, ext = new, ".mp4"
             meta = ffprobe(path)
+    elif kind == "video" and ext == ".mp4" and HAVE_FFMPEG and meta["has_audio"] and meta["acodec"] not in TG_AUDIO_OK:
+        log.info("converting %s audio to AAC (Telegram plays it silent otherwise)", meta["acodec"])
+        _fix_mp4_audio(path)
+        meta = ffprobe(path)
     if kind == "audio" and ext in VIDEO_EXT and ext != ".mp4":
         kind = "document"
 
