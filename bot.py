@@ -1281,7 +1281,7 @@ async def start_handler(_, message):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
                  "/stats  /userstats <code>id</code>  /topusers  /clearcache\n"
-                 "/testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
+                 "/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
     await message.reply_text(text)
 
 
@@ -1961,6 +1961,54 @@ async def cancel_callback(_, cq):
     await cq.answer("🚫 Cancelling...")
 
 
+def janitor_sync(active_ids, min_age=1800, emergency=False):
+    """Delete download folders / files that no running job owns (a job task that died, a crash, a stray temp file).
+    Normal run: only things older than min_age seconds. Emergency (disk low): everything not owned by a live job."""
+    freed, now = 0, time.time()
+    for p in list(DOWNLOAD_DIR.iterdir()):
+        m = re.match(r"job(\d+)_", p.name)
+        if m and int(m.group(1)) in active_ids:
+            continue                                   # a live job is using it
+        try:
+            age = now - p.stat().st_mtime
+        except OSError:
+            continue
+        if not emergency and age < min_age:
+            continue
+        try:
+            if p.is_dir():
+                freed += sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                freed += p.stat().st_size
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if emergency:                                      # caches that can always be rebuilt
+        for cache in (Path.home() / ".cache" / "yt-dlp", Path("/tmp/pip-cache")):
+            if cache.is_dir():
+                freed += sum(f.stat().st_size for f in cache.rglob("*") if f.is_file())
+                shutil.rmtree(cache, ignore_errors=True)
+    return freed
+
+
+async def run_janitor(emergency=False):
+    active = {j.id for j in running_jobs}
+    freed = await asyncio.get_running_loop().run_in_executor(POOL, janitor_sync, active, 1800, emergency)
+    if freed:
+        log.info("Janitor freed %.1f MB%s", freed / 1048576, " (emergency)" if emergency else "")
+    return freed
+
+
+@app.on_message(PRIVATE & filters.command("cleanup"))
+@admin_only
+async def cleanup_cmd(_, message):
+    before = safety.free_bytes()
+    freed = await run_janitor(emergency=not running_jobs)      # with running jobs only orphans are removed
+    await message.reply_text(f"🧹 Freed {size_text(freed)}.\n💾 Free disk: {size_text(before)} → {size_text(safety.free_bytes())}"
+                             + ("\nℹ️ Jobs are running, so only orphaned files were removed." if running_jobs else ""))
+
+
 # =============================================================================== background tasks
 SESSION_FILE = Path(config.DATA_DIR) / "url_uploader_bot.session"
 
@@ -2086,8 +2134,14 @@ async def health_loop():
         try:
             store.flush_stats()
             clean_pending()
+            tick = state.get("health_tick", 0) + 1
+            state["health_tick"] = tick
+            low = safety.free_bytes() < config.DISK_MIN_FREE_MB * 2 * 1024 * 1024
+            if tick % 10 == 0 or low:                      # every 10 min, and every minute while the disk is low
+                await run_janitor(emergency=low and not running_jobs)
             if safety.free_bytes() < config.DISK_MIN_FREE_MB * 2 * 1024 * 1024:
-                bg(alert_admin("disk-low", f"💾 <b>Low disk space:</b> {safety.free_bytes() / 1024 ** 2:.0f} MB free."))
+                bg(alert_admin("disk-low", f"💾 <b>Low disk space:</b> {safety.free_bytes() / 1024 ** 2:.0f} MB free "
+                                           "(auto-clean ran). Use a bigger disk / smaller files."))
             if config.MONGO_URI and not db.mongo:
                 bg(alert_admin("db", "🗄 <b>MongoDB is configured but not connected.</b> The bot uses local files, so queue, premium "
                                      "users and settings are LOST on redeploy. Check MONGO_URI and Atlas Network Access "
