@@ -57,9 +57,9 @@ UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, env_int("UPLOAD_WORKERS_PER_CONNEC
 MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
 MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
-MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 5))          # per user: jobs running at the same time
-MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 20))        # per user: jobs waiting (format already chosen)
-MAX_URLS_PER_MESSAGE = max(1, min(50, env_int("MAX_URLS_PER_MESSAGE", 25)))  # links handled from one message
+MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 1))          # per user: jobs running at the same time
+MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 50))        # per user: jobs waiting (format already chosen)
+MAX_URLS_PER_MESSAGE = max(1, min(50, env_int("MAX_URLS_PER_MESSAGE", 50)))  # links handled from one message
 PROBE_CONCURRENCY = max(1, min(10, env_int("PROBE_CONCURRENCY", 5)))         # link analysis in parallel
 PLAYLIST_LIMIT = max(1, min(50, env_int("PLAYLIST_LIMIT", 15)))
 
@@ -77,3 +77,41 @@ HELPER_BOT_TOKENS = [t for t in os.getenv("HELPER_BOT_TOKENS", "").replace(",", 
 
 # ---- download tuning ----
 ARIA2_DISK_CACHE_MB = max(0, min(512, env_int("ARIA2_DISK_CACHE_MB", 64)))
+
+# ---- MongoDB (persistence across redeploys) ----
+# MONGO_URI e.g. mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/   (Atlas free M0 is enough).
+# Empty -> local JSON files in DATA_DIR (lost on a Koyeb redeploy unless DATA_DIR is a volume).
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MONGO_DB = os.getenv("MONGO_DB", "uub").strip() or "uub"
+PERSIST_SESSION = env_bool("PERSIST_SESSION", True)           # keep the Pyrogram session + peer cache in the DB (needed to resume the queue)
+
+# ---- queue / pipeline ----
+PIPELINE = env_bool("PIPELINE", True)                         # download the NEXT file while the previous one uploads (per user)
+QUEUE_RESTORE_MAX_AGE_H = max(1, env_int("QUEUE_RESTORE_MAX_AGE_H", 24))   # queued jobs older than this are dropped after a restart
+
+# ---- URL -> file_id cache (same link again = instant resend, no download / upload) ----
+CACHE_ENABLED = env_bool("CACHE_ENABLED", True)
+CACHE_TTL_DAYS = max(1, env_int("CACHE_TTL_DAYS", 30))
+
+# ---- upload auto-tune (lowers connections on timeouts, raises them again when stable) ----
+AUTOTUNE = env_bool("AUTOTUNE", True)
+SESSION_REUSE = env_bool("SESSION_REUSE", True)               # keep upload connections warm between files
+
+# ---- safety ----
+SSRF_PROTECTION = env_bool("SSRF_PROTECTION", True)           # refuse localhost / private-network / cloud-metadata links
+DISK_MIN_FREE_MB = max(50, env_int("DISK_MIN_FREE_MB", 300))  # a download is refused / aborted below this much free disk
+
+# ---- maintenance ----
+YTDLP_UPDATE_HOURS = max(0, env_int("YTDLP_UPDATE_HOURS", 12))   # 0 = never auto-update yt-dlp
+ALERTS = env_bool("ALERTS", True)                             # DM the admin on repeated failures / low disk / DB problems
+
+# ---- torrents / magnet links (via aria2c) ----
+TORRENT_ENABLED = env_bool("TORRENT_ENABLED", True)
+TORRENT_NO_PEER_TIMEOUT = max(60, env_int("TORRENT_NO_PEER_TIMEOUT", 180))   # give up when nothing downloads for this long
+TORRENT_MAX_GB = max(1, env_int("TORRENT_MAX_GB", 8))
+
+# ---- premium plans ----
+DAILY_LIMIT_GB = max(0, env_int("DAILY_LIMIT_GB", 0))         # per premium user per UTC day, 0 = unlimited (admins are never limited)
+DAILY_LIMIT_FILES = max(0, env_int("DAILY_LIMIT_FILES", 0))   # same, number of files
+PREMIUM_REMIND_DAYS = sorted({int(x) for x in os.getenv("PREMIUM_REMIND_DAYS", "3,1").replace(" ", "").split(",")
+                              if x.isdigit() and int(x) > 0}, reverse=True)

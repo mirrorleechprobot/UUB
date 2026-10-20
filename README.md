@@ -8,7 +8,7 @@ Telegram URL uploader — Pyrogram + yt-dlp + aria2c + ffmpeg. Sirf **Admin + Pr
 - Har format: video (mp4/mkv/webm/avi/…), audio, images, zip/pdf/apk etc. Non-mp4 video auto mp4 me remux (Telegram streaming), thumbnail + duration + resolution
 - **2GB+ files auto-split** (video keyframe-split, baaki byte-split)
 - Playlist support (buttons: all Best / all MP3, limit `PLAYLIST_LIMIT`)
-- Ek message me 25 links tak. Link analysis aur quality-selection queue me count nahi hoti; **format select karne par hi** job waiting list me jati hai (**har user ke liye: 5 running + 20 waiting = 25 jobs**; global cap `MAX_CONCURRENT_JOBS`)
+- Ek message me 50 links tak. **Har user ki apni queue: 1 file ek time par download+upload, 50 tak line me (FIFO, order me)**. Direct links message ke order me hi queue me lagte hain; quality-select wale links click karne par lagte hain. Alag users apni-apni queue parallel chalate hain (global cap `MAX_CONCURRENT_JOBS`; poore bot par bhi ek-ek karke chahiye to `MAX_CONCURRENT_JOBS=1`). Limits: `MAX_RUNNING_PER_USER`, `MAX_WAITING_PER_USER`, `MAX_URLS_PER_MESSAGE`.
 - Progress (speed, ETA) + ❌ Cancel button
 - **Log channel**: text logs + har delivered file ki copy (Bot API `copyMessage`, dobara upload nahi, peer errors nahi)
 
@@ -63,6 +63,28 @@ Koyeb: port 8080, health check `/health`. Persistent volume `/app/data` laga sak
 - **>2 GB (split) files**: parts alag-alag helpers parallel upload karte hain, user ko order me milte hain.
 - Helper fail/disabled ho jaye to job main bot se ho jaata hai (fail nahi hota). `/helpers` se status dekho.
 - **Dhyan:** Telegram ek hi file ke parts alag bots se mix nahi karne deta, isliye *ek akeli normal file* ki upload speed multi-bot se nahi badhti (wo multi-connection se badhti hai). Multi-bot ka fayda: kai jobs ek saath, split files, aur FloodWait ka bantwara.
+
+## v4 — MongoDB + naye features
+**MongoDB (Atlas free M0) kyun:** Koyeb par har redeploy/restart ke baad disk khali ho jaati hai. Ab ye sab MongoDB me rehta hai: premium users, user settings + usage, **queue**, URL cache, thumbnails, upload-tuner state, daily stats, aur Pyrogram ka peer cache.
+Setup: Atlas me free cluster → *Database Access* me user banao → *Network Access* me `0.0.0.0/0` allow karo → *Connect → Drivers* se URI copy karke Koyeb env `MONGO_URI` me daalo (secret rakho). `MONGO_URI` khali ho ya connect na ho to bot local JSON par chalta hai (aur admin ko alert aata hai); purana `premium.json` apne aap import ho jata hai.
+
+| Feature | Kaise kaam karta hai |
+|---|---|
+| **Queue restart-proof** | Har job DB me save hota hai. Redeploy/restart ke baad queue usi order me wapas aati hai, user ko message milta hai. 3 baar crash karne wali job ya 24h se purani job drop ho jati hai. |
+| **Download ∥ Upload (PIPELINE)** | File N upload hote waqt N+1 download hoti hai. Per user max 2 files disk par. Upload order hamesha queue order me. `PIPELINE=false` = pura ek-ek. |
+| **URL cache** | Same link + same quality dobara bhejo → `file_id` se turant resend (0 download/upload). Custom thumb/rename wale jobs cache bypass karte hain. `/clearcache` (admin). Sirf main bot ke file_id (helper-delivered files bhi cache hote hain). |
+| **Auto-tune upload** | Part 8s se zyada le (timeouts) → connections 30% kam; 2 clean uploads → +1. 2..`UPLOAD_CONNECTIONS` ke beech. Warm connections reuse hote hain. |
+| **Disk guard** | Download se pehle size check (split wali files ~2x). Doosri jobs chal rahi hon to space ka intezaar (10 min), warna saaf error. Download ke dauran disk bhar rahi ho to rok kar admin ko alert. |
+| **SSRF block** | localhost / private IP / 169.254.x.x (cloud metadata) / redirects — sab block (`SSRF_PROTECTION`). |
+| **yt-dlp auto-update** | Idle hone par har `YTDLP_UPDATE_HOURS` ghante (aur start ke 90s baad) update + naya version bina restart ke load. |
+| **/stats + alerts** | CPU/RAM/disk, jobs, uploaders, tuner, DB, aaj ka usage. Admin ko DM: 10 min me 5 failures, disk low/full, MongoDB down. |
+| **Batch** | Ek message ke links = ek batch: ek progress message ("3/50") + ek final notification. |
+| **Queue control** | `/clear` (waiting hatao), `/clear all`, `/top <id>`, `/move <id> <pos>`, `/queue` me 🔝 / ❌ buttons. |
+| **Settings** | `/settings` (Auto/Document), `/caption {title} {name} {size} {ext}`, `/setthumb` (photo par reply), `/delthumb`, `link \| naya naam.mp4`. |
+| **Premium** | Expiry reminder (3 aur 1 din pehle), daily quota (`DAILY_LIMIT_GB/FILES`, per-user `/setquota id gb [files]`), `/mystats`, `/userstats`, `/topusers`. |
+| **Torrent / magnet** | `magnet:?...` ya `.torrent` link → aria2c (seed nahi). 1 file = wahi file, kai files = ek ZIP (uncompressed). `TORRENT_MAX_GB`, `TORRENT_ENABLED=false` se band. Copyright ki zimmedari aapki hai. |
+
+**Dhyan:** DB me sirf peer cache (users/channels ke access hash) save hota hai, auth key nahi — isliye rolling deploy me do instance ek saath chalen to bhi AUTH_KEY_DUPLICATED nahi aata.
 
 ## Cookies
 Login-wale sites ke liye Netscape `cookies.txt` (ya `COOKIES_TEXT`). Kabhi share/commit mat karo. Sirf apne authorized content ke liye use karo.

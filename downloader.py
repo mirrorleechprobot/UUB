@@ -9,6 +9,7 @@ import http.cookiejar
 import json
 import logging
 import mimetypes
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ import requests
 import yt_dlp
 
 import config
+import safety
 
 log = logging.getLogger("uub.dl")
 
@@ -81,6 +83,8 @@ def _session():
                       "Accept-Encoding": "identity", "Connection": "keep-alive"})
     if config.DIRECT_REFERER:
         s.headers["Referer"] = config.DIRECT_REFERER
+    if config.SSRF_PROTECTION:
+        s.hooks["response"].append(safety.redirect_guard)     # every redirect target is validated before it is followed
     cp = cookie_path()
     if _cookies_usable(cp):
         try:
@@ -198,10 +202,22 @@ def ytdlp_base_opts():
 
 def probe(url):
     """Return {"kind": "direct"|"media"|"playlist", ...}. Raises ProbeError if nothing downloadable."""
+    if is_torrent_url(url):
+        if not config.TORRENT_ENABLED:
+            raise ProbeError("Torrent / magnet links are disabled on this bot.")
+        if not HAVE_ARIA2:
+            raise ProbeError("Torrent support needs aria2c, which is not installed.")
+        return {"kind": "torrent", "title": torrent_title(url), "size": 0}
+    try:
+        safety.check_url(url)
+    except safety.UnsafeURL as exc:
+        raise ProbeError(str(exc)) from exc
     ext = Path(urlparse(url).path).suffix.lower()
     http_info, http_err = None, None
     try:
         http_info = _probe_http(url)
+    except safety.UnsafeURL as exc:
+        raise ProbeError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         http_err = type(exc).__name__
 
@@ -274,8 +290,18 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None):
     if _cookies_usable(cp):
         cmd.append("--load-cookies=" + str(cp))
     cmd.append(url)
+    started = time.monotonic()
+    _aria2_proc(cmd, progress, cancel, expected_size)
+    if not target.is_file():
+        raise RuntimeError("aria2c finished but the file is missing")
+    log.info("aria2c finished %s in %.0fs", target.name, time.monotonic() - started)
+
+
+def _aria2_proc(cmd, progress, cancel, expected_size, max_bytes=0):
+    """Run aria2c, feed `progress`, honour `cancel`. Raises on failure. max_bytes>0 aborts when the total exceeds it."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     done = threading.Event()
+    too_big = []
 
     def watcher():
         while not done.wait(0.5):
@@ -285,7 +311,6 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None):
 
     threading.Thread(target=watcher, daemon=True).start()
     tail = []
-    started = time.monotonic()
     try:
         for line in proc.stdout:
             m = _ARIA_RE.search(line)
@@ -295,6 +320,9 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None):
                 speed = _unit_bytes(m.group(6), m.group(7))
                 progress.update({"status": "downloading", "current": cur, "total": tot or expected_size,
                                  "speed": speed, "eta": (tot - cur) / speed if speed > 0 else None})
+                if max_bytes and tot > max_bytes and proc.poll() is None:
+                    too_big.append(tot)
+                    proc.terminate()
             elif line.strip():
                 tail.append(line.strip())
                 tail = tail[-5:]
@@ -305,44 +333,62 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None):
             proc.kill()
     if cancel.is_set():
         raise Cancelled()
-    if proc.returncode != 0 or not target.is_file():
+    if too_big:
+        raise RuntimeError(f"The torrent is {too_big[0] / 1024 ** 3:.1f} GB, above the {config.TORRENT_MAX_GB} GB limit.")
+    if proc.returncode != 0:
         raise RuntimeError("aria2c failed: " + " | ".join(tail)[-250:])
-    log.info("aria2c finished %s in %.0fs", target.name, time.monotonic() - started)
 
 
-def _requests_download(url, target, progress, cancel):
-    s = _session()
-    try:
-        with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60)) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("Content-Length") or 0)
-            current, last_bytes, last_time = 0, 0, time.monotonic()
-            with target.open("wb") as out:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if cancel.is_set():
-                        raise Cancelled()
-                    if not chunk:
-                        continue
-                    out.write(chunk)
-                    current += len(chunk)
-                    now = time.monotonic()
-                    if now - last_time >= 1:
-                        speed = (current - last_bytes) / (now - last_time)
-                        last_bytes, last_time = current, now
-                        progress.update({"status": "downloading", "current": current, "total": total,
-                                         "speed": speed, "eta": (total - current) / speed if total and speed else None})
-    finally:
-        s.close()
+# --------------------------------------------------------------------------- torrents / magnet links
+def is_torrent_url(url):
+    return url.lower().startswith("magnet:") or urlparse(url).path.lower().endswith(".torrent")
 
 
-def _looks_like_html(path):
-    try:
-        if path.stat().st_size > 3 * 1024 * 1024:
-            return False
-        head = path.read_bytes()[:512].lstrip().lower()
-        return head.startswith((b"<!doctype html", b"<html", b"<?xml")) or b"<html" in head
-    except OSError:
-        return False
+def torrent_title(url):
+    if url.lower().startswith("magnet:"):
+        from urllib.parse import parse_qs, unquote_plus
+        dn = parse_qs(urlparse(url).query).get("dn")
+        return safe_filename(unquote_plus(dn[0]))[:150] if dn else "Torrent"
+    return safe_filename(Path(urlparse(url).path).stem) or "Torrent"
+
+
+DEFAULT_TRACKERS = ("udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,"
+                    "udp://tracker.torrent.eu.org:451/announce,udp://exodus.desync.com:6969/announce,"
+                    "udp://tracker.tiny-vps.com:6969/announce,udp://open.demonii.com:1337/announce")
+
+
+def download_torrent(url, workdir, progress, cancel):
+    """aria2c BitTorrent download (no seeding). One file -> that file; several files -> one stored (uncompressed) ZIP."""
+    if not HAVE_ARIA2:
+        raise RuntimeError("aria2c is not installed")
+    if url.lower().startswith("http"):
+        safety.check_url(url)                                   # a .torrent link must not point to an internal address
+    trackers = os.getenv("TORRENT_TRACKERS", DEFAULT_TRACKERS)
+    cmd = ["aria2c", "--seed-time=0", "--bt-stop-timeout=%d" % config.TORRENT_NO_PEER_TIMEOUT,
+           "--bt-max-peers=120", "--enable-dht=true", "--enable-peer-exchange=true", "--bt-enable-lpd=false",
+           "--follow-torrent=true", "--bt-save-metadata=false", "--bt-tracker=" + trackers,
+           "--max-overall-upload-limit=256K", f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M",
+           "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true",
+           "--summary-interval=1", "--console-log-level=warn", "--download-result=hide", "-d", str(workdir), url]
+    progress.update({"status": "downloading", "current": 0, "total": 0, "speed": 0, "eta": None})
+    _aria2_proc(cmd, progress, cancel, 0, max_bytes=config.TORRENT_MAX_GB * 1024 ** 3)
+    files = [p for p in workdir.rglob("*") if p.is_file() and not p.name.endswith(TEMP_SUFFIXES + (".torrent",))]
+    if not files:
+        raise RuntimeError("The torrent finished but no files were found.")
+    if len(files) == 1:
+        return {"path": files[0], "title": files[0].name}
+    top = {p.relative_to(workdir).parts[0] for p in files}
+    name = safe_filename(top.pop() if len(top) == 1 else torrent_title(url)) or "torrent"
+    progress.update({"status": "processing"})
+    import zipfile
+    archive = workdir / (name + ".zip")
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for p in sorted(files):
+            if cancel.is_set():
+                raise Cancelled()
+            zf.write(p, p.relative_to(workdir).as_posix())
+            p.unlink(missing_ok=True)                           # free disk as we go (peak usage ~1x, not 2x)
+    return {"path": archive, "title": archive.name}
 
 
 def download_direct(url, workdir, progress, cancel, filename=None, size=0):
@@ -463,6 +509,12 @@ def _scan(workdir):
 def download(job, workdir):
     """job needs: url, mode, option, direct_name, direct_size, progress, cancel."""
     workdir.mkdir(parents=True, exist_ok=True)
+    if job.mode == "torrent":
+        return download_torrent(job.url, workdir, job.progress, job.cancel)
+    try:
+        safety.check_url(job.url)                  # also protects jobs restored from the database after a restart
+    except safety.UnsafeURL as exc:
+        raise RuntimeError(str(exc)) from exc
     if job.mode == "direct":
         return download_direct(job.url, workdir, job.progress, job.cancel, job.direct_name, job.direct_size)
     return download_media(job.url, job.option, workdir, job.progress, job.cancel)

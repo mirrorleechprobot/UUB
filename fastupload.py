@@ -11,7 +11,10 @@ Compared to the first version it also:
   * scales the number of connections with the file size (small files do not pay for 8 handshakes)
   * reads the disk in a thread (the event loop never waits for I/O) in 4 MB blocks
   * calls the progress callback at most ~4x per second (no thread-pool hop per 512 KB part)
-  * closes every session when done
+  * closes every session when done (or keeps them warm for the next file: SESSION_REUSE)
+  * AUTO-TUNE: a part that takes > SLOW_PART_SECONDS (network congestion / Telegram throttling shows up as
+    "Request timed out" retries) counts as slow; the connection limit is lowered by 30% after a congested upload and
+    raised by 1 after two clean uploads, always within 2..UPLOAD_CONNECTIONS.
 
 Applied by calling install(); it patches pyrogram.Client.save_file, which every send_* method uses.
 """
@@ -46,6 +49,120 @@ except (TypeError, ValueError):
     _INVOKE_HAS_THRESHOLD = False
 
 
+SLOW_PART_SECONDS = 8.0
+POOL_IDLE = 120.0
+
+
+class Tuner:
+    """AIMD controller for the number of upload connections."""
+
+    def __init__(self):
+        self.limit = config.UPLOAD_CONNECTIONS
+        self.min = min(2, config.UPLOAD_CONNECTIONS)
+        self.clean_streak = 0
+        self.last_speed = 0.0
+        self.changes = 0
+        self.on_change = None          # callback(limit) - bot.py persists it
+
+    def record(self, file_size, parts, slow, errors, seconds):
+        if not config.AUTOTUNE or not config.UPLOAD_ADAPTIVE or file_size < 50 * 1024 * 1024 or parts <= 0:
+            return
+        self.last_speed = file_size / max(seconds, 0.001)
+        old = self.limit
+        if errors or slow / parts > 0.02:
+            self.limit = max(self.min, int(self.limit * 0.7))
+            self.clean_streak = 0
+        else:
+            self.clean_streak += 1
+            if self.clean_streak >= 2 and self.limit < config.UPLOAD_CONNECTIONS:
+                self.limit += 1
+                self.clean_streak = 0
+        if self.limit != old:
+            self.changes += 1
+            log.info("Upload auto-tune: connections %s -> %s (slow parts %s/%s, errors %s, %.1f MB/s)",
+                     old, self.limit, slow, parts, errors, self.last_speed / 1048576)
+            if self.on_change:
+                try:
+                    self.on_change(self.limit)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def restore(self, limit):
+        if isinstance(limit, int):
+            self.limit = max(self.min, min(config.UPLOAD_CONNECTIONS, limit))
+
+
+tuner = Tuner()
+
+_pool = {}                       # id(client) -> [(Session, last_used_monotonic)]
+
+
+async def _stop_all(sessions):
+    await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+
+
+async def _healthy(session):
+    try:
+        await asyncio.wait_for(session.invoke(raw.functions.Ping(ping_id=int(time.time() * 1000))), 5)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def acquire_sessions(client, n, dc_id, auth_key, test_mode):
+    """n started media sessions: warm ones from the pool first (verified with a ping when idle for a while), then new ones."""
+    got, now = [], time.monotonic()
+    if config.SESSION_REUSE:
+        pool = _pool.get(id(client), [])
+        stale = []
+        while pool and len(got) < n:
+            sess, last = pool.pop()
+            if now - last > POOL_IDLE:
+                stale.append(sess)
+            elif now - last > 15 and not await _healthy(sess):
+                stale.append(sess)
+            else:
+                got.append(sess)
+        if stale:
+            await _stop_all(stale)
+    fresh = [Session(client, dc_id, auth_key, test_mode, is_media=True) for _ in range(n - len(got))]
+    try:
+        await asyncio.gather(*(x.start() for x in fresh))
+    except BaseException:
+        await _stop_all(fresh + got)
+        raise
+    return got + fresh
+
+
+async def release_sessions(client, sessions, reuse):
+    if not (reuse and config.SESSION_REUSE):
+        await _stop_all(sessions)
+        return
+    pool = _pool.setdefault(id(client), [])
+    now = time.monotonic()
+    pool.extend((s, now) for s in sessions)
+    extra = pool[16:]                                   # keep at most 16 warm connections per client
+    del pool[16:]
+    if extra:
+        await _stop_all([s for s, _ in extra])
+    asyncio.get_running_loop().call_later(POOL_IDLE + 5, lambda: asyncio.ensure_future(_reap(client)))
+
+
+async def _reap(client):
+    pool = _pool.get(id(client), [])
+    now = time.monotonic()
+    old = [s for s, last in pool if now - last > POOL_IDLE]
+    pool[:] = [(s, last) for s, last in pool if now - last <= POOL_IDLE]
+    if old:
+        await _stop_all(old)
+
+
+async def close_pool():
+    allsess = [s for pool in _pool.values() for s, _ in pool]
+    _pool.clear()
+    await _stop_all(allsess)
+
+
 def connections_for(file_size):
     """How many parallel connections are worth opening for this file."""
     if file_size <= BIG_FILE:
@@ -61,7 +178,7 @@ def connections_for(file_size):
         n = 6
     else:
         n = config.UPLOAD_CONNECTIONS
-    return max(1, min(n, config.UPLOAD_CONNECTIONS))
+    return max(1, min(n, tuner.limit if config.AUTOTUNE else config.UPLOAD_CONNECTIONS))
 
 
 async def _invoke(session, rpc):
@@ -98,7 +215,10 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
         queue = asyncio.Queue(n_sessions * per_session * 2)
         state = {"done": 0, "error": None}
         dc_id, auth_key, test_mode = await self.storage.dc_id(), await self.storage.auth_key(), await self.storage.test_mode()
-        sessions = [Session(self, dc_id, auth_key, test_mode, is_media=True) for _ in range(n_sessions)]
+        sessions = []
+        state["slow"] = 0
+        state["errors"] = 0
+        t_start = time.monotonic()
 
         async def worker(session):
             while True:
@@ -110,9 +230,12 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                 rpc, size = item
                 attempt = 0
                 while True:
+                    t_part = time.monotonic()
                     try:
                         await _invoke(session, rpc)
                         state["done"] += size
+                        if time.monotonic() - t_part > SLOW_PART_SECONDS:
+                            state["slow"] += 1
                         break
                     except FloodWait as fw:       # longer than Pyrogram's own threshold: wait, do NOT count as failure
                         wait = fw.value + 1
@@ -123,6 +246,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                         await asyncio.sleep(wait)
                     except Exception as exc:  # noqa: BLE001
                         attempt += 1
+                        state["errors"] += 1
                         if attempt >= 4:
                             state["error"] = exc
                             log.error("Upload part failed after retries: %s", exc)
@@ -148,8 +272,9 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                 func()                            # tiny sync callbacks: call directly (may raise StopTransmission)
 
         workers = []
+        ok = False
         try:
-            await asyncio.gather(*(s.start() for s in sessions))
+            sessions = await acquire_sessions(self, n_sessions, dc_id, auth_key, test_mode)
             workers = [loop.create_task(worker(s)) for s in sessions for _ in range(per_session)]
             part, last_report = 0, 0.0
             async for chunk in read_parts():
@@ -179,6 +304,8 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
             if state["error"]:
                 raise state["error"]
             await report()
+            tuner.record(file_size, total_parts, state["slow"], state["errors"], time.monotonic() - t_start)
+            ok = True
             if is_big:
                 return raw.types.InputFileBig(id=new_id, parts=total_parts, name=file_name)
             digest = "".join(hex(i)[2:].zfill(2) for i in md5_sum.digest())
@@ -188,7 +315,8 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
         finally:
             for w in workers:
                 w.cancel()
-            await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+            # warm sessions are reused only after a clean upload; after an error / cancel they are closed
+            await release_sessions(self, sessions, reuse=ok and not state["errors"])
             if isinstance(path, (str, PurePath)):
                 fp.close()
 
