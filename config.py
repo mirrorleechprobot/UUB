@@ -121,3 +121,8 @@ PREMIUM_REMIND_DAYS = sorted({int(x) for x in os.getenv("PREMIUM_REMIND_DAYS", "
 # otherwise set KEEPALIVE_URL=https://your-app.koyeb.app/health
 KEEPALIVE_MINUTES = max(0, env_int("KEEPALIVE_MINUTES", 4))
 KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
+
+# ---- automatic disk cleaning ----
+# When the disk is this % full the bot cleans everything that no running job owns (orphaned folders, caches). Safe:
+# live jobs and anything younger than 2 minutes are never touched.
+DISK_CLEAN_PERCENT = max(50, min(99, env_int("DISK_CLEAN_PERCENT", 90)))

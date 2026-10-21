@@ -100,6 +100,16 @@ Free host tab sleep karta hai jab uske **public URL par koi traffic na aaye** (T
 ## /restart = storage clean
 `/restart` pehle chalti jobs rok deta hai (queue DB me safe rehti hai), phir `downloads` folder aur yt-dlp cache **poora** saaf karta hai, batata hai kitna MB free hua, aur tab restart karta hai. Jobs restart ke baad shuru se apne aap chalti hain; user ko "Bot is restarting" message milta hai.
 
+## Connect Channel (files apne channel me)
+1. Bot ko apne channel me **Admin** banao (permission: **Post Messages**).
+2. Bot me `/connect @channelusername` (ya `/connect -100…` id) bhejo — **ya `/connect` dabakar channel ki koi post forward kar do** (private channel ke liye aasan).
+3. Bot verify karta hai: bot admin hai + post kar sakta hai + **aap us channel ke owner/admin ho** (dusre ke channel me post nahi kar sakte). Pass hone par aapko "✅ Channel connected and verified" message milta hai.
+4. Ab har file/video **sirf channel me** jaati hai. Har file ke baad bot chat me ek notification ("📣 Delivered to your channel" + post ka link); batch me ek hi summary. Same link dobara bhejo to cache se channel me turant.
+`/channel` (⏸ pause / ▶️ resume / ❌ disconnect), `/disconnect`. Channel post reject kare (bot hata diya / rights gaye) to file **bot chat me aa jati hai**, user ko wajah batai jati hai aur channel delivery OFF ho jati hai. Peer cache DB me save hota hai, isliye redeploy ke baad bhi channel kaam karta hai.
+
+## Disk auto-clean (90%)
+Health loop har minute disk % dekhta hai. `DISK_CLEAN_PERCENT` (default 90) par safe clean: sirf wo cheezein jo kisi **chalti job** ki nahi hain (orphan folders, yt-dlp/pip cache); **2 minute se taaze files kabhi nahi** (speedtest file, abhi ban rahi job). Admin ko report: "Disk was 93% → cleaned 1.2 GB → now 61%". Agar clean ke baad bhi 90% se upar ho (chalti jobs jagah rok rahi hain) to alert aata hai. `/stats` me disk % dikhta hai.
+
 ## Mute video (Instagram / Facebook)
 Bot download ke baad ffprobe se audio track check karta hai aur 3 tareeke se audio dhundhta hai (alag audio stream, kisi bhi format ka audio, poori muxed file). Agar Koyeb log me `no audio found by any strategy` aaye aur `site lists 0 audio-only formats` ho, to site ne video bina audio ke diya hai — Instagram aksar login ke bina (music wali reels) aisa karta hai. Ilaaj: **login cookies**. Ek alag (throwaway) Instagram account se browser me login karo → "Get cookies.txt LOCALLY" extension se `instagram.com` ke cookies export karo → pura Netscape text Koyeb ke secret env `COOKIES_TEXT` me paste karo → redeploy. Aise videos ke result me bot khud "🔇 No audio in the source" likhta hai aur unhe cache nahi karta.
 

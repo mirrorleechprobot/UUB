@@ -374,7 +374,7 @@ async def copy_to_log(job, sent_message, part_label=""):
 
 async def copy_to_user(job, stored_message, caption):
     """Helper-bot path: the file already sits in the storage channel -> the main bot copies it to the user (instant, no upload)."""
-    r = await bot_api("copyMessage", chat_id=str(job.chat_id), from_chat_id=str(config.LOG_CHANNEL_ID),
+    r = await bot_api("copyMessage", chat_id=str(job.target_chat), from_chat_id=str(config.LOG_CHANNEL_ID),
                       message_id=str(stored_message.id), caption=caption, parse_mode="HTML")
     if not r.get("ok"):
         raise RuntimeError("Could not deliver the file from the storage channel: " + explain_log_error(r.get("description")))
@@ -457,6 +457,10 @@ class Job:
         self.size_bytes = 0
         self.delivered = []                   # [(slot, file_id)] -> URL cache
         self.silent = False                   # the source itself has no audio track
+        self.target_chat = chat_id            # where the files go: the user's chat, or their connected channel
+        self.channel = None                   # {"id","title","username"} while delivering to a channel
+        self.channel_msg_id = 0               # first message in the channel (for the link)
+        self.channel_note = ""                # why the channel could not be used (fallback to the chat)
 
     @property
     def est_size(self):
@@ -586,12 +590,21 @@ async def serve_from_cache(job, status_msg):
     if not doc or not doc.get("parts"):
         return False
     parts, sent_any = doc["parts"], False
+    resolve_target(job)
     job.title = doc.get("title") or job.title
     job.size_bytes = int(doc.get("size") or 0)
     job.file_name = doc.get("file_name") or job.title
     try:
         for i, fid in enumerate(parts, 1):
-            await app.send_cached_media(job.chat_id, fid, caption=user_caption(job, f"Part {i}/{len(parts)}" if len(parts) > 1 else ""))
+            cap = user_caption(job, f"Part {i}/{len(parts)}" if len(parts) > 1 else "")
+            try:
+                sent = await app.send_cached_media(job.target_chat, fid, caption=cap)
+            except Exception as exc:  # noqa: BLE001
+                if job.target_chat == job.chat_id or not channel_unusable(exc):
+                    raise
+                channel_fallback(job, exc)
+                sent = await app.send_cached_media(job.chat_id, fid, caption=cap)
+            note_channel_message(job, getattr(sent, "id", 0))
             sent_any = True
     except Exception as exc:  # noqa: BLE001
         log.warning("cache resend failed (%s) - dropping the entry", type(exc).__name__)
@@ -608,7 +621,9 @@ async def serve_from_cache(job, status_msg):
     if job.batch:
         job.batch.job_finished("ok", job.size_bytes)
         bg(batch_update(job.batch))
-    await edit_final(status_msg, f"⚡ <b>Sent instantly (already uploaded before)</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}")
+    await edit_final(status_msg, f"⚡ <b>Sent instantly (already uploaded before)</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
+                     + channel_text_line(job))
+    notify_channel_delivery(job)
     log_bg(f"⚡ Cache hit #{job.id}\n👤 {job.user_label}\n🔗 {job.url}")
     return True
 
@@ -904,10 +919,11 @@ async def deliver_item(job, item, uc, slot, label):
         uc.active += 1
         try:
             stored = await upload_one(job, uc, item, slot, config.LOG_CHANNEL_ID, log_caption(job, label))
-            mid = await copy_to_user(job, stored, caption)
+            mid = await copy_with_fallback(job, stored, caption)
+            note_channel_message(job, mid)
             uc.uploaded += 1
             if mid and cache_eligible(job):
-                fid = await fetch_file_id(job.chat_id, mid)
+                fid = await fetch_file_id(job.target_chat, mid)
                 if fid:
                     job.delivered.append((slot, fid))
             return None, True
@@ -921,8 +937,19 @@ async def deliver_item(job, item, uc, slot, label):
             uc.active -= 1
     main_uc.active += 1
     try:
-        sent = await upload_one(job, main_uc, item, slot, job.chat_id, caption)
+        try:
+            sent = await upload_one(job, main_uc, item, slot, job.target_chat, caption)
+        except dl.Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if job.cancel.is_set():
+                raise dl.Cancelled() from exc
+            if job.target_chat == job.chat_id or not channel_unusable(exc):
+                raise
+            channel_fallback(job, exc)                 # the channel does not accept our posts: deliver to the chat instead
+            sent = await upload_one(job, main_uc, item, slot, job.chat_id, caption)
         main_uc.uploaded += 1
+        note_channel_message(job, sent.id)
         fid = msg_file_id(sent)
         if fid:
             job.delivered.append((slot, fid))
@@ -963,9 +990,10 @@ async def upload_parts_parallel(job, items, helpers):
         for i, task in enumerate(tasks, 1):
             stored = await task
             job.part_label = f"Part {i}/{n}"
-            mid = await copy_to_user(job, stored, user_caption(job, f"Part {i}/{n}"))
+            mid = await copy_with_fallback(job, stored, user_caption(job, f"Part {i}/{n}"))
+            note_channel_message(job, mid)
             if mid and cache_eligible(job):
-                fid = await fetch_file_id(job.chat_id, mid)
+                fid = await fetch_file_id(job.target_chat, mid)
                 if fid:
                     job.delivered.append((i, fid))
     finally:
@@ -995,6 +1023,7 @@ async def upload_reporter(job, started, stop):
 
 
 async def upload_all(job, items, started):
+    resolve_target(job)
     n = len(items)
     job.up_total = sum(Path(i["path"]).stat().st_size for i in items)
     job.up_cur = {}
@@ -1137,7 +1166,9 @@ async def run_job(job):
                       + (f"\n🔇 <b>No audio in the source:</b> the site delivered this video without sound "
                          f"(Instagram/Facebook do this when not logged in, or the music was removed). The admin can add login cookies."
                          if job.silent else "")
+                      + channel_text_line(job)
                       + f"\n🕒 Total time: {time_text(elapsed)}")
+        notify_channel_delivery(job)
         log_bg(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
     except dl.Cancelled:
         if job.disk_full:
@@ -1650,6 +1681,244 @@ async def queue_callback(_, cq):
     await edit_safely(cq.message, queue_text(uid), queue_markup(uid))
 
 
+# ------------------------------------------------------------------- connected channel
+_connect_wait = {}                  # uid -> time /connect was started (a forwarded channel post is then taken as the channel)
+CONNECT_WAIT = 600
+CHANNEL_BAD = {"ChatWriteForbidden", "ChatAdminRequired", "ChannelPrivate", "ChannelInvalid", "PeerIdInvalid",
+               "UserBannedInChannel", "ChatForbidden"}
+
+
+def channel_unusable(exc):
+    """True when the error means 'this channel does not accept the bot's posts' (not a network hiccup)."""
+    text = str(exc)
+    return (type(exc).__name__ in CHANNEL_BAD or "Peer id invalid" in text or "PEER_ID_INVALID" in text
+            or text.startswith("Could not deliver the file"))
+
+
+def channel_link(ch, message_id):
+    if not ch or not message_id:
+        return ""
+    if ch.get("username"):
+        return f"https://t.me/{ch['username']}/{message_id}"
+    cid = str(ch["id"])
+    return f"https://t.me/c/{cid[4:] if cid.startswith('-100') else cid.lstrip('-')}/{message_id}"
+
+
+def resolve_target(job):
+    """Where this job's files go: the user's connected channel (when connected + ON), else the bot chat."""
+    st = store.get_settings(job.user_id)
+    if st.get("channel_on") and st.get("channel_id"):
+        job.target_chat = int(st["channel_id"])
+        job.channel = {"id": int(st["channel_id"]), "title": st.get("channel_title") or "your channel",
+                       "username": st.get("channel_username") or ""}
+        if job.batch:
+            job.batch.channel_title = job.channel["title"]
+    else:
+        job.target_chat, job.channel = job.chat_id, None
+
+
+def note_channel_message(job, message_id):
+    if job.channel and message_id and not job.channel_msg_id:
+        job.channel_msg_id = int(message_id)
+
+
+def channel_fallback(job, exc):
+    """The channel refused the post: deliver to the bot chat instead and switch channel delivery off (user is told)."""
+    reason = type(exc).__name__ if type(exc).__name__ in CHANNEL_BAD else "the bot cannot post there"
+    log.warning("channel delivery failed for user %s: %s", job.user_id, reason)
+    job.channel_note = (f"Could not post to your channel ({reason}). The file was sent here instead and channel delivery is OFF. "
+                        "Make the bot an Admin (Post Messages) of the channel, then run /connect again.")
+    job.channel, job.target_chat = None, job.chat_id
+    store.set_setting(job.user_id, "channel_on", False)
+
+
+async def copy_with_fallback(job, stored, caption):
+    try:
+        return await copy_to_user(job, stored, caption)
+    except RuntimeError as exc:
+        if job.target_chat == job.chat_id or not channel_unusable(exc):
+            raise
+        channel_fallback(job, exc)
+        return await copy_to_user(job, stored, caption)
+
+
+def channel_text_line(job):
+    out = ""
+    if job.channel:
+        link = channel_link(job.channel, job.channel_msg_id)
+        out += f"\n📣 <b>Sent to your channel:</b> {esc(job.channel['title'])}" + (f' • <a href="{link}">open post</a>' if link else "")
+    if job.channel_note:
+        out += f"\n⚠️ {esc(job.channel_note)}"
+    return out
+
+
+def notify_channel_delivery(job):
+    """A separate (notifying) message in the bot chat when a file reached the channel. Batches get ONE summary instead."""
+    if not job.channel or (job.batch and job.batch.visible):
+        return
+    link = channel_link(job.channel, job.channel_msg_id)
+    bg(app.send_message(job.chat_id, f"📣 <b>Delivered to your channel</b>\n🎬 {esc(job.title[:100])}\n📢 {esc(job.channel['title'])}"
+                                     + (f'\n🔗 <a href="{link}">Open post</a>' if link else ""), disable_web_page_preview=True))
+
+
+async def verify_channel(uid, ref):
+    """(True, {"id","title","username"}) or (False, reason). Uses the Bot API only (no cached peer needed)."""
+    ref = str(ref).strip()
+    m = re.match(r"(?:https?://)?t\.me/([A-Za-z][A-Za-z0-9_]{3,})/?$", ref)
+    if m:
+        ref = "@" + m.group(1)
+    elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", ref):
+        ref = "@" + ref
+    if not (ref.startswith("@") or re.fullmatch(r"-\d+", ref)):
+        return False, "Send the channel as <code>@username</code> (public) or its id <code>-100…</code>, or forward a post from it."
+    r = await bot_api("getChat", chat_id=ref)
+    if not r.get("ok"):
+        return False, ("Channel not found. First add this bot to the channel as <b>Admin</b> (permission: Post Messages), "
+                       "then try again.")
+    chat = r["result"]
+    if chat.get("type") != "channel":
+        return False, "That is a group / user, not a channel."
+    cid = chat["id"]
+    if cid == config.LOG_CHANNEL_ID:
+        return False, "This channel cannot be used."
+    me = (await bot_api("getChatMember", chat_id=str(cid), user_id=str(state["bot_id"]))).get("result") or {}
+    if me.get("status") not in ("administrator", "creator"):
+        return False, "The bot is not an <b>Admin</b> of this channel. Add it as Admin with the <b>Post Messages</b> permission."
+    if me.get("status") == "administrator" and not me.get("can_post_messages"):
+        return False, "The bot is Admin but lacks the <b>Post Messages</b> permission. Enable it and try again."
+    um = (await bot_api("getChatMember", chat_id=str(cid), user_id=str(uid))).get("result") or {}
+    if um.get("status") not in ("administrator", "creator"):
+        return False, "You must be the <b>owner or an admin</b> of this channel to connect it."
+    return True, {"id": cid, "title": chat.get("title") or "channel", "username": chat.get("username") or ""}
+
+
+async def ensure_channel_peer(cid, username=""):
+    """The bot must be able to upload INTO the channel over MTProto, which needs the channel's access hash. A bot learns it
+    from an update, so we post a short message (the verification message) and delete it again."""
+    async def known():
+        for ref in ([cid] + ([f"@{username}"] if username else [])):
+            try:
+                await app.get_chat(ref)
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    if await known():
+        return True
+    r = await bot_api("sendMessage", chat_id=str(cid), disable_notification="true",
+                      text="✅ URL Uploader Bot is connected to this channel (this message disappears in a moment).")
+    mid = (r.get("result") or {}).get("message_id")
+    ok = False
+    for _ in range(12):
+        await asyncio.sleep(1)
+        if await known():
+            ok = True
+            break
+    if mid:
+        bg(bot_api("deleteMessage", chat_id=str(cid), message_id=str(mid)))
+    return ok
+
+
+async def connect_channel(message, ref):
+    uid = message.from_user.id
+    note = await message.reply_text("🔎 Verifying your channel...")
+    ok, res = await verify_channel(uid, ref)
+    if not ok:
+        return await edit_final(note, f"❌ <b>Could not connect</b>\n{res}")
+    if not await ensure_channel_peer(res["id"], res["username"]):
+        return await edit_final(note, "❌ <b>Could not connect</b>\nThe bot is Admin there, but Telegram has not given it access yet. "
+                                      "Remove and add the bot as Admin again, wait a minute and send /connect again.")
+    for key, val in (("channel_id", res["id"]), ("channel_title", res["title"]), ("channel_username", res["username"]),
+                     ("channel_on", True)):
+        store.set_setting(uid, key, val)
+    _connect_wait.pop(uid, None)
+    await edit_final(note, "🔎 Channel verified ✅")
+    await message.reply_text(f"✅ <b>Channel connected and verified!</b>\n\n📢 {esc(res['title'])}"
+                             + (f" (@{res['username']})" if res["username"] else "") +
+                             "\n\nFrom now on every file / video is delivered to <b>this channel</b>, and you get a message here "
+                             "when it arrives.\n/channel – pause or disconnect")
+    log_bg(f"📣 Channel connected: {res['title']} [{res['id']}] by user {uid}")
+
+
+@app.on_message(PRIVATE & filters.command("connect"))
+@allowed_only
+async def connect_cmd(_, message):
+    args = message.command[1:]
+    if not args:
+        _connect_wait[message.from_user.id] = time.time()
+        return await message.reply_text(
+            "📣 <b>Connect your channel</b>\n\n1️⃣ Add this bot to your channel as <b>Admin</b> (permission: <b>Post Messages</b>)\n"
+            "2️⃣ Send <code>/connect @yourchannel</code> (public) or <code>/connect -100…</code> (id)\n"
+            "     <i>or simply forward any post of the channel here now.</i>\n\n"
+            "I check that the bot is Admin and that <b>you</b> are an admin of the channel, then confirm here.")
+    await connect_channel(message, args[0])
+
+
+@app.on_message(PRIVATE & filters.forwarded, group=-1)
+async def connect_forward(_, message):
+    """Only while /connect is waiting: a forwarded channel post identifies the channel. Otherwise forwards work as normal links."""
+    uid = message.from_user.id if message.from_user else 0
+    if not store.is_allowed(uid) or time.time() - _connect_wait.get(uid, 0) > CONNECT_WAIT:
+        return
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is None or getattr(getattr(chat, "type", None), "name", "") != "CHANNEL":
+        await message.reply_text("That forward is not from a channel (or the channel hides its origin). "
+                                 "Send <code>/connect @channelusername</code> instead.")
+        message.stop_propagation()
+        return
+    await connect_channel(message, chat.id)
+    message.stop_propagation()
+
+
+def channel_text(uid):
+    st = store.get_settings(uid)
+    if not st.get("channel_id"):
+        return "📣 <b>No channel connected.</b>\nSend /connect to deliver your files to your own channel."
+    return (f"📣 <b>Connected channel:</b> {esc(st['channel_title'])}" + (f" (@{st['channel_username']})" if st["channel_username"] else "")
+            + f"\n📤 Delivery to the channel: <b>{'ON ✅' if st['channel_on'] else 'OFF ⏸ (files come to this chat)'}</b>")
+
+
+def channel_markup(uid):
+    st = store.get_settings(uid)
+    if not st.get("channel_id"):
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏸ Pause" if st["channel_on"] else "▶️ Resume", callback_data="ch:toggle"),
+                                  InlineKeyboardButton("❌ Disconnect", callback_data="ch:disc")]])
+
+
+@app.on_message(PRIVATE & filters.command("channel"))
+@allowed_only
+async def channel_cmd(_, message):
+    uid = message.from_user.id
+    await message.reply_text(channel_text(uid), reply_markup=channel_markup(uid))
+
+
+@app.on_message(PRIVATE & filters.command("disconnect"))
+@allowed_only
+async def disconnect_cmd(_, message):
+    uid = message.from_user.id
+    for key, val in (("channel_id", 0), ("channel_title", ""), ("channel_username", ""), ("channel_on", False)):
+        store.set_setting(uid, key, val)
+    await message.reply_text("❌ Channel disconnected. Files come to this chat again.")
+
+
+@app.on_callback_query(filters.regex(r"^ch:"))
+async def channel_callback(_, cq):
+    uid = cq.from_user.id
+    if not store.is_allowed(uid):
+        return await cq.answer("🔒 Premium required.", show_alert=True)
+    action = cq.data.split(":", 1)[1]
+    st = store.get_settings(uid)
+    if action == "toggle" and st.get("channel_id"):
+        store.set_setting(uid, "channel_on", not st["channel_on"])
+    elif action == "disc":
+        for key, val in (("channel_id", 0), ("channel_title", ""), ("channel_username", ""), ("channel_on", False)):
+            store.set_setting(uid, key, val)
+    await cq.answer("Saved")
+    await edit_safely(cq.message, channel_text(uid), channel_markup(uid))
+
+
 # ------------------------------------------------------------------- redeem codes (admin giveaway)
 _redeem_lock = asyncio.Lock()
 _redeem_fails = {}                  # uid -> [timestamps of wrong codes]
@@ -2023,7 +2292,7 @@ def stats_text():
         "📊 <b>Bot stats</b>",
         f"⏱ Uptime: {time_text(up)} • yt-dlp {yt_dlp.version.__version__}",
         f"🖥 CPU {cpu} • RAM {size_text(si['ram_used'])}/{size_text(si['ram_total'])} • "
-        f"Disk free {size_text(si['disk_free'])}/{size_text(si['disk_total'])}",
+        f"Disk free {size_text(si['disk_free'])}/{size_text(si['disk_total'])} ({safety.disk_percent():.0f}% used, auto-clean at {config.DISK_CLEAN_PERCENT}%)",
         f"🗄 Database: {esc(db.label)}" + (f"  ⚠️ {esc(db.error)}" if db.error else ""),
         keepalive_text(),
         "",
@@ -2410,7 +2679,7 @@ def janitor_sync(active_ids, min_age=1800, emergency=False):
             age = now - p.stat().st_mtime
         except OSError:
             continue
-        if not emergency and age < min_age:
+        if age < (120 if emergency else min_age):          # even in an emergency: never touch very fresh files
             continue
         try:
             if p.is_dir():
@@ -2422,7 +2691,7 @@ def janitor_sync(active_ids, min_age=1800, emergency=False):
         except OSError:
             pass
     if emergency:                                      # caches that can always be rebuilt
-        for cache in (Path.home() / ".cache" / "yt-dlp", Path("/tmp/pip-cache")):
+        for cache in (Path.home() / ".cache" / "yt-dlp", Path.home() / ".cache" / "pip", Path("/tmp/pip-cache")):
             if cache.is_dir():
                 freed += sum(f.stat().st_size for f in cache.rglob("*") if f.is_file())
                 shutil.rmtree(cache, ignore_errors=True)
@@ -2581,11 +2850,19 @@ async def health_loop():
             tick = state.get("health_tick", 0) + 1
             state["health_tick"] = tick
             low = safety.free_bytes() < config.DISK_MIN_FREE_MB * 2 * 1024 * 1024
-            if tick % 10 == 0 or low:                      # every 10 min, and every minute while the disk is low
-                await run_janitor(emergency=low and not running_jobs)
-            if safety.free_bytes() < config.DISK_MIN_FREE_MB * 2 * 1024 * 1024:
-                bg(alert_admin("disk-low", f"💾 <b>Low disk space:</b> {safety.free_bytes() / 1024 ** 2:.0f} MB free "
-                                           "(auto-clean ran). Use a bigger disk / smaller files."))
+            pct = safety.disk_percent()
+            full = low or pct >= config.DISK_CLEAN_PERCENT
+            if tick % 10 == 0 or full:                     # every 10 min, and every minute while the disk is (nearly) full
+                freed = await run_janitor(emergency=full)  # safe: only what no running job owns, nothing younger than 2 min
+                if full:
+                    after = safety.disk_percent()
+                    if after >= config.DISK_CLEAN_PERCENT or low:
+                        bg(alert_admin("disk-low", f"💾 <b>Disk {after:.0f}% full</b> (was {pct:.0f}%). Auto-clean freed {size_text(freed)}, "
+                                                   f"{size_text(safety.free_bytes())} free. The rest is held by running jobs - "
+                                                   "use a bigger disk or smaller files.", every=1800))
+                    elif freed:
+                        bg(alert_admin("disk-cleaned", f"🧹 <b>Disk was {pct:.0f}% full</b> → auto-cleaned {size_text(freed)} → now "
+                                                       f"{after:.0f}%.", every=1800))
             if config.MONGO_URI and not db.mongo:
                 bg(alert_admin("db", "🗄 <b>MongoDB is configured but not connected.</b> The bot uses local files, so queue, premium "
                                      "users and settings are LOST on redeploy. Check MONGO_URI and Atlas Network Access "

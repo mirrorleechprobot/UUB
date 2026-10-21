@@ -21,7 +21,8 @@ _users = {}            # str(uid) -> {"name", "first_seen", "last_seen", "settin
 _stats = {}            # "YYYY-MM-DD" -> {"files", "bytes", "errors", "cache_hits", "jobs"}
 _stats_saved = 0.0
 
-DEFAULT_SETTINGS = {"send_as": "video", "caption": "", "has_thumb": False}   # send_as: "video" | "document"
+DEFAULT_SETTINGS = {"send_as": "video", "caption": "", "has_thumb": False,
+                    "channel_id": 0, "channel_title": "", "channel_username": "", "channel_on": False}   # send_as: "video" | "document"
 
 
 def today():

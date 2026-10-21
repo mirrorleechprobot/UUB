@@ -36,6 +36,7 @@ class Batch:
         self.msg = None                       # the single progress message
         self.last_edit = 0.0
         self.final_sent = False
+        self.channel_title = ""               # set when the files go to the user's connected channel
         self.lock = asyncio.Lock()
 
     # --- events
@@ -81,4 +82,6 @@ class Batch:
             lines.append(f"⚠️ Not queued: {self.invalid}")
         if final:
             lines.append(f"📦 Total uploaded: {_size(self.bytes)}\n🕒 Time: {_dur(time.time() - self.started)}")
+            if self.channel_title:
+                lines.append(f"📣 Delivered to your channel: {self.channel_title}")
         return "\n".join(lines)

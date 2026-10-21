@@ -86,5 +86,14 @@ def check_disk(size):
     return True, ""
 
 
+def disk_percent(path=None):
+    """Used disk space in % (the filesystem that holds the downloads)."""
+    try:
+        du = shutil.disk_usage(path or config.DOWNLOAD_DIR)
+        return du.used * 100.0 / du.total if du.total else 0.0
+    except OSError:
+        return 0.0
+
+
 def disk_low():
     return free_bytes() < config.DISK_MIN_FREE_MB * 1024 * 1024
