@@ -236,6 +236,43 @@ def log_bg(text):
 
 
 BOT_API_BASE = "https://api.telegram.org"
+_API_OPENER = None
+
+
+def _api_opener():
+    """urllib opener that connects over IPv4 with a short connect timeout. Many hosts (Koyeb included) have no working IPv6
+    route: the default 'try IPv6 first' then waits the FULL timeout (60 s) before falling back to IPv4 - every call was slow."""
+    global _API_OPENER
+    if _API_OPENER is None:
+        import http.client
+        import socket
+        import ssl
+        import urllib.request
+
+        class _V4Conn(http.client.HTTPSConnection):
+            def connect(self):
+                try:
+                    infos = socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM)
+                except socket.gaierror:
+                    infos = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)     # IPv6-only host
+                last = OSError("no address")
+                for _fam, _typ, _proto, _canon, addr in infos:
+                    try:
+                        sock = socket.create_connection(addr[:2], 10)           # 10 s to connect...
+                        sock.settimeout(self.timeout)                           # ...then the normal read timeout
+                        break
+                    except OSError as exc:
+                        last = exc
+                else:
+                    raise last
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+        class _V4Handler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(_V4Conn, req, context=ssl.create_default_context())
+
+        _API_OPENER = urllib.request.build_opener(_V4Handler())
+    return _API_OPENER
 
 
 def _bot_api_sync(method, data, token=None):
@@ -246,8 +283,9 @@ def _bot_api_sync(method, data, token=None):
     import urllib.request
     url = f"{BOT_API_BASE}/bot{token or config.BOT_TOKEN}/{method}"
     req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), method="POST")
+    t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _api_opener().open(req, timeout=60) as resp:
             body = resp.read()
     except urllib.error.HTTPError as exc:               # Telegram answers 4xx/429 with a JSON body we need (retry_after ...)
         body = exc.read()
@@ -257,6 +295,10 @@ def _bot_api_sync(method, data, token=None):
             return {"ok": False, "error_code": exc.code, "description": f"HTTP {exc.code}"}
     except Exception as exc:  # noqa: BLE001  (never print exc: its text can contain the token URL)
         return {"ok": False, "description": f"network error: {type(exc).__name__}"}
+    finally:
+        took = time.monotonic() - t0
+        if took > 5:
+            log.warning("Bot API %s was slow: %.1fs", method, took)
     try:
         return json.loads(body)
     except ValueError:

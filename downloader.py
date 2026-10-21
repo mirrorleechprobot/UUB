@@ -391,6 +391,41 @@ def download_torrent(url, workdir, progress, cancel):
     return {"path": archive, "title": archive.name}
 
 
+def _requests_download(url, target, progress, cancel):
+    s = _session()
+    try:
+        with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60)) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or 0)
+            current, last_bytes, last_time = 0, 0, time.monotonic()
+            with target.open("wb") as out:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if cancel.is_set():
+                        raise Cancelled()
+                    if not chunk:
+                        continue
+                    out.write(chunk)
+                    current += len(chunk)
+                    now = time.monotonic()
+                    if now - last_time >= 1:
+                        speed = (current - last_bytes) / (now - last_time)
+                        last_bytes, last_time = current, now
+                        progress.update({"status": "downloading", "current": current, "total": total,
+                                         "speed": speed, "eta": (total - current) / speed if total and speed else None})
+    finally:
+        s.close()
+
+
+def _looks_like_html(path):
+    try:
+        if path.stat().st_size > 3 * 1024 * 1024:
+            return False
+        head = path.read_bytes()[:512].lstrip().lower()
+        return head.startswith((b"<!doctype html", b"<html", b"<?xml")) or b"<html" in head
+    except OSError:
+        return False
+
+
 def download_direct(url, workdir, progress, cancel, filename=None, size=0):
     if not filename:
         info = _probe_http(url)
