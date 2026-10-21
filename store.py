@@ -21,7 +21,7 @@ _users = {}            # str(uid) -> {"name", "first_seen", "last_seen", "settin
 _stats = {}            # "YYYY-MM-DD" -> {"files", "bytes", "errors", "cache_hits", "jobs"}
 _stats_saved = 0.0
 
-DEFAULT_SETTINGS = {"send_as": "auto", "caption": "", "has_thumb": False}
+DEFAULT_SETTINGS = {"send_as": "video", "caption": "", "has_thumb": False}   # send_as: "video" | "document"
 
 
 def today():
@@ -90,6 +90,22 @@ def add_premium(user_id, days=None, by=None):
         _premium[str(user_id)] = rec
     db.put("premium", user_id, rec)
     return expires
+
+
+def grant_premium(user_id, seconds, by=None):
+    """Add `seconds` of premium (redeem codes). An active plan is EXTENDED, an expired/new one starts now.
+    Returns the new expiry, or None when the user already has lifetime premium (nothing is changed)."""
+    with _lock:
+        now = time.time()
+        rec = _premium.get(str(user_id))
+        if rec and rec.get("expires") is None:
+            return None
+        base = max(now, rec["expires"]) if rec and rec.get("expires") else now
+        new = {"added": (rec or {}).get("added", now), "expires": base + seconds, "by": by, "reminded": [],
+               "quota_gb": (rec or {}).get("quota_gb"), "quota_files": (rec or {}).get("quota_files")}
+        _premium[str(user_id)] = new
+    db.put("premium", user_id, new)
+    return new["expires"]
 
 
 def remove_premium(user_id):
@@ -163,6 +179,8 @@ def touch_user(uid, name=""):
 def get_settings(uid):
     s = dict(DEFAULT_SETTINGS)
     s.update(_user(uid).get("settings") or {})
+    if s.get("send_as") != "document":
+        s["send_as"] = "video"                      # also maps the old "auto" value
     return s
 
 

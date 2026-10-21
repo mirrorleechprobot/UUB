@@ -115,3 +115,9 @@ DAILY_LIMIT_GB = max(0, env_int("DAILY_LIMIT_GB", 0))         # per premium user
 DAILY_LIMIT_FILES = max(0, env_int("DAILY_LIMIT_FILES", 0))   # same, number of files
 PREMIUM_REMIND_DAYS = sorted({int(x) for x in os.getenv("PREMIUM_REMIND_DAYS", "3,1").replace(" ", "").split(",")
                               if x.isdigit() and int(x) > 0}, reverse=True)
+
+# ---- keep-alive (stops free hosts from putting the app to sleep) ----
+# The bot requests its own PUBLIC url every KEEPALIVE_MINUTES (0 = off). Koyeb sets KOYEB_PUBLIC_DOMAIN itself;
+# otherwise set KEEPALIVE_URL=https://your-app.koyeb.app/health
+KEEPALIVE_MINUTES = max(0, env_int("KEEPALIVE_MINUTES", 4))
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()

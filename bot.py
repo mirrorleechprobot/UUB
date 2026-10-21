@@ -70,6 +70,7 @@ import downloader as dl
 import fastupload
 import safety
 import store
+import codes
 from batch import Batch
 from db import db
 
@@ -678,7 +679,7 @@ async def enqueue(job, status_msg, batch=None):
         position = [j for j in waiting if j.user_id == uid].index(job) + 1
         text = (f"✅ <b>Added to your queue</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
                 f"🔢 Position: <b>{position}</b> • Waiting: {waiting_count(uid)}/{config.MAX_WAITING_PER_USER} • "
-                f"Active: {running_count(uid)}")
+                f"Active: {running_count(uid)}\n📤 Upload as: {'Document' if job.settings.get('send_as') == 'document' else 'Video'}")
         await edit_safely(status_msg, text, cancel_markup(job))
     return True
 
@@ -1146,6 +1147,10 @@ async def run_job(job):
                           "The download was stopped to protect the server. Try again in a few minutes.")
             bg(alert_admin("disk", f"💾 <b>Disk full</b> while downloading #{job.id}. Free space: "
                                    f"{safety.free_bytes() / 1024 ** 2:.0f} MB."))
+        elif state["shutting_down"]:
+            job.outcome = "cancelled"
+            final_text = (f"♻️ <b>Bot is restarting</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                          "This job is saved and starts again automatically after the restart.")
         else:
             job.outcome = "cancelled"
             final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
@@ -1190,7 +1195,7 @@ async def dispatcher():
     while True:
         await wake.wait()
         wake.clear()
-        while len(running_jobs) < config.MAX_CONCURRENT_JOBS:
+        while len(running_jobs) < config.MAX_CONCURRENT_JOBS and not state["shutting_down"]:
             job = next((j for j in waiting if busy_download(j.user_id) < config.MAX_RUNNING_PER_USER), None)
             if job is None:
                 break
@@ -1336,7 +1341,8 @@ async def deny(message):
     await message.reply_text(
         "🔒 <b>This bot is only for Premium users and the Admin.</b>\n\n"
         f"Your Telegram ID: <code>{message.from_user.id}</code>\n"
-        "Send this ID to the Admin to get Premium access.")
+        "Send this ID to the Admin to get Premium access.\n\n"
+        "🎟 Have a redeem code? Send <code>/redeem YOUR-CODE</code>")
 
 
 def allowed_only(func):
@@ -1381,6 +1387,7 @@ async def start_handler(_, message):
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
+                 "/gencode <code>30d [count]</code>  /codes  /delcode\n"
                  "/stats  /userstats <code>id</code>  /topusers  /clearlinks\n"
                  "/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
     await message.reply_text(text)
@@ -1502,9 +1509,12 @@ async def move_cmd(_, message):
 def settings_text(uid):
     st = store.get_settings(uid)
     cap = f"<code>{esc(st['caption'][:200])}</code>" if st["caption"] else "default"
+    method = ("📄 <b>Document</b> – the original file, no Telegram compression, no preview"
+              if st["send_as"] == "document" else "🎬 <b>Video</b> – plays inside Telegram (audio / photos go as audio / photos)")
     return ("⚙️ <b>Your settings</b>\n\n"
-            f"📤 Send as: <b>{'Document (always a file)' if st['send_as'] == 'document' else 'Auto (video / audio / photo)'}</b>\n"
+            f"📤 Upload method: {method}\n"
             f"🏷 Caption: {cap}\n🖼 Thumbnail: {'✅ set' if st['has_thumb'] else '❌ none'}\n\n"
+            "/video – send as video  •  /document – send as document\n"
             "/caption <code>text</code> – placeholders: {title} {name} {size} {ext}\n"
             "/setthumb – reply to a photo with it • /delthumb\n"
             "Rename one file: <code>link | new name.mp4</code>")
@@ -1512,8 +1522,9 @@ def settings_text(uid):
 
 def settings_markup(uid):
     st = store.get_settings(uid)
-    rows = [[InlineKeyboardButton("📤 Send as: " + ("Document" if st["send_as"] == "document" else "Auto") + "  (tap to switch)",
-                                  callback_data="st:sendas")]]
+    doc = st["send_as"] == "document"
+    rows = [[InlineKeyboardButton(("🎬 Video" if doc else "✅ 🎬 Video"), callback_data="st:video"),
+             InlineKeyboardButton(("✅ 📄 Document" if doc else "📄 Document"), callback_data="st:doc")]]
     if st["has_thumb"]:
         rows.append([InlineKeyboardButton("🗑 Remove thumbnail", callback_data="st:delthumb")])
     if st["caption"]:
@@ -1535,8 +1546,10 @@ async def settings_callback(_, cq):
         return await cq.answer("🔒 Premium required.", show_alert=True)
     action = cq.data.split(":", 1)[1]
     st = store.get_settings(uid)
-    if action == "sendas":
-        store.set_setting(uid, "send_as", "auto" if st["send_as"] == "document" else "document")
+    if action == "video":
+        store.set_setting(uid, "send_as", "video")
+    elif action == "doc":
+        store.set_setting(uid, "send_as", "document")
     elif action == "delthumb":
         store.set_setting(uid, "has_thumb", False)
         db.delete_blob(f"thumb:{uid}")
@@ -1544,6 +1557,16 @@ async def settings_callback(_, cq):
         store.set_setting(uid, "caption", "")
     await cq.answer("Saved")
     await edit_safely(cq.message, settings_text(uid), settings_markup(uid))
+
+
+@app.on_message(PRIVATE & filters.command(["video", "document"]))
+@allowed_only
+async def upload_method_cmd(_, message):
+    """/video and /document: choose how your files are uploaded."""
+    mode = "document" if message.command[0].lower() == "document" else "video"
+    store.set_setting(message.from_user.id, "send_as", mode)
+    await message.reply_text("📄 Your files will be uploaded as <b>Documents</b> (original quality, no preview)." if mode == "document"
+                             else "🎬 Your videos will be uploaded as <b>Videos</b> (play inside Telegram).")
 
 
 @app.on_message(PRIVATE & filters.command("caption"))
@@ -1625,6 +1648,225 @@ async def queue_callback(_, cq):
             await cancel_job(j)
         await cq.answer(f"🧹 {len(targets)} removed")
     await edit_safely(cq.message, queue_text(uid), queue_markup(uid))
+
+
+# ------------------------------------------------------------------- redeem codes (admin giveaway)
+_redeem_lock = asyncio.Lock()
+_redeem_fails = {}                  # uid -> [timestamps of wrong codes]
+
+
+def _code_state(d, now=None):
+    now = now or time.time()
+    if d.get("valid_until") and d["valid_until"] < now:
+        return "expired"
+    return "available" if d.get("uses_left", 0) > 0 else "used"
+
+
+@app.on_message(PRIVATE & filters.command("gencode"))
+@admin_only
+async def gencode_cmd(_, message):
+    """/gencode 30d [count] [uses=N] [valid=7d]  - durations: 30m 12h 7d 1mo 1y 1y6mo (month = 30 days, year = 365 days)."""
+    args = message.command[1:]
+    if len(args) > 1 and re.fullmatch(r"\d+(\.\d+)?", args[0]) and re.fullmatch(r"[A-Za-z]+", args[1]):
+        args = [args[0] + args[1]] + args[2:]                      # "/gencode 30 days 5"
+    seconds = codes.parse_duration(args[0]) if args else None
+    if not seconds:
+        return await message.reply_text(
+            "🎟 <b>Create redeem codes</b>\n<code>/gencode DURATION [count] [uses=N] [valid=DURATION]</code>\n\n"
+            "Duration: <code>30m</code> minutes • <code>12h</code> hours • <code>7d</code> days • <code>1mo</code> months • "
+            "<code>1y</code> years (can be combined: <code>1y6mo</code>). 1 month = 30 days, 1 year = 365 days.\n\n"
+            "Examples:\n<code>/gencode 30d</code> – one 30-day code\n<code>/gencode 7d 20</code> – twenty 7-day codes (1 use each)\n"
+            "<code>/gencode 1mo 1 uses=50</code> – ONE code that 50 different users can use\n"
+            "<code>/gencode 1y 5 valid=7d</code> – codes that must be redeemed within 7 days\n\n"
+            "/codes – list • /delcode <code>CODE|used</code> – remove")
+    count, uses, valid = 1, 1, None
+    for a in args[1:]:
+        low = a.lower()
+        if low.isdigit():
+            count = int(low)
+        elif low.startswith("uses=") and low[5:].isdigit():
+            uses = int(low[5:])
+        elif low.startswith("valid="):
+            valid = codes.parse_duration(low[6:])
+            if not valid:
+                return await message.reply_text("❌ Invalid <code>valid=</code> duration (examples: 7d, 12h, 1mo).")
+        else:
+            return await message.reply_text(f"❌ I did not understand <code>{esc(a)}</code>. Send /gencode for help.")
+    if not 1 <= count <= 100 or not 1 <= uses <= 10000:
+        return await message.reply_text("❌ count must be 1-100 and uses 1-10000.")
+    now, made = time.time(), []
+    for _ in range(count):
+        code = codes.new_code()
+        await db.put_wait("codes", code, {"seconds": seconds, "created": now, "by": message.from_user.id, "max_uses": uses,
+                                          "uses_left": uses, "redeemed_by": [], "valid_until": now + valid if valid else None})
+        made.append(code)
+    head = (f"🎟 <b>{count} code(s)</b> • each gives <b>{codes.format_duration(seconds)}</b> of Premium"
+            + (f" • {uses} uses each" if uses > 1 else "") + (f" • redeem within {codes.format_duration(valid)}" if valid else "") + "\n\n")
+    foot = "\n\n🎁 Users send: <code>/redeem CODE</code>"
+    chunk = head
+    for code in made:
+        line = f"<code>{code}</code>\n"
+        if len(chunk) + len(line) > 3500:
+            await message.reply_text(chunk)
+            chunk = ""
+        chunk += line
+    await message.reply_text(chunk + foot)
+    log_bg(f"🎟 Admin created {count} code(s) of {codes.format_duration(seconds)}")
+
+
+@app.on_message(PRIVATE & filters.command("codes"))
+@admin_only
+async def codes_cmd(_, message):
+    docs = await db.all("codes")
+    now = time.time()
+    by_state = {"available": [], "used": [], "expired": []}
+    for d in docs:
+        by_state[_code_state(d, now)].append(d)
+    lines = [f"🎟 <b>Redeem codes</b>: {len(by_state['available'])} available • {len(by_state['used'])} used • "
+             f"{len(by_state['expired'])} expired"]
+    for d in sorted(by_state["available"], key=lambda x: x.get("created", 0))[:40]:
+        extra = f" • {d['uses_left']}/{d['max_uses']} uses" if d.get("max_uses", 1) > 1 else ""
+        extra += f" • valid until {date_text(d['valid_until'])}" if d.get("valid_until") else ""
+        lines.append(f"<code>{d['_id']}</code> – {codes.format_duration(d['seconds'])}{extra}")
+    if len(by_state["available"]) > 40:
+        lines.append(f"… and {len(by_state['available']) - 40} more")
+    recent = sorted((d for d in docs if d.get("redeemed_by")), key=lambda x: -x["redeemed_by"][-1].get("ts", 0))[:8]
+    if recent:
+        lines.append("\n🕘 <b>Recently redeemed</b>")
+        for d in recent:
+            r = d["redeemed_by"][-1]
+            lines.append(f"<code>{d['_id']}</code> → <code>{r['uid']}</code> ({time.strftime('%d %b %H:%M', time.gmtime(r['ts']))} UTC)")
+    await message.reply_text("\n".join(lines)[:4000])
+
+
+@app.on_message(PRIVATE & filters.command("delcode"))
+@admin_only
+async def delcode_cmd(_, message):
+    """/delcode CODE removes one code; /delcode used removes all used + expired codes. Nothing else is touched."""
+    arg = message.command[1] if len(message.command) > 1 else ""
+    if arg.lower() == "used":
+        now = time.time()
+        gone = [d for d in await db.all("codes") if _code_state(d, now) != "available"]
+        for d in gone:
+            db.delete("codes", d["_id"])
+        await db.flush()
+        return await message.reply_text(f"🧹 {len(gone)} used / expired code(s) removed.")
+    code = codes.normalize_code(arg)
+    if not code or not await db.get("codes", code):
+        return await message.reply_text("Usage: /delcode <code>UUB-XXXX-XXXX-XXXX</code> or /delcode <code>used</code>")
+    db.delete("codes", code)
+    await db.flush()
+    await message.reply_text(f"🗑 Code <code>{code}</code> deleted.")
+
+
+@app.on_message(PRIVATE & filters.command("redeem"))
+async def redeem_cmd(_, message):
+    """Open to EVERYONE (a new user has no access yet): /redeem UUB-XXXX-XXXX-XXXX"""
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    now = time.time()
+    recent = [t for t in _redeem_fails.get(uid, []) if now - t < 600]
+    if len(recent) >= 5 and not store.is_admin(uid):                      # brute-force guard
+        _redeem_fails[uid] = recent
+        return await message.reply_text("⛔ Too many wrong codes. Try again in 10 minutes.")
+    if len(message.command) < 2:
+        return await message.reply_text("🎟 Send your code like this:\n<code>/redeem UUB-XXXX-XXXX-XXXX</code>")
+    if store.is_admin(uid):
+        return await message.reply_text("👑 You are the Admin – no code needed.")
+    rec = store.premium_info(uid)
+    if rec and rec.get("expires") is None:
+        return await message.reply_text("💎 You already have <b>lifetime</b> Premium. The code was NOT used.")
+
+    code = codes.normalize_code(" ".join(message.command[1:]))
+    async with _redeem_lock:                                              # two users can never use the last use together
+        doc = await db.get("codes", code) if code else None
+        if not doc:
+            _redeem_fails[uid] = recent + [now]
+            return await message.reply_text("❌ Invalid code. Check it and try again.")
+        status = _code_state(doc, now)
+        if any(r.get("uid") == uid for r in doc.get("redeemed_by", [])):
+            return await message.reply_text("ℹ️ You already used this code.")
+        if status == "expired":
+            return await message.reply_text("⌛ This code has expired.")
+        if status == "used":
+            return await message.reply_text("❌ This code has already been used.")
+        expires = store.grant_premium(uid, doc["seconds"], by=f"code:{code}")
+        doc["uses_left"] = doc.get("uses_left", 1) - 1
+        doc.setdefault("redeemed_by", []).append({"uid": uid, "ts": now})
+        await db.put_wait("codes", code, {k: v for k, v in doc.items() if k != "_id"})
+    store.touch_user(uid, message.from_user.first_name or "")
+    _redeem_fails.pop(uid, None)
+    await message.reply_text(f"🎉 <b>Premium activated!</b>\n⏳ +{codes.format_duration(doc['seconds'])}\n📅 Expiry: {date_text(expires)}\n\n"
+                             "Send /start to begin.")
+    name = f"{message.from_user.first_name or ''} (@{message.from_user.username})" if message.from_user.username else (message.from_user.first_name or "")
+    log_bg(f"🎟 Code {code} redeemed by {esc(name)} [{uid}] (+{codes.format_duration(doc['seconds'])})")
+
+
+# ------------------------------------------------------------------- keep-alive / uptime
+def keepalive_url():
+    if config.KEEPALIVE_URL:
+        return config.KEEPALIVE_URL
+    domain = os.getenv("KOYEB_PUBLIC_DOMAIN", "").strip()
+    return f"https://{domain}/health" if domain else ""
+
+
+def _ping_sync(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "uub-keepalive"})
+    try:
+        with _api_opener().open(req, timeout=20) as r:
+            return r.status
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "code", None)
+        return status if isinstance(status, int) else 0
+
+
+async def keepalive_loop():
+    """Free hosts put an app to sleep when nobody visits its public URL (Telegram traffic does not count). The bot visits
+    its own public /health page every few minutes, which counts as traffic."""
+    ka = state.setdefault("keepalive", {"url": "", "ok": 0, "fail": 0, "last_ok": 0.0, "last_try": 0.0, "streak": 0})
+    if not config.KEEPALIVE_MINUTES:
+        return
+    ka["url"] = keepalive_url()
+    if not ka["url"]:
+        log.warning("Keep-alive is OFF: set KEEPALIVE_URL=https://<your-app>.koyeb.app/health (KOYEB_PUBLIC_DOMAIN is not set).")
+        return
+    await asyncio.sleep(45)                                  # let the health server report ready first
+    while True:
+        status = await asyncio.get_running_loop().run_in_executor(API_POOL, _ping_sync, ka["url"])
+        ka["last_try"] = time.time()
+        if status == 200:
+            ka["ok"] += 1
+            ka["streak"] = 0
+            ka["last_ok"] = ka["last_try"]
+        else:
+            ka["fail"] += 1
+            ka["streak"] += 1
+            log.warning("Keep-alive ping failed (status %s)", status)
+            if ka["streak"] >= 5:
+                bg(alert_admin("keepalive", f"⚠️ <b>Keep-alive ping keeps failing</b> (status {status}). The app may go to sleep. "
+                                            "Check KEEPALIVE_URL / the public domain.", every=6 * 3600))
+        await asyncio.sleep(config.KEEPALIVE_MINUTES * 60)
+
+
+def keepalive_text():
+    ka = state.get("keepalive") or {}
+    if not config.KEEPALIVE_MINUTES:
+        return "💤 Keep-alive: off"
+    if not ka.get("url"):
+        return "💤 Keep-alive: ⚠️ no public URL known (set <code>KEEPALIVE_URL</code>)"
+    ago = f"{time_text(time.time() - ka['last_ok'])} ago" if ka.get("last_ok") else "not yet"
+    return (f"💤 Keep-alive: {'🟢' if ka.get('streak', 0) == 0 else '🔴'} every {config.KEEPALIVE_MINUTES} min • last OK {ago} • "
+            f"{ka.get('ok', 0)} ok / {ka.get('fail', 0)} failed")
+
+
+@app.on_message(PRIVATE & filters.command("uptime"))
+@allowed_only
+async def uptime_cmd(_, message):
+    up = time.time() - state["started"]
+    since = time.strftime("%d %b %Y %H:%M", time.gmtime(state["started"]))
+    await message.reply_text(f"⏱ <b>Uptime:</b> {time_text(up)}\n🟢 Running since {since} UTC\n{keepalive_text()}")
 
 
 # ------------------------------------------------------------------- admin: premium management
@@ -1783,6 +2025,7 @@ def stats_text():
         f"🖥 CPU {cpu} • RAM {size_text(si['ram_used'])}/{size_text(si['ram_total'])} • "
         f"Disk free {size_text(si['disk_free'])}/{size_text(si['disk_total'])}",
         f"🗄 Database: {esc(db.label)}" + (f"  ⚠️ {esc(db.error)}" if db.error else ""),
+        keepalive_text(),
         "",
         f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now)} uploading",
         f"🤖 Uploaders: " + " • ".join(f"{'main' if u.is_main else u.name}:{'🟢' if u.usable else '🔴'}{u.active}" for u in uploaders),
@@ -1920,12 +2163,48 @@ async def update_ytdlp():
     return proc.returncode == 0, running, installed, tail
 
 
-async def graceful_restart(reason=""):
-    """Exit so Docker/Koyeb starts a fresh instance. The queue is saved in the database and resumes automatically."""
-    log.info("Graceful restart: %s", reason)
-    state["shutting_down"] = True
+def wipe_storage_sync():
+    """Delete EVERYTHING in the download folder (+ rebuildable caches). Only safe when no job is using the files."""
+    freed = 0
+    for p in list(DOWNLOAD_DIR.iterdir()):
+        try:
+            if p.is_dir():
+                freed += sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                freed += p.stat().st_size
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    for cache in (Path.home() / ".cache" / "yt-dlp",):
+        if cache.is_dir():
+            freed += sum(f.stat().st_size for f in cache.rglob("*") if f.is_file())
+            shutil.rmtree(cache, ignore_errors=True)
+    return freed
+
+
+async def prepare_restart(wipe=True):
+    """Stop running jobs (they stay in the database and start again after the restart), wipe the storage, flush the DB.
+    Returns the number of bytes freed."""
+    state["shutting_down"] = True               # first: finished/failed jobs must NOT delete their queue records any more
+    for job in list(running_jobs):
+        job.cancel.set()
+    for _ in range(20):                         # give uploads/downloads up to 10 s to stop
+        if not running_jobs:
+            break
+        await asyncio.sleep(0.5)
+    freed = await asyncio.get_running_loop().run_in_executor(POOL, wipe_storage_sync) if wipe else 0
     store.flush_stats()
     await db.flush()
+    return freed
+
+
+async def graceful_restart(reason="", wipe=True):
+    """Exit so Docker/Koyeb starts a fresh instance. The queue is saved in the database and resumes automatically."""
+    log.info("Graceful restart: %s", reason)
+    freed = await prepare_restart(wipe)
+    if freed:
+        log.info("Restart cleanup freed %.1f MB", freed / 1048576)
     await asyncio.sleep(1)
     os._exit(0)
 
@@ -1946,8 +2225,14 @@ async def update_handler(_, message):
 @app.on_message(PRIVATE & filters.command("restart"))
 @admin_only
 async def restart_handler(_, message):
-    await message.reply_text("♻️ Restarting (Docker/Koyeb will start it again). Your queue is saved and resumes automatically...")
-    await graceful_restart("admin /restart")
+    busy = len(running_jobs) + len(waiting)
+    note = await message.reply_text("♻️ Stopping jobs and cleaning the storage..." + (f"\n({busy} job(s) are saved and start again after the restart.)" if busy else ""))
+    before = safety.free_bytes()
+    freed = await prepare_restart(True)
+    await edit_final(note, f"🧹 <b>Storage cleaned:</b> {size_text(freed)} freed\n💾 Free disk: {size_text(before)} → {size_text(safety.free_bytes())}\n"
+                           "♻️ Restarting now. Your queue is saved and resumes automatically.")
+    await asyncio.sleep(1)
+    os._exit(0)
 
 
 # ------------------------------------------------------------------- links
@@ -2356,7 +2641,7 @@ async def main():
     state["ready"] = True
     log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s | db=%s", me.username, yt_dlp.version.__version__,
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG, db.label)
-    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop())]
+    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop())]
     await restore_queue()
     if config.MONGO_URI and not db.mongo:
         bg(alert_admin("db", f"🗄 <b>MongoDB connection failed at startup.</b> Using local files (data is lost on redeploy).\n"

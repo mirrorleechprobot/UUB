@@ -86,6 +86,20 @@ Setup: Atlas me free cluster → *Database Access* me user banao → *Network Ac
 
 **Dhyan:** DB me sirf peer cache (users/channels ke access hash) save hota hai, auth key nahi — isliye rolling deploy me do instance ek saath chalen to bhi AUTH_KEY_DUPLICATED nahi aata.
 
+## Upload method (Video / Document)
+`/settings` me **🎬 Video | 📄 Document** buttons, ya seedha `/video` aur `/document`. Video = Telegram ke player me chalta hai; Document = original file (compression/preview nahi). Har user ki apni setting, DB me save. Queue message me bhi dikhta hai ("Upload as").
+
+## Redeem codes (sirf admin giveaway kar sakta hai)
+- **Admin:** `/gencode 30d` • `/gencode 7d 20` (20 codes) • `/gencode 1mo 1 uses=50` (ek code, 50 users) • `/gencode 1y 5 valid=7d` (7 din me redeem karna zaruri). Duration: `30m` minutes, `12h` ghante, `7d` din, `1mo` mahine (30 din), `1y` saal (365 din), combine: `1y6mo`.
+- `/codes` (list + recent redeem), `/delcode CODE`, `/delcode used` (used/expired hatao). Sirf `codes` collection badalti hai.
+- **User:** `/redeem UUB-XXXX-XXXX-XXXX` — premium na ho tab bhi chalta hai. Active plan ho to usme **jud jata hai**. Lifetime user ka code kharch nahi hota. 5 galat code par 10 min ka lock; ek code ka aakhri use do log ek saath nahi le sakte.
+
+## Uptime / keep-alive
+Free host tab sleep karta hai jab uske **public URL par koi traffic na aaye** (Telegram ka traffic count nahi hota). Isliye bot khud apne public `/health` ko har `KEEPALIVE_MINUTES` (default 4) me ping karta hai. Koyeb me `KEEPALIVE_URL=https://<app>.koyeb.app/health` set karo (agar `KOYEB_PUBLIC_DOMAIN` mile to apne aap banta hai). `/uptime` (sab users) aur `/stats` (admin) me status dikhta hai; 5 baar fail ho to admin ko alert. **Backup:** UptimeRobot / cron-job.org se bhi wahi URL har 5 min ping karwa do.
+
+## /restart = storage clean
+`/restart` pehle chalti jobs rok deta hai (queue DB me safe rehti hai), phir `downloads` folder aur yt-dlp cache **poora** saaf karta hai, batata hai kitna MB free hua, aur tab restart karta hai. Jobs restart ke baad shuru se apne aap chalti hain; user ko "Bot is restarting" message milta hai.
+
 ## Mute video (Instagram / Facebook)
 Bot download ke baad ffprobe se audio track check karta hai aur 3 tareeke se audio dhundhta hai (alag audio stream, kisi bhi format ka audio, poori muxed file). Agar Koyeb log me `no audio found by any strategy` aaye aur `site lists 0 audio-only formats` ho, to site ne video bina audio ke diya hai — Instagram aksar login ke bina (music wali reels) aisa karta hai. Ilaaj: **login cookies**. Ek alag (throwaway) Instagram account se browser me login karo → "Get cookies.txt LOCALLY" extension se `instagram.com` ke cookies export karo → pura Netscape text Koyeb ke secret env `COOKIES_TEXT` me paste karo → redeploy. Aise videos ke result me bot khud "🔇 No audio in the source" likhta hai aur unhe cache nahi karta.
 
