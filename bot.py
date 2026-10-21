@@ -1413,7 +1413,7 @@ async def start_handler(_, message):
             "• <code>link | new name.mp4</code> → rename the file\n\n"
             "Your links run <b>one by one</b> (the next file downloads while the previous one uploads). "
             f"Up to {config.MAX_WAITING_PER_USER} can wait in line. Same link again = instant resend ⚡\n\n"
-            "📋 /queue  /clear  /top  /move  /cancel\n⚙️ /settings  /caption  /setthumb  /delthumb\n"
+            "📋 /queue  /clear  /top  /move  /cancel\n⚙️ /settings  /connect  /caption  /setthumb  /delthumb\n"
             "📊 /mystats  /myplan  /id")
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
