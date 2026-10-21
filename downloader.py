@@ -507,6 +507,7 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
         for p in files:
             p.unlink(missing_ok=True)
     log.warning("no audio found by any strategy: this video is really silent (or the site needs login cookies)")
+    result["silent"] = True
     return result
 
 

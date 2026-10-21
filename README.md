@@ -86,5 +86,11 @@ Setup: Atlas me free cluster → *Database Access* me user banao → *Network Ac
 
 **Dhyan:** DB me sirf peer cache (users/channels ke access hash) save hota hai, auth key nahi — isliye rolling deploy me do instance ek saath chalen to bhi AUTH_KEY_DUPLICATED nahi aata.
 
+## Mute video (Instagram / Facebook)
+Bot download ke baad ffprobe se audio track check karta hai aur 3 tareeke se audio dhundhta hai (alag audio stream, kisi bhi format ka audio, poori muxed file). Agar Koyeb log me `no audio found by any strategy` aaye aur `site lists 0 audio-only formats` ho, to site ne video bina audio ke diya hai — Instagram aksar login ke bina (music wali reels) aisa karta hai. Ilaaj: **login cookies**. Ek alag (throwaway) Instagram account se browser me login karo → "Get cookies.txt LOCALLY" extension se `instagram.com` ke cookies export karo → pura Netscape text Koyeb ke secret env `COOKIES_TEXT` me paste karo → redeploy. Aise videos ke result me bot khud "🔇 No audio in the source" likhta hai aur unhe cache nahi karta.
+
+## yt-dlp update
+Container har start par newest yt-dlp install karta hai (`YTDLP_UPDATE_ON_START`), aur har `YTDLP_UPDATE_HOURS` ghante PyPI check karke naya version ho to bot idle hone par khud restart hota hai (queue DB me safe). Ek version ke liye sirf ek restart. yt-dlp ko chalte process me reload nahi kiya jata (isse urllib3 patch double ho kar baaki HTTP calls tod deta tha).
+
 ## Cookies
 Login-wale sites ke liye Netscape `cookies.txt` (ya `COOKIES_TEXT`). Kabhi share/commit mat karo. Sirf apne authorized content ke liye use karo.

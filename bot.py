@@ -24,6 +24,40 @@ try:                                   # uvloop = faster event loop (less CPU pe
 except Exception:  # noqa: BLE001  (uvloop missing / unsupported -> plain asyncio, still works)
     pass
 
+import config
+
+_EARLY_SERVER = None
+
+
+def run_with_update():
+    """Install the newest yt-dlp BEFORE it is imported (so no hot-reload is ever needed). A tiny health server answers
+    Koyeb's health check while pip runs, and is handed over to the real handler later (start_health_server)."""
+    global _EARLY_SERVER
+    if not config.YTDLP_UPDATE_HOURS or os.getenv("YTDLP_UPDATE_ON_START", "true").lower() not in ("1", "true", "yes"):
+        return
+    import subprocess
+
+    class _Starting(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"starting")
+
+        def log_message(self, *a):
+            pass
+
+    try:
+        _EARLY_SERVER = ThreadingHTTPServer(("0.0.0.0", config.PORT), _Starting)
+        Thread(target=_EARLY_SERVER.serve_forever, daemon=True, name="early-health").start()
+        subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "-q", "--disable-pip-version-check",
+                        "yt-dlp[default,curl-cffi]"], timeout=150, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001  (offline / read-only: the version baked into the image is used)
+        pass
+
+
+run_with_update()
+
 import requests
 import yt_dlp
 from pyrogram import Client, filters, idle
@@ -170,6 +204,10 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
+    if _EARLY_SERVER is not None:                 # the early server already holds the port: just switch its handler
+        _EARLY_SERVER.RequestHandlerClass = HealthHandler
+        log.info("Health server listening on 0.0.0.0:%s", config.PORT)
+        return
     server = ThreadingHTTPServer(("0.0.0.0", config.PORT), HealthHandler)
     Thread(target=server.serve_forever, daemon=True, name="health-server").start()
     log.info("Health server listening on 0.0.0.0:%s", config.PORT)
@@ -197,16 +235,32 @@ def log_bg(text):
     bg(send_log(text))
 
 
+BOT_API_BASE = "https://api.telegram.org"
+
+
 def _bot_api_sync(method, data, token=None):
-    url = f"https://api.telegram.org/bot{token or config.BOT_TOKEN}/{method}"
+    """Plain urllib (NOT requests): yt-dlp patches urllib3 globally and a bad patch must never break the log channel."""
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    url = f"{BOT_API_BASE}/bot{token or config.BOT_TOKEN}/{method}"
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), method="POST")
     try:
-        r = requests.post(url, data=data, timeout=60)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:               # Telegram answers 4xx/429 with a JSON body we need (retry_after ...)
+        body = exc.read()
         try:
-            return r.json()
+            return json.loads(body)
         except ValueError:
-            return {"ok": False, "description": f"HTTP {r.status_code}"}
-    except Exception as exc:  # noqa: BLE001  (never print exc: its text contains the token URL)
+            return {"ok": False, "error_code": exc.code, "description": f"HTTP {exc.code}"}
+    except Exception as exc:  # noqa: BLE001  (never print exc: its text can contain the token URL)
         return {"ok": False, "description": f"network error: {type(exc).__name__}"}
+    try:
+        return json.loads(body)
+    except ValueError:
+        return {"ok": False, "description": "invalid response"}
 
 
 async def bot_api(method, _token=None, **data):
@@ -359,6 +413,7 @@ class Job:
         self.file_name = ""
         self.size_bytes = 0
         self.delivered = []                   # [(slot, file_id)] -> URL cache
+        self.silent = False                   # the source itself has no audio track
 
     @property
     def est_size(self):
@@ -453,7 +508,7 @@ async def batch_update(batch):
 
 # --------------------------------------------------------------------------- URL -> file_id cache
 def cache_eligible(job):
-    return config.CACHE_ENABLED and not job.custom_name and not job.settings.get("has_thumb")
+    return config.CACHE_ENABLED and not job.custom_name and not job.settings.get("has_thumb") and not job.silent
 
 
 def cache_key(job):
@@ -1007,6 +1062,7 @@ async def run_job(job):
         result = await fut
         job.title = result["title"] or job.title
         apply_custom_name(job, result)
+        job.silent = bool(result.get("silent"))
         job.title = result["title"] or job.title
         size = Path(result["path"]).stat().st_size
         job.size_bytes = size
@@ -1035,6 +1091,9 @@ async def run_job(job):
         elapsed = time.monotonic() - started
         final_text = (f"✅ <b>Completed</b>  •  #{job.id}\n\n🎬 {esc(job.title[:130])}\n📦 {size_text(size)}"
                       + (f"\n📚 {len(items)} parts (Telegram 2GB limit)" if len(items) > 1 else "")
+                      + (f"\n🔇 <b>No audio in the source:</b> the site delivered this video without sound "
+                         f"(Instagram/Facebook do this when not logged in, or the music was removed). The admin can add login cookies."
+                         if job.silent else "")
                       + f"\n🕒 Total time: {time_text(elapsed)}")
         log_bg(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
     except dl.Cancelled:
@@ -1789,53 +1848,64 @@ async def clearlinks_cmd(_, message):
                              "Nothing else in the database was touched.")
 
 
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])       # "2026.08.19" == "2026.8.19"
+
+
+def _latest_ytdlp_version():
+    """Newest yt-dlp on PyPI (urllib, not requests: keeps this independent of yt-dlp's own networking patches)."""
+    import json
+    import urllib.request
+    with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=20) as r:
+        return json.loads(r.read())["info"]["version"]
+
+
 async def update_ytdlp():
-    """pip-upgrade yt-dlp and load the new version into the running process (no restart needed)."""
-    import importlib
-    global yt_dlp
-    old = yt_dlp.version.__version__
+    """pip-install the newest yt-dlp. It is NOT hot-reloaded: re-importing yt-dlp in a running process patches urllib3 a
+    second time and breaks every later HTTP request of the bot. The new version is used after the next restart
+    (the container also updates yt-dlp by itself on every start)."""
+    from importlib import metadata
+    running = yt_dlp.version.__version__
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "yt-dlp[default,curl-cffi]",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     out, _ = await proc.communicate()
     tail = out.decode(errors="ignore")[-400:]
-    if proc.returncode != 0:
-        return False, old, old, tail
-    new = old
     try:
-        importlib.invalidate_caches()
-        for name in [m for m in sys.modules if m == "yt_dlp" or m.startswith("yt_dlp.")]:
-            sys.modules.pop(name, None)
-        fresh = importlib.import_module("yt_dlp")
-        yt_dlp = fresh
-        dl.yt_dlp = fresh
-        new = fresh.version.__version__
-    except Exception as exc:  # noqa: BLE001
-        log.error("yt-dlp reload failed: %s", exc)
-        return False, old, old, f"installed but could not be loaded: {exc}"
-    return True, old, new, tail
+        installed = metadata.version("yt-dlp")
+    except Exception:  # noqa: BLE001
+        installed = running
+    return proc.returncode == 0, running, installed, tail
+
+
+async def graceful_restart(reason=""):
+    """Exit so Docker/Koyeb starts a fresh instance. The queue is saved in the database and resumes automatically."""
+    log.info("Graceful restart: %s", reason)
+    state["shutting_down"] = True
+    store.flush_stats()
+    await db.flush()
+    await asyncio.sleep(1)
+    os._exit(0)
 
 
 @app.on_message(PRIVATE & filters.command("update"))
 @admin_only
 async def update_handler(_, message):
     note = await message.reply_text("⏳ Updating yt-dlp...")
-    ok, old, new, tail = await update_ytdlp()
-    if ok:
-        await edit_final(note, f"✅ yt-dlp {esc(old)} → <b>{esc(new)}</b> (loaded, no restart needed)")
+    ok, running, installed, tail = await update_ytdlp()
+    if not ok:
+        return await edit_final(note, f"❌ Update failed:\n<code>{esc(tail)}</code>")
+    if _vtuple(installed) > _vtuple(running):
+        await edit_final(note, f"✅ yt-dlp {esc(running)} → <b>{esc(installed)}</b> installed.\nUse /restart to start using it.")
     else:
-        await edit_final(note, f"❌ Update failed:\n<code>{esc(tail)}</code>")
+        await edit_final(note, f"✅ yt-dlp is already the newest version (<b>{esc(running)}</b>).")
 
 
 @app.on_message(PRIVATE & filters.command("restart"))
 @admin_only
 async def restart_handler(_, message):
     await message.reply_text("♻️ Restarting (Docker/Koyeb will start it again). Your queue is saved and resumes automatically...")
-    state["shutting_down"] = True
-    store.flush_stats()
-    await db.flush()
-    await asyncio.sleep(1)
-    os._exit(0)
+    await graceful_restart("admin /restart")
 
 
 # ------------------------------------------------------------------- links
@@ -2146,25 +2216,32 @@ async def reminder_loop():
 
 
 async def ytdlp_update_loop():
-    """Keep yt-dlp fresh (sites change weekly). Runs when the bot is idle, ~90 s after start and then every N hours."""
+    """Sites change weekly. Every YTDLP_UPDATE_HOURS check PyPI; when a newer yt-dlp exists and the bot is idle, restart:
+    the container installs the newest yt-dlp at start (see run_with_update in bot.py), and the queue survives the restart.
+    One restart per new version at most (guards against a restart loop when the install keeps failing)."""
     if not config.YTDLP_UPDATE_HOURS:
         return
-    await asyncio.sleep(90)
+    await asyncio.sleep(300)
     while True:
-        waited = 0
-        while (running_jobs or waiting) and waited < 7200:
-            await asyncio.sleep(30)
-            waited += 30
-        if not running_jobs:
-            try:
-                ok, old, new, tail = await update_ytdlp()
-                if ok and new != old:
-                    log.info("yt-dlp auto-updated %s -> %s", old, new)
-                    log_bg(f"🔄 yt-dlp auto-updated {old} → {new}")
-                elif not ok:
-                    log.warning("yt-dlp auto-update failed: %s", tail[-200:])
-            except Exception:  # noqa: BLE001
-                log.exception("yt-dlp update loop")
+        try:
+            latest = await asyncio.get_running_loop().run_in_executor(POOL, _latest_ytdlp_version)
+            running = yt_dlp.version.__version__
+            if _vtuple(latest) > _vtuple(running):
+                marker = await db.get("kv", "ytdlp_restart") or {}
+                if marker.get("target") == latest and time.time() - marker.get("ts", 0) < 86400:
+                    log.warning("yt-dlp %s is available but a restart for it already happened - not restarting again", latest)
+                else:
+                    waited = 0
+                    while (running_jobs or waiting) and waited < 7200:
+                        await asyncio.sleep(30)
+                        waited += 30
+                    if not running_jobs:
+                        await db.put_wait("kv", "ytdlp_restart", {"target": latest, "ts": time.time()})
+                        log_bg(f"🔄 yt-dlp {running} → {latest}: restarting to update (queue is saved).")
+                        await asyncio.sleep(3)
+                        await graceful_restart(f"yt-dlp {running} -> {latest}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("yt-dlp update check failed: %s", type(exc).__name__)
         await asyncio.sleep(config.YTDLP_UPDATE_HOURS * 3600)
 
 
