@@ -44,9 +44,11 @@ _original = pyrogram.Client.save_file
 
 # Session.invoke(sleep_threshold=...) exists in current Pyrogram 2.0.x; stay safe if a fork dropped it.
 try:
-    _INVOKE_HAS_THRESHOLD = "sleep_threshold" in inspect.signature(Session.invoke).parameters
+    _params = inspect.signature(Session.invoke).parameters
+    _INVOKE_HAS_THRESHOLD = "sleep_threshold" in _params
+    _INVOKE_HAS_RETRIES = "retries" in _params
 except (TypeError, ValueError):
-    _INVOKE_HAS_THRESHOLD = False
+    _INVOKE_HAS_THRESHOLD = _INVOKE_HAS_RETRIES = False
 
 
 SLOW_PART_SECONDS = 8.0
@@ -235,9 +237,39 @@ def connections_for(file_size, active=None):
 async def _invoke(session, rpc):
     # sleep_threshold=0: Pyrogram does NOT sleep inside each of the 6-32 parallel requests (each one logging
     # 'Waiting for 3 seconds'); the FloodWait comes up to worker() which pauses ALL workers together and counts it as congestion.
+    # retries=3 (Pyrogram default 10): on a dead connection Pyrogram retried the SAME closed transport 10 x 4 times
+    # (~65 s) before failing. Now it fails fast and worker() revives the connection.
+    kw = {}
     if _INVOKE_HAS_THRESHOLD:
-        return await session.invoke(rpc, sleep_threshold=0)
-    return await session.invoke(rpc)
+        kw["sleep_threshold"] = 0
+    if _INVOKE_HAS_RETRIES:
+        kw["retries"] = 3
+    return await session.invoke(rpc, **kw)
+
+
+def _dead_transport(exc):
+    text = str(exc).lower()
+    return isinstance(exc, ConnectionError) or "handler is closed" in text or "connection lost" in text \
+        or "closed=true" in text
+
+
+async def _revive(session, gen0):
+    """Restart ONE dead upload connection (shared by the 4 workers that use it: only the first one restarts it)."""
+    lock = session.__dict__.setdefault("_uub_lock", asyncio.Lock())
+    async with lock:
+        if session.__dict__.get("_uub_gen", 0) != gen0:
+            return                                    # another worker already revived it
+        try:
+            restart = getattr(session, "restart", None)
+            if restart:
+                await asyncio.wait_for(restart(), 30)
+            else:
+                await asyncio.wait_for(session.stop(), 15)
+                await asyncio.wait_for(session.start(), 30)
+            log.info("Upload connection was dead: restarted")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not restart upload connection: %s", exc)
+        session.__dict__["_uub_gen"] = gen0 + 1
 
 
 async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, progress_args=()):
@@ -292,6 +324,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                     await _sem().acquire()
                     state["peak"] = max(state["peak"], _active["n"])
                     t_part = time.monotonic()
+                    gen0 = session.__dict__.get("_uub_gen", 0)
                     try:
                         await _invoke(session, rpc)
                         state["done"] += size
@@ -311,7 +344,10 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                     except Exception as exc:  # noqa: BLE001
                         attempt += 1
                         state["errors"] += 1
-                        if attempt >= 4:
+                        dead = _dead_transport(exc)
+                        if dead:
+                            await _revive(session, gen0)
+                        if attempt >= (6 if dead else 4):
                             state["error"] = exc
                             log.error("Upload part failed after retries: %s", exc)
                             break

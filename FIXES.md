@@ -40,3 +40,13 @@ The 429 back-off, silent-video, FloodWait-pause and watchdog fixes are active in
   one clean upload, and ignores 'slow parts' measured while other uploads shared the line.
 * ffmpeg (remux) and aria2c run with `nice -n 10`, so they cannot starve the Telegram upload loop on a 0.1 vCPU host.
 * Every upload logs its real speed: `Uploaded 700 MB in 95s = 7.4 MB/s (8 conn x 4 workers, 2 upload(s) at once ...)`.
+
+## v6.3 (from the 11:51 log)
+* **503 "Service Temporarily Unavailable"** (jobs #6, #7, #9 failed instantly): handled like 429 - back-off 20/40/80/160 s, fewer
+  connections each time, and a host that refused us is limited to ONE job at a time afterwards.
+* **Dead Telegram connection** (`TCPTransport closed ... handler is closed`): Pyrogram retried the same dead socket 10 x 4 times
+  (~65 s). Now it fails fast (3 retries) and the upload connection is RESTARTED, the upload continues where it was.
+* **Network error -> no more 'retry as document'**: after `send as video failed (OSError)` the bot re-uploaded the WHOLE file as a
+  plain document (no player, no thumbnail). Now it retries the same upload as video/audio (3x with a short pause).
+* **HLS downloads vs uploads**: while an upload runs, HLS/DASH downloads use at most `FRAGMENTS_WHILE_UPLOADING` (6, free profile 3)
+  fragments - the fragment threads were starving the Telegram loop (Edit timed out, watchdog warnings).

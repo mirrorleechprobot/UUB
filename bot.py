@@ -931,26 +931,48 @@ async def send_item(uc, chat_id, job, item, caption, cb):
     kind = item["kind"]
     size = Path(path).stat().st_size
 
+    async def send_once():
+        if kind == "video":
+            return await client.send_video(chat_id, path, caption=caption, duration=item["duration"],
+                                           width=item["width"], height=item["height"], thumb=thumb,
+                                           supports_streaming=True, progress=cb)
+        if kind == "audio":
+            return await client.send_audio(chat_id, path, caption=caption, duration=item["duration"],
+                                           performer=item["artist"] or None,
+                                           title=item["title"] or job.title[:60], progress=cb)
+        if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
+            return await client.send_photo(chat_id, path, caption=caption, progress=cb)
+        return await client.send_document(chat_id, path, caption=caption, thumb=thumb, progress=cb)
+
+    def network_error(exc):
+        text = str(exc).lower()
+        return isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError)) or "handler is closed" in text \
+            or "connection lost" in text
+
     async def attempt():
-        try:
-            if kind == "video":
-                return await client.send_video(chat_id, path, caption=caption, duration=item["duration"],
-                                               width=item["width"], height=item["height"], thumb=thumb,
-                                               supports_streaming=True, progress=cb)
-            if kind == "audio":
-                return await client.send_audio(chat_id, path, caption=caption, duration=item["duration"],
-                                               performer=item["artist"] or None,
-                                               title=item["title"] or job.title[:60], progress=cb)
-            if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
-                return await client.send_photo(chat_id, path, caption=caption, progress=cb)
-            return await client.send_document(chat_id, path, caption=caption, thumb=thumb, progress=cb)
-        except FloodWait:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if job.cancel.is_set() or kind in ("document",):
+        net_tries = 0
+        while True:
+            try:
+                return await send_once()
+            except FloodWait:
                 raise
-            log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
-            return await client.send_document(chat_id, path, caption=caption, progress=cb)
+            except Exception as exc:  # noqa: BLE001
+                if job.cancel.is_set():
+                    raise
+                if network_error(exc):
+                    # The connection broke: upload the SAME thing again (still as video / audio). The old code switched to
+                    # 'document' here, which re-uploaded the whole file AND lost the video player / thumbnail.
+                    net_tries += 1
+                    if net_tries > 3:
+                        raise
+                    log.warning("send as %s: connection problem (%s), retry %d/3 in %ds", kind, type(exc).__name__,
+                                net_tries, 5 * net_tries)
+                    await sleep_cancellable(job, 5 * net_tries)
+                    continue
+                if kind in ("document",):
+                    raise
+                log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
+                return await client.send_document(chat_id, path, caption=caption, progress=cb)
 
     return await flood_retry(job, uc, attempt, "upload")
 
@@ -1350,6 +1372,7 @@ async def restore_queue():
 # =============================================================================== Telegram app
 
 fastupload.install()      # multi-connection uploads (stock Pyrogram is single-connection, ~5-6 MB/s)
+dl.upload_active = lambda: fastupload._active["n"] > 0     # downloads use fewer parallel fragments while an upload runs
 _kwargs = dict(name="url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
                workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=config.FLOOD_SLEEP_THRESHOLD)
 try:

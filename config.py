@@ -92,6 +92,9 @@ PER_HOST_CONCURRENCY = max(1, env_int("PER_HOST_CONCURRENCY", 2))
 RATE_LIMIT_RETRIES = max(0, min(8, env_int("RATE_LIMIT_RETRIES", 4)))
 RATE_LIMIT_BASE_WAIT = max(5, env_int("RATE_LIMIT_BASE_WAIT", 20))
 
+# HLS/DASH fragments in parallel while an upload is running (fragment threads compete with the Telegram loop for CPU).
+FRAGMENTS_WHILE_UPLOADING = max(1, env_int("FRAGMENTS_WHILE_UPLOADING", _p(6, 3)))
+
 # ---- shared upload budget (several users uploading at the same time) ----
 # Max 512 KB parts in flight over ALL running uploads together. One upload can use all of it, 4 uploads share it fairly
 # (and Telegram is not flooded with 4 x 32 requests). 0 = auto (UPLOAD_CONNECTIONS x UPLOAD_WORKERS_PER_CONNECTION).

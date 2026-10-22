@@ -54,7 +54,10 @@ HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is 
 _HOST_SEMS = {}
 _HOST_COOLDOWN = {}                 # host -> time.monotonic() until which we do not touch it
 _HOST_LOCK = threading.Lock()
-_RL_RE = re.compile(r"too many requests|rate.?limit|(?:http error|status[= ]|response code)\D{0,12}429", re.I)
+_HOST_STRICT = set()                # hosts that already refused us (429 / 503): only ONE job at a time from now on
+upload_active = lambda: False       # bot.py replaces this: True while an upload is running
+_RL_RE = re.compile(r"too many requests|rate.?limit|service (?:temporarily )?unavailable"
+                    r"|(?:http error|status[= ]|response code)\D{0,12}(?:429|503)|\b503 server error", re.I)
 
 
 def _host(url):
@@ -77,8 +80,9 @@ class _HostSlot:
     def __enter__(self):
         if not self.host:
             return self
+        limit = 1 if self.host in _HOST_STRICT else config.PER_HOST_CONCURRENCY
         with _HOST_LOCK:
-            self.sem = _HOST_SEMS.setdefault(self.host, threading.Semaphore(config.PER_HOST_CONCURRENCY))
+            self.sem = _HOST_SEMS.setdefault((self.host, limit), threading.Semaphore(limit))
         while not self.sem.acquire(timeout=1):
             if self.cancel.is_set():
                 self.sem = None
@@ -118,14 +122,27 @@ def _with_rate_limit_retry(url, cancel, progress, fn):
             if not is_rate_limited(exc):
                 raise
             if rl >= config.RATE_LIMIT_RETRIES:
-                raise RuntimeError("The server keeps answering 'Too Many Requests' (HTTP 429). "
+                raise RuntimeError("The download server keeps refusing us (HTTP 429 / 503: too many requests or overloaded). "
                                    "Please try again in a few minutes.") from exc
             wait = min(300, config.RATE_LIMIT_BASE_WAIT * (2 ** rl)) + random.uniform(0, 5)
             rl += 1
             if host:
                 _HOST_COOLDOWN[host] = max(_HOST_COOLDOWN.get(host, 0), time.monotonic() + wait)
+                _HOST_STRICT.add(host)
             log.warning("429 from %s: waiting %.0fs, retry %d/%d with fewer connections",
                         host or "server", wait, rl, config.RATE_LIMIT_RETRIES)
+
+
+def _fragments(rl=0, cap=None):
+    """Parallel HLS/DASH fragments: fewer after a 429/503 and while an upload runs (0.1 vCPU: fragment threads would
+    starve the Telegram loop -> edit timeouts, dead connections)."""
+    n = max(1, config.CONCURRENT_FRAGMENTS >> rl)
+    try:
+        if upload_active():
+            n = min(n, config.FRAGMENTS_WHILE_UPLOADING)
+    except Exception:  # noqa: BLE001
+        pass
+    return max(1, min(n, cap) if cap else n)
 
 
 def _clean_partials(workdir):
@@ -578,7 +595,7 @@ def _fetch_format(url, workdir, fmt, tag):
     opts = ytdlp_base_opts()
     opts.update({"outtmpl": str(workdir / f"%(id)s.{tag}.%(ext)s"), "format": fmt, "overwrites": True,
                  "file_access_retries": config.MAX_RETRIES,
-                 "concurrent_fragment_downloads": max(1, min(config.CONCURRENT_FRAGMENTS, 4))})
+                 "concurrent_fragment_downloads": _fragments(0, 4)})
     with yt_dlp.YoutubeDL(opts) as ydl:
         ainfo = ydl.extract_info(url, download=True)
     files = [Path(d["filepath"]) for d in (ainfo.get("requested_downloads") or []) if d.get("filepath")]
@@ -677,7 +694,7 @@ def download_media(url, option, workdir, progress, cancel, rl=0):
         opts.update({
             "outtmpl": str(workdir / "%(title).150B [%(id)s].%(ext)s"),
             "continuedl": True, "overwrites": False, "file_access_retries": config.MAX_RETRIES,
-            "concurrent_fragment_downloads": max(1, config.CONCURRENT_FRAGMENTS >> rl),
+            "concurrent_fragment_downloads": _fragments(rl),
             "progress_hooks": [hook], "http_chunk_size": 10 * 1024 * 1024,
             "ignoreerrors": False,
         })
