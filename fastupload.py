@@ -50,7 +50,7 @@ except (TypeError, ValueError):
 
 
 SLOW_PART_SECONDS = 8.0
-POOL_IDLE = 120.0
+POOL_IDLE = 60.0
 
 
 class Tuner:
@@ -95,9 +95,14 @@ class Tuner:
 tuner = Tuner()
 
 _pool = {}                       # id(client) -> [(Session, last_used_monotonic)]
+_live = set()                    # EVERY session started here and not stopped yet
+_busy = set()                    # sessions an upload is using right now
 
 
 async def _stop_all(sessions):
+    for s in sessions:
+        _live.discard(s)
+        _busy.discard(s)
     await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
 
 
@@ -109,29 +114,43 @@ async def _healthy(session):
         return False
 
 
+def _pooled():
+    return {s for pool in _pool.values() for s, _ in pool}
+
+
 async def acquire_sessions(client, n, dc_id, auth_key, test_mode):
-    """n started media sessions: warm ones from the pool first (verified with a ping when idle for a while), then new ones."""
-    got, now = [], time.monotonic()
-    if config.SESSION_REUSE:
-        pool = _pool.get(id(client), [])
-        stale = []
-        while pool and len(got) < n:
-            sess, last = pool.pop()
-            if now - last > POOL_IDLE:
-                stale.append(sess)
-            elif now - last > 15 and not await _healthy(sess):
-                stale.append(sess)
-            else:
-                got.append(sess)
-        if stale:
-            await _stop_all(stale)
-    fresh = [Session(client, dc_id, auth_key, test_mode, is_media=True) for _ in range(n - len(got))]
+    """n started media sessions: warm ones from the pool first (verified with a ping when idle for a while), then new ones.
+    Cancellation-safe: whatever was taken out of the pool is either returned to the caller or stopped - never leaked
+    (a leaked session keeps pinging a dead connection forever: 'Send exception ... the handler is closed')."""
+    held, fresh = [], []                  # held = sessions taken out of the pool, fresh = sessions we create
     try:
+        got = []
+        if config.SESSION_REUSE:
+            pool = _pool.get(id(client), [])
+            now = time.monotonic()
+            candidates, stale = [], []
+            while pool and len(candidates) < n:
+                sess, last = pool.pop()
+                held.append(sess)
+                _busy.add(sess)                                    # owned by us from this moment: never an orphan
+                (stale if now - last > POOL_IDLE else candidates).append((sess, last))
+            check = [s for s, last in candidates if now - last > 15]
+            results = await asyncio.gather(*(_healthy(s) for s in check)) if check else []
+            dead = {s for s, ok in zip(check, results) if not ok}
+            got = [s for s, _ in candidates if s not in dead]
+            to_stop = [s for s, _ in stale] + list(dead)
+            if to_stop:
+                await _stop_all(to_stop)
+        fresh = [Session(client, dc_id, auth_key, test_mode, is_media=True) for _ in range(n - len(got))]
         await asyncio.gather(*(x.start() for x in fresh))
+        for x in fresh:
+            _live.add(x)
+            _busy.add(x)
+        return got + fresh
     except BaseException:
-        await _stop_all(fresh + got)
+        # also on cancellation: close everything we hold (fire-and-forget: a second cancel must not interrupt it)
+        asyncio.ensure_future(_stop_all(list({*held, *fresh})))
         raise
-    return got + fresh
 
 
 async def release_sessions(client, sessions, reuse):
@@ -140,6 +159,8 @@ async def release_sessions(client, sessions, reuse):
         return
     pool = _pool.setdefault(id(client), [])
     now = time.monotonic()
+    for s in sessions:
+        _busy.discard(s)
     pool.extend((s, now) for s in sessions)
     extra = pool[16:]                                   # keep at most 16 warm connections per client
     del pool[16:]
@@ -157,8 +178,22 @@ async def _reap(client):
         await _stop_all(old)
 
 
+async def reap_orphans():
+    """Watchdog (called every minute by bot.py): a session that is neither in use nor in the pool is a leak -> stop it.
+    Returns how many were stopped."""
+    orphans = [s for s in list(_live) if s not in _busy and s not in _pooled()]
+    if orphans:
+        log.warning("Stopping %d leaked upload session(s)", len(orphans))
+        await _stop_all(orphans)
+    return len(orphans)
+
+
+def session_stats():
+    return {"live": len(_live), "busy": len(_busy), "pooled": len(_pooled())}
+
+
 async def close_pool():
-    allsess = [s for pool in _pool.values() for s, _ in pool]
+    allsess = list(_live) + [s for s in _pooled() if s not in _live]
     _pool.clear()
     await _stop_all(allsess)
 

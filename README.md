@@ -92,6 +92,7 @@ Setup: Atlas me free cluster → *Database Access* me user banao → *Network Ac
 ## Redeem codes (sirf admin giveaway kar sakta hai)
 - **Admin:** `/gencode 30d` • `/gencode 7d 20` (20 codes) • `/gencode 1mo 1 uses=50` (ek code, 50 users) • `/gencode 1y 5 valid=7d` (7 din me redeem karna zaruri). Duration: `30m` minutes, `12h` ghante, `7d` din, `1mo` mahine (30 din), `1y` saal (365 din), combine: `1y6mo`.
 - `/codes` (list + recent redeem), `/delcode CODE`, `/delcode used` (used/expired hatao). Sirf `codes` collection badalti hai.
+- **Ek `/gencode` = ek batch: ek user us batch ka sirf 1 code le sakta hai** (dusra code kharch nahi hota). Naya `/gencode` = naya batch.
 - **User:** `/redeem UUB-XXXX-XXXX-XXXX` — premium na ho tab bhi chalta hai. Active plan ho to usme **jud jata hai**. Lifetime user ka code kharch nahi hota. 5 galat code par 10 min ka lock; ek code ka aakhri use do log ek saath nahi le sakte.
 
 ## Uptime / keep-alive

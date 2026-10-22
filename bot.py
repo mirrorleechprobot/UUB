@@ -1413,7 +1413,7 @@ async def start_handler(_, message):
             "• <code>link | new name.mp4</code> → rename the file\n\n"
             "Your links run <b>one by one</b> (the next file downloads while the previous one uploads). "
             f"Up to {config.MAX_WAITING_PER_USER} can wait in line. Same link again = instant resend ⚡\n\n"
-            "📋 /queue  /clear  /top  /move  /cancel\n⚙️ /settings  /connect  /caption  /setthumb  /delthumb\n"
+            "📋 /queue  /clear  /top  /move  /cancel\n⚙️ /settings  /caption  /setthumb  /delthumb\n"
             "📊 /mystats  /myplan  /id")
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
@@ -1924,6 +1924,11 @@ _redeem_lock = asyncio.Lock()
 _redeem_fails = {}                  # uid -> [timestamps of wrong codes]
 
 
+def _code_batch(d):
+    """All codes made by one /gencode share a batch id. Older codes (no id) are grouped by their creation time."""
+    return d.get("batch") or f"t{int(d.get('created', 0))}"
+
+
 def _code_state(d, now=None):
     now = now or time.time()
     if d.get("valid_until") and d["valid_until"] < now:
@@ -1963,15 +1968,18 @@ async def gencode_cmd(_, message):
             return await message.reply_text(f"❌ I did not understand <code>{esc(a)}</code>. Send /gencode for help.")
     if not 1 <= count <= 100 or not 1 <= uses <= 10000:
         return await message.reply_text("❌ count must be 1-100 and uses 1-10000.")
-    now, made = time.time(), []
+    now, made, batch = time.time(), [], secrets.token_hex(3)
     for _ in range(count):
         code = codes.new_code()
         await db.put_wait("codes", code, {"seconds": seconds, "created": now, "by": message.from_user.id, "max_uses": uses,
-                                          "uses_left": uses, "redeemed_by": [], "valid_until": now + valid if valid else None})
+                                          "uses_left": uses, "redeemed_by": [], "valid_until": now + valid if valid else None,
+                                          "batch": batch})
         made.append(code)
     head = (f"🎟 <b>{count} code(s)</b> • each gives <b>{codes.format_duration(seconds)}</b> of Premium"
             + (f" • {uses} uses each" if uses > 1 else "") + (f" • redeem within {codes.format_duration(valid)}" if valid else "") + "\n\n")
-    foot = "\n\n🎁 Users send: <code>/redeem CODE</code>"
+    foot = ("\n\n🎁 Users send: <code>/redeem CODE</code>"
+            + (f"\n🔒 <b>One code per person</b> from this set (batch <code>{batch}</code>): a user cannot claim a second code of it."
+               if count > 1 else ""))
     chunk = head
     for code in made:
         line = f"<code>{code}</code>\n"
@@ -2060,6 +2068,11 @@ async def redeem_cmd(_, message):
             return await message.reply_text("⌛ This code has expired.")
         if status == "used":
             return await message.reply_text("❌ This code has already been used.")
+        mine = _code_batch(doc)
+        for other in await db.all("codes"):
+            if other["_id"] != code and _code_batch(other) == mine and any(r.get("uid") == uid for r in other.get("redeemed_by", [])):
+                return await message.reply_text("🎁 You already claimed a code from this giveaway.\n"
+                                                "<b>Only one code per person</b> – this code was NOT used, so someone else can still claim it.")
         expires = store.grant_premium(uid, doc["seconds"], by=f"code:{code}")
         doc["uses_left"] = doc.get("uses_left", 1) - 1
         doc.setdefault("redeemed_by", []).append({"uid": uid, "ts": now})
@@ -2298,6 +2311,7 @@ def stats_text():
         "",
         f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now)} uploading",
         f"🤖 Uploaders: " + " • ".join(f"{'main' if u.is_main else u.name}:{'🟢' if u.usable else '🔴'}{u.active}" for u in uploaders),
+        "🔌 Upload sessions: {live} live • {busy} in use • {pooled} warm".format(**fastupload.session_stats()),
         f"🚀 Upload connections: {fastupload.tuner.limit}/{config.UPLOAD_CONNECTIONS} (auto-tune {'on' if config.AUTOTUNE else 'off'}, "
         f"last {fastupload.tuner.last_speed / 1048576:.1f} MB/s)",
         "",
@@ -2841,10 +2855,31 @@ async def ytdlp_update_loop():
         await asyncio.sleep(config.YTDLP_UPDATE_HOURS * 3600)
 
 
+async def telegram_watchdog_loop():
+    """If the MAIN Telegram connection silently dies (Pyrogram swallows send errors on a closed transport) the bot would
+    stay 'online' but deaf. Every 2 min: a cheap get_me(); 3 failures in a row -> alert + graceful restart (queue is saved)."""
+    fails = 0
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await asyncio.wait_for(app.get_me(), 25)
+            fails = 0
+        except Exception as exc:  # noqa: BLE001
+            fails += 1
+            log.warning("Telegram watchdog: get_me failed (%s) %d/3", type(exc).__name__, fails)
+            if fails >= 3:
+                await bot_api("sendMessage", chat_id=str(config.ADMIN_ID), parse_mode="HTML",
+                              text="🚨 <b>Telegram connection lost</b> – the bot restarts itself now (queue is saved).")
+                await graceful_restart("telegram watchdog", wipe=False)
+                return
+        await asyncio.sleep(120)
+
+
 async def health_loop():
     while True:
         await asyncio.sleep(60)
         try:
+            await fastupload.reap_orphans()
             store.flush_stats()
             clean_pending()
             tick = state.get("health_tick", 0) + 1
@@ -2918,7 +2953,7 @@ async def main():
     state["ready"] = True
     log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s | db=%s", me.username, yt_dlp.version.__version__,
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG, db.label)
-    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop())]
+    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop(), telegram_watchdog_loop())]
     await restore_queue()
     if config.MONGO_URI and not db.mongo:
         bg(alert_admin("db", f"🗄 <b>MongoDB connection failed at startup.</b> Using local files (data is lost on redeploy).\n"
