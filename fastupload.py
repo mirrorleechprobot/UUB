@@ -64,8 +64,10 @@ class Tuner:
         self.changes = 0
         self.on_change = None          # callback(limit) - bot.py persists it
 
-    def record(self, file_size, parts, slow, errors, seconds):
+    def record(self, file_size, parts, slow, errors, seconds, shared=False):
         if not config.AUTOTUNE or not config.UPLOAD_ADAPTIVE or file_size < 50 * 1024 * 1024 or parts <= 0:
+            return
+        if shared and not errors:             # other uploads used the same line: slow parts say nothing about congestion
             return
         self.last_speed = file_size / max(seconds, 0.001)
         old = self.limit
@@ -74,8 +76,8 @@ class Tuner:
             self.clean_streak = 0
         else:
             self.clean_streak += 1
-            if self.clean_streak >= 2 and self.limit < config.UPLOAD_CONNECTIONS:
-                self.limit += 1
+            if self.limit < config.UPLOAD_CONNECTIONS:          # one clean upload is enough to climb back (+2)
+                self.limit = min(config.UPLOAD_CONNECTIONS, self.limit + 2)
                 self.clean_streak = 0
         if self.limit != old:
             self.changes += 1
@@ -93,6 +95,18 @@ class Tuner:
 
 
 tuner = Tuner()
+
+_active = {"n": 0}                  # uploads running right now (all users)
+_inflight_sem = None
+
+
+def _sem():
+    """One budget of in-flight parts shared by every upload (created lazily inside the running loop)."""
+    global _inflight_sem
+    if _inflight_sem is None:
+        total = config.UPLOAD_TOTAL_INFLIGHT or config.UPLOAD_CONNECTIONS * config.UPLOAD_WORKERS_PER_CONNECTION
+        _inflight_sem = asyncio.Semaphore(max(2, total))
+    return _inflight_sem
 
 _pool = {}                       # id(client) -> [(Session, last_used_monotonic)]
 _live = set()                    # EVERY session started here and not stopped yet
@@ -198,8 +212,8 @@ async def close_pool():
     await _stop_all(allsess)
 
 
-def connections_for(file_size):
-    """How many parallel connections are worth opening for this file."""
+def connections_for(file_size, active=None):
+    """How many parallel connections are worth opening for this file (shared fairly with the other running uploads)."""
     if file_size <= BIG_FILE:
         return 1
     if not config.UPLOAD_ADAPTIVE:
@@ -213,7 +227,9 @@ def connections_for(file_size):
         n = 6
     else:
         n = config.UPLOAD_CONNECTIONS
-    return max(1, min(n, tuner.limit if config.AUTOTUNE else config.UPLOAD_CONNECTIONS))
+    cap = tuner.limit if config.AUTOTUNE else config.UPLOAD_CONNECTIONS
+    n = min(n, max(2, -(-cap // max(1, active if active is not None else _active["n"]))))   # ceil(limit / uploads), >= 2
+    return max(1, min(n, cap))
 
 
 async def _invoke(session, rpc):
@@ -245,7 +261,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
 
         total_parts = int(math.ceil(file_size / PART_SIZE))
         is_big = file_size > BIG_FILE
-        n_sessions = connections_for(file_size)
+        n_sessions = connections_for(file_size, _active["n"] + 1)
         per_session = config.UPLOAD_WORKERS_PER_CONNECTION if is_big else 1
         md5_sum = md5() if not is_big else None
         new_id = self.rnd_id()
@@ -257,6 +273,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
         state["errors"] = 0
         state["floods"] = 0
         state["pause_until"] = 0.0
+        state["peak"] = _active["n"] + 1
         t_start = time.monotonic()
 
         async def worker(session):
@@ -272,6 +289,8 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                     pause = state["pause_until"] - time.monotonic()
                     if pause > 0:                 # a FloodWait is active: every worker waits, nobody hammers Telegram
                         await asyncio.sleep(pause)
+                    await _sem().acquire()
+                    state["peak"] = max(state["peak"], _active["n"])
                     t_part = time.monotonic()
                     try:
                         await _invoke(session, rpc)
@@ -297,6 +316,8 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                             log.error("Upload part failed after retries: %s", exc)
                             break
                         await asyncio.sleep(1 + attempt)
+                    finally:
+                        _sem().release()
 
         async def read_parts():
             """Yield 512 KB parts; the disk is read in 4 MB blocks inside a thread."""
@@ -318,6 +339,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
 
         workers = []
         ok = False
+        _active["n"] += 1                    # counted from here to the finally below (no await in between: no leak)
         try:
             sessions = await acquire_sessions(self, n_sessions, dc_id, auth_key, test_mode)
             workers = [loop.create_task(worker(s)) for s in sessions for _ in range(per_session)]
@@ -349,7 +371,14 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
             if state["error"]:
                 raise state["error"]
             await report()
-            tuner.record(file_size, total_parts, state["slow"], state["errors"] + state["floods"], time.monotonic() - t_start)
+            took = time.monotonic() - t_start
+            tuner.record(file_size, total_parts, state["slow"], state["errors"] + state["floods"], took,
+                         shared=state["peak"] > 1)
+            if file_size >= 20 * 1024 * 1024:
+                log.info("Uploaded %.0f MB in %.0fs = %.1f MB/s (%d conn x %d workers, %d upload(s) at once, "
+                         "slow parts %d/%d, floods %d, errors %d)", file_size / 1048576, took,
+                         file_size / max(took, 0.001) / 1048576, n_sessions, per_session, state["peak"],
+                         state["slow"], total_parts, state["floods"], state["errors"])
             ok = True
             if is_big:
                 return raw.types.InputFileBig(id=new_id, parts=total_parts, name=file_name)
@@ -358,6 +387,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
         except StopTransmission:
             raise
         finally:
+            _active["n"] = max(0, _active["n"] - 1)
             for w in workers:
                 w.cancel()
             # warm sessions are reused only after a clean upload; after an error / cancel they are closed

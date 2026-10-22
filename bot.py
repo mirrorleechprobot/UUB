@@ -2994,7 +2994,7 @@ async def main():
 
     await db.start()                       # MongoDB (or local JSON fallback)
     await store.init()
-    fastupload.tuner.restore(((await db.get("kv", "tuner")) or {}).get("limit"))
+    # (not restored from the DB any more: a low value saved during a bad hour kept uploads slow after every restart)
     fastupload.tuner.on_change = lambda limit: db.put("kv", "tuner", {"limit": limit})
     for leftover in DOWNLOAD_DIR.iterdir():          # files of jobs that were running when the previous instance died
         shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)

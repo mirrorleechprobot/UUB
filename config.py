@@ -92,6 +92,11 @@ PER_HOST_CONCURRENCY = max(1, env_int("PER_HOST_CONCURRENCY", 2))
 RATE_LIMIT_RETRIES = max(0, min(8, env_int("RATE_LIMIT_RETRIES", 4)))
 RATE_LIMIT_BASE_WAIT = max(5, env_int("RATE_LIMIT_BASE_WAIT", 20))
 
+# ---- shared upload budget (several users uploading at the same time) ----
+# Max 512 KB parts in flight over ALL running uploads together. One upload can use all of it, 4 uploads share it fairly
+# (and Telegram is not flooded with 4 x 32 requests). 0 = auto (UPLOAD_CONNECTIONS x UPLOAD_WORKERS_PER_CONNECTION).
+UPLOAD_TOTAL_INFLIGHT = max(0, env_int("UPLOAD_TOTAL_INFLIGHT", 0))
+
 # ---- Telegram watchdog (restarts the bot when the connection is really dead) ----
 # A tiny host (Koyeb free: 0.1 vCPU) gets slow while uploading, so a single slow get_me() must not trigger a restart.
 WATCHDOG_TIMEOUT = max(15, env_int("WATCHDOG_TIMEOUT", 60))

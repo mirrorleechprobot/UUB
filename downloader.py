@@ -45,6 +45,7 @@ OTHER_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".pdf", ".txt"
 DIRECT_EXT = VIDEO_EXT | AUDIO_EXT | IMAGE_EXT | OTHER_EXT
 TEMP_SUFFIXES = (".part", ".ytdl", ".aria2", ".temp", ".tmp")
 
+NICE = ["nice", "-n", "10"] if shutil.which("nice") else []      # ffmpeg / aria2c must not starve the upload loop
 HAVE_ARIA2 = shutil.which("aria2c") is not None
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
@@ -370,7 +371,7 @@ _ARIA_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)\
 
 def _aria2(url, target, progress, cancel, expected_size, connections=None):
     n = connections or config.ARIA2_CONNECTIONS
-    cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
+    cmd = [*NICE, "aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", "--enable-http-keep-alive=true", "--http-accept-gzip=false",
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true", "-c",
            "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
@@ -850,7 +851,7 @@ def _remux_mp4(path):
         # Opus / Vorbis inside MP4 plays SILENT in Telegram's players -> convert such audio to AAC (video stays untouched).
         acodec = ffprobe(path).get("acodec", "")
         audio = ["-c:a", "copy"] if (not acodec or acodec in TG_AUDIO_OK) else ["-c:a", "aac", "-b:a", "192k"]
-        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
+        r = _run([*NICE, "ffmpeg", "-y", "-threads", "1", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
                   "-sn", "-dn", *fast, str(tmp)])
     except Exception:  # noqa: BLE001
         tmp.unlink(missing_ok=True)

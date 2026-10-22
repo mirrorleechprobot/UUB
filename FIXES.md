@@ -31,3 +31,12 @@ be limited by latency (~2-4 MB/s). A Singapore VPS / paid Koyeb instance is the 
 * `PROFILE=turbo` (default): original maximum-speed settings (8 conn x 4 workers, 6 uploads, aria2c x16, pipeline on).
 * `PROFILE=free`: gentle settings (3 x 2, 2 uploads, aria2c x4, pipeline off) if you see Edit timeouts / FloodWait again.
 The 429 back-off, silent-video, FloodWait-pause and watchdog fixes are active in BOTH profiles.
+
+## v6.2: several users at once
+* One shared budget of in-flight parts for ALL uploads (`UPLOAD_TOTAL_INFLIGHT`, auto = 8 x 4): 1 user can use everything,
+  3-4 users share it fairly instead of each opening 8 x 4 requests (which caused FloodWait / timeouts).
+* Connections per upload are divided by the number of running uploads (a handshake per connection costs CPU on a tiny host).
+* Auto-tune starts at the maximum on every start (the saved low value made speed crawl up 5 -> 6 -> ...), climbs +2 after
+  one clean upload, and ignores 'slow parts' measured while other uploads shared the line.
+* ffmpeg (remux) and aria2c run with `nice -n 10`, so they cannot starve the Telegram upload loop on a 0.1 vCPU host.
+* Every upload logs its real speed: `Uploaded 700 MB in 95s = 7.4 MB/s (8 conn x 4 workers, 2 upload(s) at once ...)`.
