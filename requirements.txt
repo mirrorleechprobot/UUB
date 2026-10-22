@@ -1,6 +1,9 @@
 Pyrogram==2.0.106
 TgCrypto
 uvloop; sys_platform != "win32"
+motor>=3.3
+dnspython>=2.4
+psutil>=5.9
 yt-dlp[default,curl-cffi]
 requests>=2.31.0
 deno
