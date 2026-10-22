@@ -26,6 +26,75 @@ except Exception:  # noqa: BLE001  (uvloop missing / unsupported -> plain asynci
 
 import config
 
+# A stale / half-copied config.py crashes later with a confusing AttributeError. Say it clearly instead.
+_REQUIRED_CONFIG = (
+    "ADMIN_ID",
+    "ALERTS",
+    "API_HASH",
+    "API_ID",
+    "ARIA2_CONNECTIONS",
+    "ARIA2_DISK_CACHE_MB",
+    "AUTOTUNE",
+    "BOT_TOKEN",
+    "CACHE_ENABLED",
+    "CACHE_TTL_DAYS",
+    "CONCURRENT_FRAGMENTS",
+    "COOKIES_TEXT",
+    "COOKIE_FILE",
+    "DAILY_LIMIT_FILES",
+    "DAILY_LIMIT_GB",
+    "DATA_DIR",
+    "DIRECT_REFERER",
+    "DIRECT_USER_AGENT",
+    "DISK_CLEAN_PERCENT",
+    "DISK_MIN_FREE_MB",
+    "DOWNLOAD_DIR",
+    "EDIT_TIMEOUT",
+    "EXTRA_ADMIN_IDS",
+    "FLOOD_MAX_WAIT",
+    "FLOOD_SLEEP_THRESHOLD",
+    "HELPER_BOT_TOKENS",
+    "KEEPALIVE_MINUTES",
+    "KEEPALIVE_URL",
+    "LOG_CHANNEL_ID",
+    "MAX_CONCURRENT_JOBS",
+    "MAX_CONCURRENT_TRANSMISSIONS",
+    "MAX_RETRIES",
+    "MAX_RUNNING_PER_USER",
+    "MAX_URLS_PER_MESSAGE",
+    "MAX_WAITING_PER_USER",
+    "MONGO_DB",
+    "MONGO_URI",
+    "PERSIST_SESSION",
+    "PER_HOST_CONCURRENCY",
+    "PIPELINE",
+    "PLAYLIST_LIMIT",
+    "PORT",
+    "PREMIUM_REMIND_DAYS",
+    "PROBE_CONCURRENCY",
+    "PROGRESS_UPDATE_INTERVAL",
+    "QUEUE_RESTORE_MAX_AGE_H",
+    "RATE_LIMIT_BASE_WAIT",
+    "RATE_LIMIT_RETRIES",
+    "SESSION_REUSE",
+    "SPLIT_SIZE_MB",
+    "SSRF_PROTECTION",
+    "TORRENT_ENABLED",
+    "TORRENT_MAX_GB",
+    "TORRENT_NO_PEER_TIMEOUT",
+    "UPLOAD_ADAPTIVE",
+    "UPLOAD_CONNECTIONS",
+    "UPLOAD_WORKERS_PER_CONNECTION",
+    "WATCHDOG_MAX_FAILS",
+    "WATCHDOG_TIMEOUT",
+    "YTDLP_UPDATE_HOURS",
+)
+_missing_cfg = [n for n in _REQUIRED_CONFIG if not hasattr(config, n)]
+if _missing_cfg:
+    sys.exit("config.py is outdated or incomplete (missing: " + ", ".join(_missing_cfg[:12])
+             + (" ..." if len(_missing_cfg) > 12 else "") + "). Replace config.py with the one from UUB-fixed.zip "
+             "(all files of the zip must be deployed together).")
+
 _EARLY_SERVER = None
 
 
