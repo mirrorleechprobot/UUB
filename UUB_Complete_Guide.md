@@ -389,6 +389,7 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | `/addpremium <id> [days]` (`/addprem`) | Premium do (days nahi = lifetime). Reply bhi chalta hai |
 | `/removepremium <id>` | Premium hatao |
 | `/premiumlist` | Premium users |
+| `/broadcast [all\|premium\|free] [-s]` | Message sabko bhejo (kisi message par reply karke, ya text likh kar). Pehle preview + Send button |
 | `/setquota <id> <gb> [files]` | Per-user daily quota (0 = unlimited) |
 | `/gencode`, `/codes`, `/delcode` | Redeem codes |
 | `/userstats <id>`, `/topusers` | Usage |

@@ -172,9 +172,42 @@ def _user(uid):
 def touch_user(uid, name=""):
     u = _user(uid)
     u["last_seen"] = time.time()
+    changed = False
     if name and u.get("name") != name:
         u["name"] = name
+        changed = True
+    if u.get("blocked"):                        # they wrote to the bot again -> broadcasts can reach them
+        u["blocked"] = False
+        changed = True
+    if changed:
         db.put("users", uid, u)
+
+
+def set_unreachable(uids):
+    """Broadcast: these users blocked the bot / deleted their account. Skipped by the next broadcast."""
+    with _lock:
+        for uid in uids:
+            u = _user(uid)
+            u["blocked"] = True
+            db.put("users", uid, u)
+
+
+def broadcast_targets(audience="all", exclude=()):
+    """User ids a broadcast can reach: 'all' | 'premium' (active) | 'free' (everybody else). Blocked users are skipped."""
+    with _lock:
+        users = {int(uid): dict(u) for uid, u in _users.items()}
+    prem = {uid for uid, _ in list_premium()}
+    ids = set(users) | prem
+    out = []
+    for uid in sorted(ids):
+        if uid in exclude or users.get(uid, {}).get("blocked") or is_admin(uid) and audience != "all":
+            continue
+        if audience == "premium" and uid not in prem:
+            continue
+        if audience == "free" and uid in prem:
+            continue
+        out.append(uid)
+    return out
 
 
 def get_settings(uid):

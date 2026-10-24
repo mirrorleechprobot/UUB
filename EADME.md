@@ -18,6 +18,7 @@ Telegram URL uploader — Pyrogram + yt-dlp + aria2c + ffmpeg. Sirf **Admin + Pr
 | `/addpremium <id> [days]` | Premium do (days na do = lifetime). User ke message par reply bhi chalega |
 | `/removepremium <id>` | Premium hatao |
 | `/premiumlist` | Sab premium users + expiry |
+| `/broadcast [all\|premium\|free] [-s]` | Admin: sab users ko message/photo/video bhejo (reply karke) |
 | `/testlog` | Log channel check + test message |
 | `/helpers` | Helper bots ka status (ready / disabled + wajah) |
 | `/speedtest [MB] [conns] [workers]` | Asli upload speed naapo aur settings tune karo |

@@ -22,6 +22,7 @@ uptime - Bot uptime aur keep-alive status
 addpremium - Admin: user ko Premium do
 removepremium - Admin: user ka Premium hatao
 premiumlist - Admin: Premium users ki list
+broadcast - Admin: Sab users ko message bhejo (reply karke)
 setquota - Admin: user ka daily quota set karo
 gencode - Admin: redeem codes banao
 codes - Admin: redeem codes ki list

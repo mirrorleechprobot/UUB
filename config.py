@@ -85,6 +85,9 @@ EDIT_TIMEOUT = max(5, env_int("EDIT_TIMEOUT", 15))          # a progress edit th
 # exactly like the main bot. Helpers upload into that channel and the main bot copies the file to the user (no re-upload).
 HELPER_BOT_TOKENS = [t for t in os.getenv("HELPER_BOT_TOKENS", "").replace(",", " ").split() if ":" in t]
 
+# ---- /broadcast (admin) ----
+BROADCAST_RATE = max(1, min(30, env_int("BROADCAST_RATE", _p(15, 8))))     # messages per second (Telegram limit ~30)
+
 # ---- time shown to users/admins (premium expiry etc.) ----
 # Fixed UTC offset in minutes (India = 330, UTC = 0, Dubai = 240 ...) and the label printed after the time.
 TZ_OFFSET_MINUTES = env_int("TZ_OFFSET_MINUTES", 330)

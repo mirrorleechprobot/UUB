@@ -135,6 +135,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
+import broadcast
 import downloader as dl
 import fastupload
 import safety
@@ -1531,7 +1532,7 @@ async def start_handler(_, message):
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
                  "/gencode <code>30d [count]</code>  /codes  /delcode\n"
                  "/stats  /userstats <code>id</code>  /topusers  /clearlinks\n"
-                 "/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
+                 "/broadcast <code>[all|premium|free]</code> (reply to a message)\n/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
     await message.reply_text(text)
 
 
@@ -2312,6 +2313,130 @@ async def premiumlist_handler(_, message):
         f"• <code>{uid}</code> — {date_text(exp)}" + (f"  <i>({left_text(exp)})</i>" if exp else "")
         for uid, exp in sorted(users)]
     await message.reply_text("\n".join(lines))
+
+
+# --------------------------------------------------------------------------- /broadcast
+bc_pending = {}                 # token -> {"admin", "audience", "silent", "targets", "src": (chat_id, msg_id) | None, "text", "ts"}
+bc_active = {"cancel": None, "task": None}      # one broadcast at a time
+
+
+def bc_usage():
+    n_all, n_pre, n_free = (len(store.broadcast_targets(a)) for a in broadcast.AUDIENCES)
+    return ("📢 <b>Broadcast</b>\n\n"
+            "<b>1.</b> Reply to ANY message (text, photo, video, file ...) with:\n"
+            "<code>/broadcast</code> — everybody\n<code>/broadcast premium</code> — active premium users\n"
+            "<code>/broadcast free</code> — users without premium\n"
+            "<b>2.</b> Or write the text directly: <code>/broadcast premium Hello <b>everyone</b>!</code> (HTML allowed)\n\n"
+            "Add <code>-s</code> for a silent message (no notification).\n"
+            "You get a preview and must press <b>Send</b> — nothing is sent before that.\n\n"
+            f"👥 Reachable now: all <b>{n_all}</b> • premium <b>{n_pre}</b> • free <b>{n_free}</b>\n"
+            "<i>Only users who started the bot can receive messages.</i>")
+
+
+@app.on_message(PRIVATE & filters.command("broadcast"))
+@admin_only
+async def broadcast_handler(_, message):
+    if bc_active["task"] and not bc_active["task"].done():
+        return await message.reply_text("⏳ A broadcast is already running. Wait for it or press ❌ Stop on its message.")
+    src, text = None, ""
+    if message.reply_to_message:
+        audience, silent, unknown = broadcast.parse_args(message.command[1:])
+        src = (message.chat.id, message.reply_to_message.id)
+        if unknown:
+            return await message.reply_text("❌ Unknown option: <code>" + esc(" ".join(unknown)) + "</code>\n\n" + bc_usage())
+    else:
+        flags, text = broadcast.strip_command(message.text.html if message.text else "")
+        audience, silent, _ = broadcast.parse_args(flags)
+        if not text:
+            return await message.reply_text(bc_usage())
+    targets = store.broadcast_targets(audience, exclude={message.from_user.id})
+    if not targets:
+        return await message.reply_text(f"ℹ️ No reachable users for <b>{audience}</b>.")
+    for tok, p in list(bc_pending.items()):                       # forget old previews
+        if time.time() - p["ts"] > 900:
+            bc_pending.pop(tok, None)
+    token = secrets.token_hex(4)
+    bc_pending[token] = {"admin": message.from_user.id, "audience": audience, "silent": silent,
+                         "targets": targets, "src": src, "text": text, "ts": time.time()}
+    try:                                                          # preview = exactly what the users will get
+        if src:
+            await app.copy_message(message.chat.id, src[0], src[1])
+        else:
+            await app.send_message(message.chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as exc:  # noqa: BLE001
+        bc_pending.pop(token, None)
+        return await message.reply_text(f"❌ This message cannot be broadcast: <code>{esc(str(exc)[:200])}</code>")
+    eta = len(targets) / config.BROADCAST_RATE
+    await message.reply_text(
+        f"👆 <b>Preview</b> (this is what they receive)\n\n📢 Audience: <b>{audience}</b>  •  👥 <b>{len(targets)}</b> users\n"
+        f"🔔 {'Silent' if silent else 'With notification'}  •  ⏱ about {time_text(eta)}\n\nSend it?",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Send to {len(targets)} users", callback_data=f"bc:go:{token}"),
+                                            InlineKeyboardButton("❌ Cancel", callback_data=f"bc:no:{token}")]]))
+
+
+@app.on_callback_query(filters.regex(r"^bc:"))
+async def broadcast_cb(_, cq):
+    if not store.is_admin(cq.from_user.id):
+        return await cq.answer("Admins only.", show_alert=True)
+    _, action, token = cq.data.split(":", 2)
+    if action == "stop":
+        if bc_active["cancel"]:
+            bc_active["cancel"].set()
+        return await cq.answer("Stopping after the current batch...")
+    p = bc_pending.pop(token, None)
+    if action == "no":
+        await cq.answer("Cancelled.")
+        return await edit_final(cq.message, "❌ Broadcast cancelled. Nothing was sent.")
+    if not p:
+        return await cq.answer("This preview expired. Run /broadcast again.", show_alert=True)
+    if bc_active["task"] and not bc_active["task"].done():
+        return await cq.answer("Another broadcast is running.", show_alert=True)
+    await cq.answer("Sending...")
+    cancel = asyncio.Event()
+    bc_active["cancel"] = cancel
+    bc_active["task"] = asyncio.create_task(run_broadcast(cq.message, token, p, cancel))
+
+
+async def run_broadcast(status, token, p, cancel):
+    src, text, silent = p["src"], p["text"], p["silent"]
+    stop_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Stop", callback_data=f"bc:stop:{token}")]])
+
+    async def send_one(uid):
+        if src:
+            await app.copy_message(uid, src[0], src[1], disable_notification=silent)
+        else:
+            await app.send_message(uid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                   disable_notification=silent)
+
+    def bar(res):
+        pct = int(res.done * 100 / max(1, res.total))
+        return "█" * (pct // 10) + "░" * (10 - pct // 10) + f" {pct}%"
+
+    async def progress(res):
+        await edit_safely(status, f"📢 <b>Broadcasting</b> ({p['audience']})\n{bar(res)}\n"
+                                  f"✅ {res.sent}  •  🚫 {len(res.unreachable)}  •  ⚠️ {res.failed}  •  {res.done}/{res.total}\n"
+                                  f"⏱ {time_text(res.elapsed)} • ETA {time_text(res.eta)}", stop_markup)
+
+    log.info("Broadcast started by %s: %s users (%s)", p["admin"], len(p["targets"]), p["audience"])
+    try:
+        res = await broadcast.run(p["targets"], send_one, cancel, progress, config.BROADCAST_RATE)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Broadcast crashed")
+        return await edit_final(status, f"❌ Broadcast crashed: <code>{esc(str(exc)[:200])}</code>")
+    if res.unreachable:
+        store.set_unreachable(res.unreachable)
+    other = "".join(f"\n   • {esc(k)}: {v}" for k, v in sorted(res.errors.items(), key=lambda kv: -kv[1])[:5])
+    report = (f"{'🛑 <b>Broadcast stopped</b>' if res.cancelled else '✅ <b>Broadcast finished</b>'} ({p['audience']})\n\n"
+              f"✅ Delivered: <b>{res.sent}</b>\n🚫 Blocked / deleted: <b>{len(res.unreachable)}</b> (skipped from now on)\n"
+              f"⚠️ Failed: <b>{res.failed}</b>{other}\n"
+              + (f"⏭ Not sent (stopped): <b>{res.total - res.done}</b>\n" if res.cancelled else "")
+              + f"⏱ {time_text(res.elapsed)}")
+    log.info("Broadcast done: sent=%s unreachable=%s failed=%s cancelled=%s", res.sent, len(res.unreachable), res.failed, res.cancelled)
+    await edit_final(status, report)
+    try:
+        await send_log("📢 " + re.sub(r"<[^>]+>", "", report))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.on_message(PRIVATE & filters.command("testlog"))

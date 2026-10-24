@@ -55,3 +55,10 @@ The 429 back-off, silent-video, FloodWait-pause and watchdog fixes are active in
 * Expiry is now shown as `25 Oct 2026, 03:45 PM IST` (date AND time) everywhere: /premiumlist, /status, redeem/grant messages, reminders.
 * /premiumlist also shows the time left, e.g. `(2d 5h left)`.
 * Time zone: `TZ_OFFSET_MINUTES=330`, `TZ_NAME=IST` (change for another country). Internally nothing changed: expiry is still stored as exact UTC seconds.
+
+## v6.5: /broadcast (admin)
+* Reply to any message with `/broadcast` (everybody), `/broadcast premium` or `/broadcast free`; add `-s` for a silent message.
+  Or write the text directly: `/broadcast premium Hello <b>all</b>`.
+* Preview first (you see exactly what users get), then a **Send** / **Cancel** button. Live progress with a **Stop** button.
+* Safe: `BROADCAST_RATE` msgs/s (default 15, free profile 8), FloodWait pauses all senders and retries the user,
+  users who blocked the bot are counted and skipped from then on (until they write to the bot again), final report + copy in the log channel.
