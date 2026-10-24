@@ -62,3 +62,6 @@ The 429 back-off, silent-video, FloodWait-pause and watchdog fixes are active in
 * Preview first (you see exactly what users get), then a **Send** / **Cancel** button. Live progress with a **Stop** button.
 * Safe: `BROADCAST_RATE` msgs/s (default 15, free profile 8), FloodWait pauses all senders and retries the user,
   users who blocked the bot are counted and skipped from then on (until they write to the bot again), final report + copy in the log channel.
+
+## v6.6
+* Users without premium get a **📩 Contact Admin** button (https://t.me/Satyajeetkumarofficial) under the 'only for Premium users' message. Change with `ADMIN_USERNAME`.

@@ -1485,7 +1485,9 @@ async def deny(message):
         "🔒 <b>This bot is only for Premium users and the Admin.</b>\n\n"
         f"Your Telegram ID: <code>{message.from_user.id}</code>\n"
         "Send this ID to the Admin to get Premium access.\n\n"
-        "🎟 Have a redeem code? Send <code>/redeem YOUR-CODE</code>")
+        "🎟 Have a redeem code? Send <code>/redeem YOUR-CODE</code>",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📩 Contact Admin", url=f"https://t.me/{config.ADMIN_USERNAME}")]]) if config.ADMIN_USERNAME else None)
 
 
 def allowed_only(func):
