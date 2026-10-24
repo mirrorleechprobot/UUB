@@ -85,6 +85,11 @@ EDIT_TIMEOUT = max(5, env_int("EDIT_TIMEOUT", 15))          # a progress edit th
 # exactly like the main bot. Helpers upload into that channel and the main bot copies the file to the user (no re-upload).
 HELPER_BOT_TOKENS = [t for t in os.getenv("HELPER_BOT_TOKENS", "").replace(",", " ").split() if ":" in t]
 
+# ---- time shown to users/admins (premium expiry etc.) ----
+# Fixed UTC offset in minutes (India = 330, UTC = 0, Dubai = 240 ...) and the label printed after the time.
+TZ_OFFSET_MINUTES = env_int("TZ_OFFSET_MINUTES", 330)
+TZ_NAME = os.getenv("TZ_NAME", "IST").strip() or "IST"
+
 # ---- rate limits (HTTP 429 / "Too Many Requests") ----
 # Max downloads running against the SAME host at once (a CDN that sees many parallel jobs from one IP answers 429).
 PER_HOST_CONCURRENCY = max(1, env_int("PER_HOST_CONCURRENCY", 2))

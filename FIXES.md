@@ -50,3 +50,8 @@ The 429 back-off, silent-video, FloodWait-pause and watchdog fixes are active in
   plain document (no player, no thumbnail). Now it retries the same upload as video/audio (3x with a short pause).
 * **HLS downloads vs uploads**: while an upload runs, HLS/DASH downloads use at most `FRAGMENTS_WHILE_UPLOADING` (6, free profile 3)
   fragments - the fragment threads were starving the Telegram loop (Edit timed out, watchdog warnings).
+
+## v6.4: premium expiry with time
+* Expiry is now shown as `25 Oct 2026, 03:45 PM IST` (date AND time) everywhere: /premiumlist, /status, redeem/grant messages, reminders.
+* /premiumlist also shows the time left, e.g. `(2d 5h left)`.
+* Time zone: `TZ_OFFSET_MINUTES=330`, `TZ_NAME=IST` (change for another country). Internally nothing changed: expiry is still stored as exact UTC seconds.

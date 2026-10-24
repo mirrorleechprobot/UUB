@@ -183,8 +183,27 @@ def time_text(seconds):
     return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
 
 
+def stamp(ts, with_year=True):
+    """'25 Oct 2026, 03:45 PM IST' in the configured display time zone (TZ_OFFSET_MINUTES / TZ_NAME)."""
+    t = time.gmtime(int(ts) + config.TZ_OFFSET_MINUTES * 60)
+    return time.strftime("%d %b %Y, %I:%M %p" if with_year else "%d %b, %I:%M %p", t) + f" {config.TZ_NAME}"
+
+
 def date_text(ts):
-    return "Lifetime" if not ts else time.strftime("%d %b %Y", time.gmtime(ts)) + " (UTC)"
+    return "Lifetime" if not ts else stamp(ts)
+
+
+def left_text(ts):
+    """'2d 5h left' / '3h 20m left' / 'expired' for a premium expiry timestamp (empty for lifetime)."""
+    if not ts:
+        return ""
+    s = int(ts - time.time())
+    if s <= 0:
+        return "expired"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    return (f"{d}d {h}h left" if d else f"{h}h {m}m left" if h else f"{m}m left")
 
 
 def progress_text(job, stage, title, current, total, speed, eta, elapsed):
@@ -2104,7 +2123,7 @@ async def codes_cmd(_, message):
         lines.append("\n🕘 <b>Recently redeemed</b>")
         for d in recent:
             r = d["redeemed_by"][-1]
-            lines.append(f"<code>{d['_id']}</code> → <code>{r['uid']}</code> ({time.strftime('%d %b %H:%M', time.gmtime(r['ts']))} UTC)")
+            lines.append(f"<code>{d['_id']}</code> → <code>{r['uid']}</code> ({stamp(r['ts'], False)})")
     await message.reply_text("\n".join(lines)[:4000])
 
 
@@ -2239,8 +2258,7 @@ def keepalive_text():
 @allowed_only
 async def uptime_cmd(_, message):
     up = time.time() - state["started"]
-    since = time.strftime("%d %b %Y %H:%M", time.gmtime(state["started"]))
-    await message.reply_text(f"⏱ <b>Uptime:</b> {time_text(up)}\n🟢 Running since {since} UTC\n{keepalive_text()}")
+    await message.reply_text(f"⏱ <b>Uptime:</b> {time_text(up)}\n🟢 Running since {stamp(state['started'])}\n{keepalive_text()}")
 
 
 # ------------------------------------------------------------------- admin: premium management
@@ -2291,7 +2309,8 @@ async def premiumlist_handler(_, message):
     if not users:
         return await message.reply_text("There are no premium users yet.")
     lines = [f"💎 <b>Premium users ({len(users)})</b>"] + [
-        f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
+        f"• <code>{uid}</code> — {date_text(exp)}" + (f"  <i>({left_text(exp)})</i>" if exp else "")
+        for uid, exp in sorted(users)]
     await message.reply_text("\n".join(lines))
 
 
