@@ -44,11 +44,9 @@ _original = pyrogram.Client.save_file
 
 # Session.invoke(sleep_threshold=...) exists in current Pyrogram 2.0.x; stay safe if a fork dropped it.
 try:
-    _params = inspect.signature(Session.invoke).parameters
-    _INVOKE_HAS_THRESHOLD = "sleep_threshold" in _params
-    _INVOKE_HAS_RETRIES = "retries" in _params
+    _INVOKE_HAS_THRESHOLD = "sleep_threshold" in inspect.signature(Session.invoke).parameters
 except (TypeError, ValueError):
-    _INVOKE_HAS_THRESHOLD = _INVOKE_HAS_RETRIES = False
+    _INVOKE_HAS_THRESHOLD = False
 
 
 SLOW_PART_SECONDS = 8.0
@@ -66,10 +64,8 @@ class Tuner:
         self.changes = 0
         self.on_change = None          # callback(limit) - bot.py persists it
 
-    def record(self, file_size, parts, slow, errors, seconds, shared=False):
+    def record(self, file_size, parts, slow, errors, seconds):
         if not config.AUTOTUNE or not config.UPLOAD_ADAPTIVE or file_size < 50 * 1024 * 1024 or parts <= 0:
-            return
-        if shared and not errors:             # other uploads used the same line: slow parts say nothing about congestion
             return
         self.last_speed = file_size / max(seconds, 0.001)
         old = self.limit
@@ -78,8 +74,8 @@ class Tuner:
             self.clean_streak = 0
         else:
             self.clean_streak += 1
-            if self.limit < config.UPLOAD_CONNECTIONS:          # one clean upload is enough to climb back (+2)
-                self.limit = min(config.UPLOAD_CONNECTIONS, self.limit + 2)
+            if self.clean_streak >= 2 and self.limit < config.UPLOAD_CONNECTIONS:
+                self.limit += 1
                 self.clean_streak = 0
         if self.limit != old:
             self.changes += 1
@@ -97,18 +93,6 @@ class Tuner:
 
 
 tuner = Tuner()
-
-_active = {"n": 0}                  # uploads running right now (all users)
-_inflight_sem = None
-
-
-def _sem():
-    """One budget of in-flight parts shared by every upload (created lazily inside the running loop)."""
-    global _inflight_sem
-    if _inflight_sem is None:
-        total = config.UPLOAD_TOTAL_INFLIGHT or config.UPLOAD_CONNECTIONS * config.UPLOAD_WORKERS_PER_CONNECTION
-        _inflight_sem = asyncio.Semaphore(max(2, total))
-    return _inflight_sem
 
 _pool = {}                       # id(client) -> [(Session, last_used_monotonic)]
 _live = set()                    # EVERY session started here and not stopped yet
@@ -214,8 +198,8 @@ async def close_pool():
     await _stop_all(allsess)
 
 
-def connections_for(file_size, active=None):
-    """How many parallel connections are worth opening for this file (shared fairly with the other running uploads)."""
+def connections_for(file_size):
+    """How many parallel connections are worth opening for this file."""
     if file_size <= BIG_FILE:
         return 1
     if not config.UPLOAD_ADAPTIVE:
@@ -229,47 +213,13 @@ def connections_for(file_size, active=None):
         n = 6
     else:
         n = config.UPLOAD_CONNECTIONS
-    cap = tuner.limit if config.AUTOTUNE else config.UPLOAD_CONNECTIONS
-    n = min(n, max(2, -(-cap // max(1, active if active is not None else _active["n"]))))   # ceil(limit / uploads), >= 2
-    return max(1, min(n, cap))
+    return max(1, min(n, tuner.limit if config.AUTOTUNE else config.UPLOAD_CONNECTIONS))
 
 
 async def _invoke(session, rpc):
-    # sleep_threshold=0: Pyrogram does NOT sleep inside each of the 6-32 parallel requests (each one logging
-    # 'Waiting for 3 seconds'); the FloodWait comes up to worker() which pauses ALL workers together and counts it as congestion.
-    # retries=3 (Pyrogram default 10): on a dead connection Pyrogram retried the SAME closed transport 10 x 4 times
-    # (~65 s) before failing. Now it fails fast and worker() revives the connection.
-    kw = {}
     if _INVOKE_HAS_THRESHOLD:
-        kw["sleep_threshold"] = 0
-    if _INVOKE_HAS_RETRIES:
-        kw["retries"] = 3
-    return await session.invoke(rpc, **kw)
-
-
-def _dead_transport(exc):
-    text = str(exc).lower()
-    return isinstance(exc, ConnectionError) or "handler is closed" in text or "connection lost" in text \
-        or "closed=true" in text
-
-
-async def _revive(session, gen0):
-    """Restart ONE dead upload connection (shared by the 4 workers that use it: only the first one restarts it)."""
-    lock = session.__dict__.setdefault("_uub_lock", asyncio.Lock())
-    async with lock:
-        if session.__dict__.get("_uub_gen", 0) != gen0:
-            return                                    # another worker already revived it
-        try:
-            restart = getattr(session, "restart", None)
-            if restart:
-                await asyncio.wait_for(restart(), 30)
-            else:
-                await asyncio.wait_for(session.stop(), 15)
-                await asyncio.wait_for(session.start(), 30)
-            log.info("Upload connection was dead: restarted")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not restart upload connection: %s", exc)
-        session.__dict__["_uub_gen"] = gen0 + 1
+        return await session.invoke(rpc, sleep_threshold=config.FLOOD_SLEEP_THRESHOLD)
+    return await session.invoke(rpc)
 
 
 async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, progress_args=()):
@@ -293,7 +243,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
 
         total_parts = int(math.ceil(file_size / PART_SIZE))
         is_big = file_size > BIG_FILE
-        n_sessions = connections_for(file_size, _active["n"] + 1)
+        n_sessions = connections_for(file_size)
         per_session = config.UPLOAD_WORKERS_PER_CONNECTION if is_big else 1
         md5_sum = md5() if not is_big else None
         new_id = self.rnd_id()
@@ -303,9 +253,6 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
         sessions = []
         state["slow"] = 0
         state["errors"] = 0
-        state["floods"] = 0
-        state["pause_until"] = 0.0
-        state["peak"] = _active["n"] + 1
         t_start = time.monotonic()
 
         async def worker(session):
@@ -318,13 +265,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                 rpc, size = item
                 attempt = 0
                 while True:
-                    pause = state["pause_until"] - time.monotonic()
-                    if pause > 0:                 # a FloodWait is active: every worker waits, nobody hammers Telegram
-                        await asyncio.sleep(pause)
-                    await _sem().acquire()
-                    state["peak"] = max(state["peak"], _active["n"])
                     t_part = time.monotonic()
-                    gen0 = session.__dict__.get("_uub_gen", 0)
                     try:
                         await _invoke(session, rpc)
                         state["done"] += size
@@ -336,24 +277,16 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
                         if wait > config.FLOOD_MAX_WAIT:
                             state["error"] = fw
                             break
-                        state["floods"] += 1
-                        if state["floods"] == 1 or state["floods"] % 25 == 0:
-                            log.warning("Upload FloodWait: all workers pause %ss (seen %d times in this upload)",
-                                        wait, state["floods"])
-                        state["pause_until"] = max(state["pause_until"], time.monotonic() + wait)
+                        log.warning("Upload FloodWait: sleeping %ss", wait)
+                        await asyncio.sleep(wait)
                     except Exception as exc:  # noqa: BLE001
                         attempt += 1
                         state["errors"] += 1
-                        dead = _dead_transport(exc)
-                        if dead:
-                            await _revive(session, gen0)
-                        if attempt >= (6 if dead else 4):
+                        if attempt >= 4:
                             state["error"] = exc
                             log.error("Upload part failed after retries: %s", exc)
                             break
                         await asyncio.sleep(1 + attempt)
-                    finally:
-                        _sem().release()
 
         async def read_parts():
             """Yield 512 KB parts; the disk is read in 4 MB blocks inside a thread."""
@@ -375,7 +308,6 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
 
         workers = []
         ok = False
-        _active["n"] += 1                    # counted from here to the finally below (no await in between: no leak)
         try:
             sessions = await acquire_sessions(self, n_sessions, dc_id, auth_key, test_mode)
             workers = [loop.create_task(worker(s)) for s in sessions for _ in range(per_session)]
@@ -407,14 +339,7 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
             if state["error"]:
                 raise state["error"]
             await report()
-            took = time.monotonic() - t_start
-            tuner.record(file_size, total_parts, state["slow"], state["errors"] + state["floods"], took,
-                         shared=state["peak"] > 1)
-            if file_size >= 20 * 1024 * 1024:
-                log.info("Uploaded %.0f MB in %.0fs = %.1f MB/s (%d conn x %d workers, %d upload(s) at once, "
-                         "slow parts %d/%d, floods %d, errors %d)", file_size / 1048576, took,
-                         file_size / max(took, 0.001) / 1048576, n_sessions, per_session, state["peak"],
-                         state["slow"], total_parts, state["floods"], state["errors"])
+            tuner.record(file_size, total_parts, state["slow"], state["errors"], time.monotonic() - t_start)
             ok = True
             if is_big:
                 return raw.types.InputFileBig(id=new_id, parts=total_parts, name=file_name)
@@ -423,7 +348,6 @@ async def fast_save_file(self, path, file_id=None, file_part=0, progress=None, p
         except StopTransmission:
             raise
         finally:
-            _active["n"] = max(0, _active["n"] - 1)
             for w in workers:
                 w.cancel()
             # warm sessions are reused only after a clean upload; after an error / cancel they are closed

@@ -22,7 +22,6 @@ uptime - Bot uptime aur keep-alive status
 addpremium - Admin: user ko Premium do
 removepremium - Admin: user ka Premium hatao
 premiumlist - Admin: Premium users ki list
-broadcast - Admin: Sab users ko message bhejo (reply karke)
 setquota - Admin: user ka daily quota set karo
 gencode - Admin: redeem codes banao
 codes - Admin: redeem codes ki list
@@ -37,3 +36,7 @@ cleanup - Admin: disk safai
 clearlinks - Admin: MongoDB ke saved links saaf karo
 update - Admin: yt-dlp update karo
 restart - Admin: storage saaf karke restart karo
+stoptxt - Premium Plus: TXT task rok do
+addplus - Admin: user ko Premium Plus (TXT upload) do
+removeplus - Admin: user ka Premium Plus hatao
+pluslist - Admin: Premium Plus users ki list

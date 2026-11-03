@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import hashlib
 import html
+import io
 import itertools
 import logging
 import os
@@ -25,75 +27,6 @@ except Exception:  # noqa: BLE001  (uvloop missing / unsupported -> plain asynci
     pass
 
 import config
-
-# A stale / half-copied config.py crashes later with a confusing AttributeError. Say it clearly instead.
-_REQUIRED_CONFIG = (
-    "ADMIN_ID",
-    "ALERTS",
-    "API_HASH",
-    "API_ID",
-    "ARIA2_CONNECTIONS",
-    "ARIA2_DISK_CACHE_MB",
-    "AUTOTUNE",
-    "BOT_TOKEN",
-    "CACHE_ENABLED",
-    "CACHE_TTL_DAYS",
-    "CONCURRENT_FRAGMENTS",
-    "COOKIES_TEXT",
-    "COOKIE_FILE",
-    "DAILY_LIMIT_FILES",
-    "DAILY_LIMIT_GB",
-    "DATA_DIR",
-    "DIRECT_REFERER",
-    "DIRECT_USER_AGENT",
-    "DISK_CLEAN_PERCENT",
-    "DISK_MIN_FREE_MB",
-    "DOWNLOAD_DIR",
-    "EDIT_TIMEOUT",
-    "EXTRA_ADMIN_IDS",
-    "FLOOD_MAX_WAIT",
-    "FLOOD_SLEEP_THRESHOLD",
-    "HELPER_BOT_TOKENS",
-    "KEEPALIVE_MINUTES",
-    "KEEPALIVE_URL",
-    "LOG_CHANNEL_ID",
-    "MAX_CONCURRENT_JOBS",
-    "MAX_CONCURRENT_TRANSMISSIONS",
-    "MAX_RETRIES",
-    "MAX_RUNNING_PER_USER",
-    "MAX_URLS_PER_MESSAGE",
-    "MAX_WAITING_PER_USER",
-    "MONGO_DB",
-    "MONGO_URI",
-    "PERSIST_SESSION",
-    "PER_HOST_CONCURRENCY",
-    "PIPELINE",
-    "PLAYLIST_LIMIT",
-    "PORT",
-    "PREMIUM_REMIND_DAYS",
-    "PROBE_CONCURRENCY",
-    "PROGRESS_UPDATE_INTERVAL",
-    "QUEUE_RESTORE_MAX_AGE_H",
-    "RATE_LIMIT_BASE_WAIT",
-    "RATE_LIMIT_RETRIES",
-    "SESSION_REUSE",
-    "SPLIT_SIZE_MB",
-    "SSRF_PROTECTION",
-    "TORRENT_ENABLED",
-    "TORRENT_MAX_GB",
-    "TORRENT_NO_PEER_TIMEOUT",
-    "UPLOAD_ADAPTIVE",
-    "UPLOAD_CONNECTIONS",
-    "UPLOAD_WORKERS_PER_CONNECTION",
-    "WATCHDOG_MAX_FAILS",
-    "WATCHDOG_TIMEOUT",
-    "YTDLP_UPDATE_HOURS",
-)
-_missing_cfg = [n for n in _REQUIRED_CONFIG if not hasattr(config, n)]
-if _missing_cfg:
-    sys.exit("config.py is outdated or incomplete (missing: " + ", ".join(_missing_cfg[:12])
-             + (" ..." if len(_missing_cfg) > 12 else "") + "). Replace config.py with the one from UUB-fixed.zip "
-             "(all files of the zip must be deployed together).")
 
 _EARLY_SERVER = None
 
@@ -135,7 +68,6 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
-import broadcast
 import downloader as dl
 import fastupload
 import safety
@@ -184,27 +116,8 @@ def time_text(seconds):
     return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
 
 
-def stamp(ts, with_year=True):
-    """'25 Oct 2026, 03:45 PM IST' in the configured display time zone (TZ_OFFSET_MINUTES / TZ_NAME)."""
-    t = time.gmtime(int(ts) + config.TZ_OFFSET_MINUTES * 60)
-    return time.strftime("%d %b %Y, %I:%M %p" if with_year else "%d %b, %I:%M %p", t) + f" {config.TZ_NAME}"
-
-
 def date_text(ts):
-    return "Lifetime" if not ts else stamp(ts)
-
-
-def left_text(ts):
-    """'2d 5h left' / '3h 20m left' / 'expired' for a premium expiry timestamp (empty for lifetime)."""
-    if not ts:
-        return ""
-    s = int(ts - time.time())
-    if s <= 0:
-        return "expired"
-    d, rem = divmod(s, 86400)
-    h, rem = divmod(rem, 3600)
-    m = rem // 60
-    return (f"{d}d {h}h left" if d else f"{h}h {m}m left" if h else f"{m}m left")
+    return "Lifetime" if not ts else time.strftime("%d %b %Y", time.gmtime(ts)) + " (UTC)"
 
 
 def progress_text(job, stage, title, current, total, speed, eta, elapsed):
@@ -272,6 +185,14 @@ async def edit_final(message, text, markup=None):
             await asyncio.sleep(min(wait, 60))
         if await _try_edit(message, text, markup):
             return
+
+
+async def delete_quiet(message):
+    try:
+        if message is not None:
+            await message.delete()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # =============================================================================== health server
@@ -550,6 +471,10 @@ class Job:
         self.channel = None                   # {"id","title","username"} while delivering to a channel
         self.channel_msg_id = 0               # first message in the channel (for the link)
         self.channel_note = ""                # why the channel could not be used (fallback to the chat)
+        self.txt = None                       # TxtTask this job belongs to (Premium Plus TXT upload), else None
+        self.txt_idx = -1                     # position of this link inside the TXT file
+        self.txt_counted = False              # the task has already counted this job's result
+        self.error = ""                       # short failure reason (shown in the TXT task summary)
 
     @property
     def est_size(self):
@@ -607,6 +532,8 @@ def waiting_count(uid):
 
 # --------------------------------------------------------------------------- queue persistence (MongoDB)
 def persist_job(job):
+    if job.txt is not None:               # a TXT task keeps its own resume point (see TxtTask)
+        return
     db.put("queue", job.key, job.to_doc())
 
 
@@ -797,6 +724,7 @@ async def cancel_job(job):
         job.state = "done"
         job.outcome = "cancelled"
         forget_job(job)
+        txt_job_done(job)
         if job.batch:
             job.batch.job_finished("cancelled")
             bg(batch_update(job.batch))
@@ -951,48 +879,26 @@ async def send_item(uc, chat_id, job, item, caption, cb):
     kind = item["kind"]
     size = Path(path).stat().st_size
 
-    async def send_once():
-        if kind == "video":
-            return await client.send_video(chat_id, path, caption=caption, duration=item["duration"],
-                                           width=item["width"], height=item["height"], thumb=thumb,
-                                           supports_streaming=True, progress=cb)
-        if kind == "audio":
-            return await client.send_audio(chat_id, path, caption=caption, duration=item["duration"],
-                                           performer=item["artist"] or None,
-                                           title=item["title"] or job.title[:60], progress=cb)
-        if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
-            return await client.send_photo(chat_id, path, caption=caption, progress=cb)
-        return await client.send_document(chat_id, path, caption=caption, thumb=thumb, progress=cb)
-
-    def network_error(exc):
-        text = str(exc).lower()
-        return isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError)) or "handler is closed" in text \
-            or "connection lost" in text
-
     async def attempt():
-        net_tries = 0
-        while True:
-            try:
-                return await send_once()
-            except FloodWait:
+        try:
+            if kind == "video":
+                return await client.send_video(chat_id, path, caption=caption, duration=item["duration"],
+                                               width=item["width"], height=item["height"], thumb=thumb,
+                                               supports_streaming=True, progress=cb)
+            if kind == "audio":
+                return await client.send_audio(chat_id, path, caption=caption, duration=item["duration"],
+                                               performer=item["artist"] or None,
+                                               title=item["title"] or job.title[:60], progress=cb)
+            if kind == "image" and size < 10 * 1024 * 1024 and Path(path).suffix.lower() in (".jpg", ".jpeg", ".png"):
+                return await client.send_photo(chat_id, path, caption=caption, progress=cb)
+            return await client.send_document(chat_id, path, caption=caption, thumb=thumb, progress=cb)
+        except FloodWait:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if job.cancel.is_set() or kind in ("document",):
                 raise
-            except Exception as exc:  # noqa: BLE001
-                if job.cancel.is_set():
-                    raise
-                if network_error(exc):
-                    # The connection broke: upload the SAME thing again (still as video / audio). The old code switched to
-                    # 'document' here, which re-uploaded the whole file AND lost the video player / thumbnail.
-                    net_tries += 1
-                    if net_tries > 3:
-                        raise
-                    log.warning("send as %s: connection problem (%s), retry %d/3 in %ds", kind, type(exc).__name__,
-                                net_tries, 5 * net_tries)
-                    await sleep_cancellable(job, 5 * net_tries)
-                    continue
-                if kind in ("document",):
-                    raise
-                log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
-                return await client.send_document(chat_id, path, caption=caption, progress=cb)
+            log.warning("send as %s failed (%s); retrying as document", kind, type(exc).__name__)
+            return await client.send_document(chat_id, path, caption=caption, progress=cb)
 
     return await flood_retry(job, uc, attempt, "upload")
 
@@ -1284,6 +1190,7 @@ async def run_job(job):
     except dl.Cancelled:
         if job.disk_full:
             job.outcome = "failed"
+            job.error = "server disk was full"
             store.bump("errors")
             final_text = (f"❌ <b>Server disk is full</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
                           "The download was stopped to protect the server. Try again in a few minutes.")
@@ -1300,6 +1207,7 @@ async def run_job(job):
     except Exception as exc:  # noqa: BLE001
         log.exception("Job #%s failed", job.id)
         job.outcome = "failed"
+        job.error = str(exc)[:200]
         store.bump("errors")
         note_failure(job, exc)
         final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
@@ -1307,8 +1215,13 @@ async def run_job(job):
     finally:
         release_upload_turn(job)
         shutil.rmtree(workdir, ignore_errors=True)   # always clean: failed jobs must not fill the disk
+        if job.txt is not None:
+            gc.collect()                             # TXT tasks run for hours: give the memory back after every file
     if final_text:
-        await edit_final(job.status_msg, final_text)
+        if job.txt is not None and (job.outcome == "ok" or state["shutting_down"]):
+            await delete_quiet(job.status_msg)       # keep the chat clean: the delivered file is the proof (summary shows the rest)
+        else:
+            await edit_final(job.status_msg, final_text)
 
 
 async def run_wrapper(job):
@@ -1326,6 +1239,7 @@ async def run_wrapper(job):
         jobs.pop(job.id, None)
         release_upload_turn(job)
         forget_job(job)
+        txt_job_done(job)
         if job.batch:
             job.batch.job_finished(job.outcome, job.size_bytes)
             bg(batch_update(job.batch))
@@ -1392,7 +1306,6 @@ async def restore_queue():
 # =============================================================================== Telegram app
 
 fastupload.install()      # multi-connection uploads (stock Pyrogram is single-connection, ~5-6 MB/s)
-dl.upload_active = lambda: fastupload._active["n"] > 0     # downloads use fewer parallel fragments while an upload runs
 _kwargs = dict(name="url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
                workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=config.FLOOD_SLEEP_THRESHOLD)
 try:
@@ -1485,9 +1398,7 @@ async def deny(message):
         "🔒 <b>This bot is only for Premium users and the Admin.</b>\n\n"
         f"Your Telegram ID: <code>{message.from_user.id}</code>\n"
         "Send this ID to the Admin to get Premium access.\n\n"
-        "🎟 Have a redeem code? Send <code>/redeem YOUR-CODE</code>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            "📩 Contact Admin", url=f"https://t.me/{config.ADMIN_USERNAME}")]]) if config.ADMIN_USERNAME else None)
+        "🎟 Have a redeem code? Send <code>/redeem YOUR-CODE</code>")
 
 
 def allowed_only(func):
@@ -1529,12 +1440,16 @@ async def start_handler(_, message):
             f"Up to {config.MAX_WAITING_PER_USER} can wait in line. Same link again = instant resend ⚡\n\n"
             "📋 /queue  /clear  /top  /move  /cancel\n⚙️ /settings  /caption  /setthumb  /delthumb\n"
             "📊 /mystats  /myplan  /id")
+    if store.has_plus(message.from_user.id):
+        text += ("\n\n➕ <b>Premium Plus:</b> send a <b>.txt file</b> (one link per line). All links are downloaded in "
+                 "<b>Best quality</b>, one by one. If the bot restarts it continues automatically. /stoptxt = stop")
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
+                 "/addplus <code>id [days]</code>  /removeplus <code>id</code>  /pluslist  (TXT upload)\n"
                  "/gencode <code>30d [count]</code>  /codes  /delcode\n"
                  "/stats  /userstats <code>id</code>  /topusers  /clearlinks\n"
-                 "/broadcast <code>[all|premium|free]</code> (reply to a message)\n/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
+                 "/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
     await message.reply_text(text)
 
 
@@ -1554,7 +1469,9 @@ async def myplan_handler(_, message):
     if store.is_admin(uid):
         return await message.reply_text("👑 You are the <b>Admin</b>: unlimited access.")
     rec = store.premium_info(uid)
-    await message.reply_text(f"💎 <b>Premium active</b>\n📅 Expiry: {date_text(rec.get('expires'))}\n\n{usage_text(uid)}")
+    plus = store.plus_info(uid)
+    plus_line = f"\n➕ <b>Premium Plus (TXT upload)</b>: {date_text(plus.get('expires'))}" if plus else ""
+    await message.reply_text(f"💎 <b>Premium active</b>\n📅 Expiry: {date_text(rec.get('expires'))}{plus_line}\n\n{usage_text(uid)}")
 
 
 @app.on_message(PRIVATE & filters.command("mystats"))
@@ -1581,7 +1498,10 @@ def queue_text(uid):
     active = [j for j in user_jobs(uid) if j not in waiting]
     wl = [j for j in waiting if j.user_id == uid]
     lines = [f"📋 <b>Your queue</b> • Active: {len(active)} • Waiting: {len(wl)}/{config.MAX_WAITING_PER_USER}"]
-    if not active and not wl:
+    tt = user_txt_task(uid)
+    if tt:
+        lines.append(f"\n📄 TXT task #{tt.id}: {tt.finished_count}/{tt.total} done • /stoptxt to stop")
+    if not active and not wl and not tt:
         lines.append("\nYou have no active jobs.")
     for j in active:
         lines.append(f"\n▶️ #{j.id} • {esc(j.state)} • {esc(j.title[:60])}")
@@ -1602,10 +1522,14 @@ async def status_handler(_, message):
 @app.on_message(PRIVATE & filters.command("cancel"))
 @allowed_only
 async def cancel_cmd(_, message):
-    mine = user_jobs(message.from_user.id)
+    uid = message.from_user.id
+    task = user_txt_task(uid)
+    if task:
+        await cancel_txt_task(task, "Stopped by you.")      # first: no new link of the TXT task may start
+    mine = user_jobs(uid)
     for j in mine:
         await cancel_job(j)
-    await message.reply_text(f"🚫 Cancelling {len(mine)} job(s)." if mine else "No active jobs.")
+    await message.reply_text(f"🚫 Cancelling {len(mine)} job(s)." + (" TXT task stopped." if task else "") if (mine or task) else "No active jobs.")
 
 
 @app.on_message(PRIVATE & filters.command("clear"))
@@ -1614,6 +1538,8 @@ async def clear_cmd(_, message):
     """/clear = remove everything that is still WAITING (running jobs continue). /clear all = cancel running ones too."""
     uid = message.from_user.id
     everything = len(message.command) > 1 and message.command[1].lower() == "all"
+    if everything and user_txt_task(uid):
+        await cancel_txt_task(user_txt_task(uid), "Stopped by you.")
     targets = user_jobs(uid) if everything else [j for j in waiting if j.user_id == uid]
     for j in targets:
         await cancel_job(j)
@@ -2126,7 +2052,7 @@ async def codes_cmd(_, message):
         lines.append("\n🕘 <b>Recently redeemed</b>")
         for d in recent:
             r = d["redeemed_by"][-1]
-            lines.append(f"<code>{d['_id']}</code> → <code>{r['uid']}</code> ({stamp(r['ts'], False)})")
+            lines.append(f"<code>{d['_id']}</code> → <code>{r['uid']}</code> ({time.strftime('%d %b %H:%M', time.gmtime(r['ts']))} UTC)")
     await message.reply_text("\n".join(lines)[:4000])
 
 
@@ -2261,7 +2187,8 @@ def keepalive_text():
 @allowed_only
 async def uptime_cmd(_, message):
     up = time.time() - state["started"]
-    await message.reply_text(f"⏱ <b>Uptime:</b> {time_text(up)}\n🟢 Running since {stamp(state['started'])}\n{keepalive_text()}")
+    since = time.strftime("%d %b %Y %H:%M", time.gmtime(state["started"]))
+    await message.reply_text(f"⏱ <b>Uptime:</b> {time_text(up)}\n🟢 Running since {since} UTC\n{keepalive_text()}")
 
 
 # ------------------------------------------------------------------- admin: premium management
@@ -2298,6 +2225,8 @@ async def removepremium_handler(_, message):
     if uid is None:
         return await message.reply_text("Usage: /removepremium <code>user_id</code>")
     if store.remove_premium(uid):
+        if user_txt_task(uid):
+            await cancel_txt_task(user_txt_task(uid), "Premium was removed by the Admin.")
         for j in user_jobs(uid):
             await cancel_job(j)
         await message.reply_text(f"🗑 Premium removed for <code>{uid}</code>.")
@@ -2312,133 +2241,51 @@ async def premiumlist_handler(_, message):
     if not users:
         return await message.reply_text("There are no premium users yet.")
     lines = [f"💎 <b>Premium users ({len(users)})</b>"] + [
-        f"• <code>{uid}</code> — {date_text(exp)}" + (f"  <i>({left_text(exp)})</i>" if exp else "")
-        for uid, exp in sorted(users)]
+        f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
     await message.reply_text("\n".join(lines))
 
 
-# --------------------------------------------------------------------------- /broadcast
-bc_pending = {}                 # token -> {"admin", "audience", "silent", "targets", "src": (chat_id, msg_id) | None, "text", "ts"}
-bc_active = {"cancel": None, "task": None}      # one broadcast at a time
-
-
-def bc_usage():
-    n_all, n_pre, n_free = (len(store.broadcast_targets(a)) for a in broadcast.AUDIENCES)
-    return ("📢 <b>Broadcast</b>\n\n"
-            "<b>1.</b> Reply to ANY message (text, photo, video, file ...) with:\n"
-            "<code>/broadcast</code> — everybody\n<code>/broadcast premium</code> — active premium users\n"
-            "<code>/broadcast free</code> — users without premium\n"
-            "<b>2.</b> Or write the text directly: <code>/broadcast premium Hello <b>everyone</b>!</code> (HTML allowed)\n\n"
-            "Add <code>-s</code> for a silent message (no notification).\n"
-            "You get a preview and must press <b>Send</b> — nothing is sent before that.\n\n"
-            f"👥 Reachable now: all <b>{n_all}</b> • premium <b>{n_pre}</b> • free <b>{n_free}</b>\n"
-            "<i>Only users who started the bot can receive messages.</i>")
-
-
-@app.on_message(PRIVATE & filters.command("broadcast"))
+@app.on_message(PRIVATE & filters.command(["addplus", "addpremiumplus"]))
 @admin_only
-async def broadcast_handler(_, message):
-    if bc_active["task"] and not bc_active["task"].done():
-        return await message.reply_text("⏳ A broadcast is already running. Wait for it or press ❌ Stop on its message.")
-    src, text = None, ""
-    if message.reply_to_message:
-        audience, silent, unknown = broadcast.parse_args(message.command[1:])
-        src = (message.chat.id, message.reply_to_message.id)
-        if unknown:
-            return await message.reply_text("❌ Unknown option: <code>" + esc(" ".join(unknown)) + "</code>\n\n" + bc_usage())
-    else:
-        flags, text = broadcast.strip_command(message.text.html if message.text else "")
-        audience, silent, _ = broadcast.parse_args(flags)
-        if not text:
-            return await message.reply_text(bc_usage())
-    targets = store.broadcast_targets(audience, exclude={message.from_user.id})
-    if not targets:
-        return await message.reply_text(f"ℹ️ No reachable users for <b>{audience}</b>.")
-    for tok, p in list(bc_pending.items()):                       # forget old previews
-        if time.time() - p["ts"] > 900:
-            bc_pending.pop(tok, None)
-    token = secrets.token_hex(4)
-    bc_pending[token] = {"admin": message.from_user.id, "audience": audience, "silent": silent,
-                         "targets": targets, "src": src, "text": text, "ts": time.time()}
-    try:                                                          # preview = exactly what the users will get
-        if src:
-            await app.copy_message(message.chat.id, src[0], src[1])
-        else:
-            await app.send_message(message.chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except Exception as exc:  # noqa: BLE001
-        bc_pending.pop(token, None)
-        return await message.reply_text(f"❌ This message cannot be broadcast: <code>{esc(str(exc)[:200])}</code>")
-    eta = len(targets) / config.BROADCAST_RATE
-    await message.reply_text(
-        f"👆 <b>Preview</b> (this is what they receive)\n\n📢 Audience: <b>{audience}</b>  •  👥 <b>{len(targets)}</b> users\n"
-        f"🔔 {'Silent' if silent else 'With notification'}  •  ⏱ about {time_text(eta)}\n\nSend it?",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Send to {len(targets)} users", callback_data=f"bc:go:{token}"),
-                                            InlineKeyboardButton("❌ Cancel", callback_data=f"bc:no:{token}")]]))
-
-
-@app.on_callback_query(filters.regex(r"^bc:"))
-async def broadcast_cb(_, cq):
-    if not store.is_admin(cq.from_user.id):
-        return await cq.answer("Admins only.", show_alert=True)
-    _, action, token = cq.data.split(":", 2)
-    if action == "stop":
-        if bc_active["cancel"]:
-            bc_active["cancel"].set()
-        return await cq.answer("Stopping after the current batch...")
-    p = bc_pending.pop(token, None)
-    if action == "no":
-        await cq.answer("Cancelled.")
-        return await edit_final(cq.message, "❌ Broadcast cancelled. Nothing was sent.")
-    if not p:
-        return await cq.answer("This preview expired. Run /broadcast again.", show_alert=True)
-    if bc_active["task"] and not bc_active["task"].done():
-        return await cq.answer("Another broadcast is running.", show_alert=True)
-    await cq.answer("Sending...")
-    cancel = asyncio.Event()
-    bc_active["cancel"] = cancel
-    bc_active["task"] = asyncio.create_task(run_broadcast(cq.message, token, p, cancel))
-
-
-async def run_broadcast(status, token, p, cancel):
-    src, text, silent = p["src"], p["text"], p["silent"]
-    stop_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Stop", callback_data=f"bc:stop:{token}")]])
-
-    async def send_one(uid):
-        if src:
-            await app.copy_message(uid, src[0], src[1], disable_notification=silent)
-        else:
-            await app.send_message(uid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-                                   disable_notification=silent)
-
-    def bar(res):
-        pct = int(res.done * 100 / max(1, res.total))
-        return "█" * (pct // 10) + "░" * (10 - pct // 10) + f" {pct}%"
-
-    async def progress(res):
-        await edit_safely(status, f"📢 <b>Broadcasting</b> ({p['audience']})\n{bar(res)}\n"
-                                  f"✅ {res.sent}  •  🚫 {len(res.unreachable)}  •  ⚠️ {res.failed}  •  {res.done}/{res.total}\n"
-                                  f"⏱ {time_text(res.elapsed)} • ETA {time_text(res.eta)}", stop_markup)
-
-    log.info("Broadcast started by %s: %s users (%s)", p["admin"], len(p["targets"]), p["audience"])
+async def addplus_handler(_, message):
+    uid, rest = parse_target(message)
+    if uid is None:
+        return await message.reply_text("Usage: /addplus <code>user_id [days]</code>\nLeave days out for Lifetime. "
+                                        "Or reply to a user's message with /addplus <code>[days]</code>")
+    days = int(rest[0]) if rest and rest[0].isdigit() and int(rest[0]) > 0 else None
+    expires = store.add_plus(uid, days, by=message.from_user.id)
+    warn = "" if store.is_allowed(uid) else "\n⚠️ This user has no Premium yet: give it with /addpremium too."
+    await message.reply_text(f"✅ Premium Plus (TXT upload) granted to <code>{uid}</code>.\n📅 Expiry: {date_text(expires)}{warn}")
     try:
-        res = await broadcast.run(p["targets"], send_one, cancel, progress, config.BROADCAST_RATE)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Broadcast crashed")
-        return await edit_final(status, f"❌ Broadcast crashed: <code>{esc(str(exc)[:200])}</code>")
-    if res.unreachable:
-        store.set_unreachable(res.unreachable)
-    other = "".join(f"\n   • {esc(k)}: {v}" for k, v in sorted(res.errors.items(), key=lambda kv: -kv[1])[:5])
-    report = (f"{'🛑 <b>Broadcast stopped</b>' if res.cancelled else '✅ <b>Broadcast finished</b>'} ({p['audience']})\n\n"
-              f"✅ Delivered: <b>{res.sent}</b>\n🚫 Blocked / deleted: <b>{len(res.unreachable)}</b> (skipped from now on)\n"
-              f"⚠️ Failed: <b>{res.failed}</b>{other}\n"
-              + (f"⏭ Not sent (stopped): <b>{res.total - res.done}</b>\n" if res.cancelled else "")
-              + f"⏱ {time_text(res.elapsed)}")
-    log.info("Broadcast done: sent=%s unreachable=%s failed=%s cancelled=%s", res.sent, len(res.unreachable), res.failed, res.cancelled)
-    await edit_final(status, report)
-    try:
-        await send_log("📢 " + re.sub(r"<[^>]+>", "", report))
+        await app.send_message(uid, f"🎉 You now have <b>Premium Plus</b>!\n📅 Expiry: {date_text(expires)}\n\n"
+                                    "Send a <b>.txt file</b> with one link per line. Everything is downloaded in Best quality.")
     except Exception:  # noqa: BLE001
         pass
+
+
+@app.on_message(PRIVATE & filters.command(["removeplus", "delplus"]))
+@admin_only
+async def removeplus_handler(_, message):
+    uid, _ = parse_target(message)
+    if uid is None:
+        return await message.reply_text("Usage: /removeplus <code>user_id</code>")
+    if store.remove_plus(uid):
+        if user_txt_task(uid):
+            await cancel_txt_task(user_txt_task(uid), "Premium Plus was removed by the Admin.")
+        await message.reply_text(f"🗑 Premium Plus removed for <code>{uid}</code> (normal Premium is unchanged).")
+    else:
+        await message.reply_text("This user does not have Premium Plus.")
+
+
+@app.on_message(PRIVATE & filters.command(["pluslist", "plusers"]))
+@admin_only
+async def pluslist_handler(_, message):
+    users = store.list_plus()
+    if not users:
+        return await message.reply_text("There are no Premium Plus users yet.")
+    lines = [f"➕ <b>Premium Plus users ({len(users)})</b>"] + [
+        f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
+    await message.reply_text("\n".join(lines))
 
 
 @app.on_message(PRIVATE & filters.command("testlog"))
@@ -2846,6 +2693,415 @@ def parse_links(text):
     return out
 
 
+# =============================================================================== Premium Plus: TXT file upload
+# A .txt file (one link per line) is turned into ONE task. The task feeds its links into the normal queue one after
+# the other, always with the BEST quality:   1 download + 1 upload at a time (the next file downloads while the
+# previous one uploads), the disk is cleaned after every file, and the progress is stored in the database, so after a
+# restart / redeploy the task continues from the first unfinished link.
+
+txt_tasks = {}                 # id -> TxtTask (running)
+txt_runners = set()            # asyncio tasks of the running TxtTasks
+TXT_WINDOW = 2                 # links of one task alive at once: one downloading/uploading + the next one waiting (pipeline)
+
+
+class TxtTask:
+    _ids = itertools.count(1)
+
+    def __init__(self, user, chat_id, filename, entries):
+        self.id = next(TxtTask._ids)
+        self.key = secrets.token_hex(8)
+        self.user = SimpleNamespace(id=user.id, first_name=getattr(user, "first_name", None),
+                                    last_name=getattr(user, "last_name", None), username=getattr(user, "username", None))
+        self.chat_id = chat_id
+        self.filename = (filename or "links.txt")[:80]
+        self.entries = entries                # [[url, custom_name|None], ...]   (a playlist link is expanded in place)
+        self.created = time.time()
+        self.started = time.time()
+        self.attempts = 0
+        self.next = 0                         # index of the next link to start
+        self.pos = 0                          # resume point: every link before it is finished
+        self.done = set()                     # finished indexes (may be ahead of pos for a moment)
+        self.ok = self.failed = self.skipped = 0
+        self.expanded = 0                     # playlist links that were replaced by their videos (not counted in the total)
+        self.bytes = 0
+        self.fails = []                       # [[url, reason]]  failed + skipped (capped)
+        self.jobs = {}                        # idx -> Job (alive)
+        self.current = ""
+        self.cancelled = False
+        self.stop_reason = ""
+        self.msg = None
+        self.last_edit = 0.0
+
+    # ---- state
+    @property
+    def total(self):
+        return len(self.entries) - self.expanded
+
+    @property
+    def finished_count(self):
+        return self.ok + self.failed + self.skipped
+
+    def text(self, final=False):
+        left = max(0, self.total - self.finished_count)
+        head = "✅ <b>TXT task finished</b>" if final else "📄 <b>TXT task running</b>"
+        if final and self.stop_reason:
+            head = "🛑 <b>TXT task stopped</b>"
+        lines = [f"{head}  •  #{self.id}", f"🗂 {esc(self.filename)}",
+                 f"📊 <b>{self.finished_count}/{self.total}</b>  •  ✅ {self.ok}  ❌ {self.failed}  🚫 {self.skipped}"]
+        if not final:
+            if self.current:
+                lines.append(f"▶️ {esc(self.current[:90])}")
+            lines.append(f"⏳ Remaining: {left}")
+        lines.append(f"📦 Uploaded: {size_text(self.bytes)}")
+        lines.append(f"🕒 {'Time' if final else 'Running'}: {time_text(time.time() - self.started)}")
+        if final and self.stop_reason:
+            lines.append(f"⚠️ {esc(self.stop_reason)}")
+        return "\n".join(lines)
+
+    def markup(self):
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop TXT task", callback_data=f"tx:{self.id}")]])
+
+    # ---- persistence
+    def to_doc(self):
+        sm = self.msg
+        return {"user_id": self.user.id, "first_name": self.user.first_name, "last_name": self.user.last_name,
+                "username": self.user.username, "chat_id": self.chat_id, "filename": self.filename,
+                "created": self.created, "attempts": self.attempts, "pos": self.pos, "ok": self.ok,
+                "failed": self.failed, "skipped": self.skipped, "expanded": self.expanded, "bytes": self.bytes, "fails": self.fails[-300:],
+                "status_chat": _chat_of(sm) if sm else 0, "status_id": getattr(sm, "id", 0) if sm else 0}
+
+    @classmethod
+    def from_doc(cls, d, entries):
+        user = SimpleNamespace(id=d["user_id"], first_name=d.get("first_name"), last_name=d.get("last_name"),
+                               username=d.get("username"))
+        t = cls(user, d["chat_id"], d.get("filename"), entries)
+        t.key = str(d["_id"])
+        t.created, t.attempts = d.get("created", t.created), d.get("attempts", 0)
+        t.pos = t.next = min(int(d.get("pos", 0)), len(entries))
+        t.done = set(range(t.pos))
+        t.ok, t.failed, t.skipped = d.get("ok", 0), d.get("failed", 0), d.get("skipped", 0)
+        t.expanded = d.get("expanded", 0)
+        t.bytes, t.fails = d.get("bytes", 0), d.get("fails", [])
+        return t
+
+
+def user_txt_task(uid):
+    return next((t for t in txt_tasks.values() if t.user.id == uid), None)
+
+
+def persist_txt(task):
+    db.put("txttask", task.key, task.to_doc())
+
+
+async def txt_update(task, force=False):
+    """One summary message per task (edited, never re-sent)."""
+    if task.msg is None:
+        return
+    if not force and time.monotonic() - task.last_edit < 5:
+        return
+    task.last_edit = time.monotonic()
+    await edit_safely(task.msg, task.text(), task.markup())
+
+
+def _txt_finish_idx(task, idx):
+    task.done.add(idx)
+    while task.pos in task.done:
+        task.pos += 1
+    task.attempts = 0                         # progress was made: reset the crash-loop guard
+    persist_txt(task)
+    bg(txt_update(task))
+
+
+def txt_job_done(job):
+    """Called when a job of a TXT task ends (finished / failed / cancelled / served from cache). Safe to call twice."""
+    task = job.txt
+    if task is None or job.txt_counted:
+        return
+    if state["shutting_down"] and job.outcome != "ok":
+        return                                # interrupted by a restart: the link is done again after the restart
+    job.txt_counted = True
+    task.jobs.pop(job.txt_idx, None)
+    if job.outcome == "ok":
+        task.ok += 1
+        task.bytes += job.size_bytes
+    elif job.outcome == "cancelled":
+        task.skipped += 1
+        task.fails.append([job.url, "cancelled"])
+    else:
+        task.failed += 1
+        task.fails.append([job.url, job.error or "failed"])
+    _txt_finish_idx(task, job.txt_idx)
+
+
+def _txt_fail_entry(task, idx, url, reason):
+    task.failed += 1
+    task.fails.append([url, reason[:200]])
+    _txt_finish_idx(task, idx)
+
+
+async def txt_process_entry(task, idx, url, name):
+    """Analyse one link and put it into the normal queue with the BEST quality."""
+    loop = asyncio.get_running_loop()
+    try:
+        async with probe_sem:
+            pr = await loop.run_in_executor(POOL, dl.probe, url)
+    except dl.ProbeError as exc:
+        return _txt_fail_entry(task, idx, url, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("txt probe failed")
+        return _txt_fail_entry(task, idx, url, f"link check failed: {type(exc).__name__}")
+
+    if pr["kind"] == "playlist":              # playlist link inside the TXT: its videos (Best quality) take its place
+        new = [[e["url"], None] for e in pr["entries"][:config.PLAYLIST_LIMIT]]
+        task.entries[idx + 1:idx + 1] = new
+        task.expanded += 1
+        await db.put_wait("txtlist", task.key, {"entries": task.entries})
+        task.done.add(idx)
+        while task.pos in task.done:
+            task.pos += 1
+        persist_txt(task)
+        return
+
+    option = pr["options"][0] if pr["kind"] == "media" else None      # options[0] is always "Best" (see downloader._build_options)
+    job = make_job_from_probe(task.user, task.chat_id, url, pr, option, custom_name=name)
+    job.txt, job.txt_idx = task, idx
+    task.jobs[idx] = job
+    task.current = job.title
+    try:
+        status = await app.send_message(task.chat_id, f"⏳ {idx + 1}/{task.total} • {esc(job.title[:100])}")
+    except Exception as exc:  # noqa: BLE001
+        task.jobs.pop(idx, None)
+        return _txt_fail_entry(task, idx, url, f"could not send status message: {type(exc).__name__}")
+    queued = await enqueue(job, status, None)
+    if not queued:
+        task.jobs.pop(idx, None)
+        await delete_quiet(status)
+        return _txt_fail_entry(task, idx, url, "queue limit / daily limit")
+    if job.id not in jobs and not job.txt_counted:   # served instantly from the URL cache
+        txt_job_done(job)
+        if job.outcome == "ok":
+            await delete_quiet(status)
+
+
+async def run_txt_task(task):
+    uid = task.user.id
+    try:
+        task.attempts += 1
+        persist_txt(task)
+        await txt_update(task, force=True)
+        while task.next < len(task.entries):
+            if state["shutting_down"] or task.cancelled:
+                break
+            if not (store.is_allowed(uid) and store.has_plus(uid)):
+                task.stop_reason = "Premium / Premium Plus is no longer active."
+                break
+            while len(task.jobs) >= TXT_WINDOW and not (state["shutting_down"] or task.cancelled):
+                await asyncio.sleep(1)
+            if state["shutting_down"] or task.cancelled:
+                break
+            ok_q, why = store.quota_check(uid, extra_files=1 + len(user_jobs(uid)))
+            if not ok_q:
+                task.stop_reason = f"{why} (resets at 00:00 UTC)"
+                break
+            idx = task.next
+            url, name = task.entries[idx]
+            task.next += 1
+            await txt_process_entry(task, idx, url, name)
+            await txt_update(task)
+        while task.jobs and not state["shutting_down"]:       # let the last links finish (or finish cancelling)
+            await asyncio.sleep(1)
+        if state["shutting_down"]:
+            return                                            # progress stays in the database -> resumes after the restart
+        if task.cancelled and not task.stop_reason:
+            task.stop_reason = "Stopped by you."
+        await txt_finish(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.exception("TXT task #%s crashed", task.id)
+        task.stop_reason = f"Internal error: {type(exc).__name__}"
+        for job in list(task.jobs.values()):
+            await cancel_job(job)
+        try:
+            await txt_finish(task)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        if not state["shutting_down"]:
+            txt_tasks.pop(task.id, None)
+
+
+def _links_file(rows, name):
+    bio = io.BytesIO("\n".join(rows).encode("utf-8"))
+    bio.name = name
+    return bio
+
+
+async def txt_finish(task):
+    remaining = [e[0] if not e[1] else f"{e[0]} | {e[1]}" for e in task.entries[task.next:]]
+    failed = [u for u, _ in task.fails]
+    final = task.text(final=True)
+    if task.fails:
+        final += "\n\n❌ <b>Not delivered:</b>\n" + "\n".join(
+            f"• {esc(u[:70])}\n   ⚠️ {esc(r[:90])}" for u, r in task.fails[:8])
+        if len(task.fails) > 8:
+            final += f"\n… and {len(task.fails) - 8} more (see the file below)"
+    if task.msg is not None:
+        await edit_final(task.msg, task.text(final=True))
+    try:
+        await app.send_message(task.chat_id, "🔔 " + final, disable_web_page_preview=True)
+        if failed:
+            await app.send_document(task.chat_id, _links_file(failed, "failed_links.txt"), file_name="failed_links.txt",
+                                    caption="❌ Failed / skipped links. Upload this file again to retry them.")
+        if remaining:
+            await app.send_document(task.chat_id, _links_file(remaining, "remaining_links.txt"), file_name="remaining_links.txt",
+                                    caption=f"📋 {len(remaining)} link(s) were not started. Upload this file again to continue.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("TXT summary could not be sent: %s", type(exc).__name__)
+    db.delete("txttask", task.key)
+    db.delete("txtlist", task.key)
+    log_bg(f"📄 TXT task #{task.id} finished\n👤 {task.user.id}\n✅ {task.ok} ❌ {task.failed} 🚫 {task.skipped} • {size_text(task.bytes)}")
+
+
+def spawn_txt(task):
+    txt_tasks[task.id] = task
+    t = asyncio.create_task(run_txt_task(task))
+    txt_runners.add(t)
+    t.add_done_callback(txt_runners.discard)
+
+
+async def cancel_txt_task(task, reason=""):
+    """Stop the task: no new link is started and the running / waiting ones of this task are cancelled."""
+    task.cancelled = True
+    if reason:
+        task.stop_reason = reason
+    for job in list(task.jobs.values()):
+        await cancel_job(job)
+
+
+async def restore_txt_tasks():
+    """After a restart / redeploy: unfinished TXT tasks continue from the first unfinished link."""
+    docs = await db.all("txttask")
+    now, max_age = time.time(), config.TXT_RESTORE_MAX_AGE_H * 3600
+    for d in docs:
+        key = d["_id"]
+        try:
+            lst = await db.get("txtlist", key)
+            entries = (lst or {}).get("entries") or []
+            uid = d["user_id"]
+            if (not entries or now - d.get("created", now) > max_age or d.get("attempts", 0) >= 5
+                    or not (store.is_allowed(uid) and store.has_plus(uid)) or d.get("pos", 0) >= len(entries)):
+                db.delete("txttask", key)
+                db.delete("txtlist", key)
+                continue
+            task = TxtTask.from_doc(d, entries)
+            msg = None
+            if d.get("status_id") and d.get("status_chat"):
+                try:
+                    msg = await app.get_messages(d["status_chat"], d["status_id"])
+                except Exception:  # noqa: BLE001
+                    msg = None
+            if msg is None or getattr(msg, "empty", False):
+                msg = await app.send_message(task.chat_id, "♻️ Restoring your TXT task...")
+            task.msg = msg
+            spawn_txt(task)
+            try:
+                await app.send_message(task.chat_id, f"♻️ <b>The bot restarted.</b> Your TXT task <b>{esc(task.filename)}</b> "
+                                                     f"continues from link {task.pos + 1}/{task.total}.")
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not restore TXT task %s: %s", key, type(exc).__name__)
+            db.delete("txttask", key)
+            db.delete("txtlist", key)
+    if txt_tasks:
+        log.info("TXT tasks restored: %s", len(txt_tasks))
+
+
+def _decode_text(raw):
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+@app.on_message(PRIVATE & filters.document)
+async def txt_upload_handler(_, message):
+    doc = message.document
+    name = (getattr(doc, "file_name", "") or "")
+    if not message.from_user or not (name.lower().endswith(".txt") or (getattr(doc, "mime_type", "") or "") == "text/plain"):
+        return                                                    # not a TXT file: ignore (same as before)
+    uid = message.from_user.id
+    if not store.is_allowed(uid):
+        return await deny(message)
+    store.touch_user(uid, message.from_user.first_name or "")
+    if not store.has_plus(uid):
+        return await message.reply_text("🔒 <b>TXT upload is a Premium Plus feature.</b>\n\n"
+                                        f"Your Telegram ID: <code>{uid}</code>\nAsk the Admin for Premium Plus.")
+    if user_txt_task(uid):
+        return await message.reply_text("⚠️ A TXT task of yours is already running. Wait until it finishes, or stop it with "
+                                        "/stoptxt, then send the new file.")
+    if (doc.file_size or 0) > config.TXT_MAX_FILE_KB * 1024:
+        return await message.reply_text(f"❌ File too big (max {config.TXT_MAX_FILE_KB} KB).")
+    wait = await message.reply_text("📄 Reading your file...", quote=True)
+    try:
+        buf = await message.download(in_memory=True)             # kept in memory only, nothing is written to disk
+        if isinstance(buf, (str, Path)):                         # (older Pyrogram: path) -> read and delete it
+            raw = Path(buf).read_bytes()
+            Path(buf).unlink(missing_ok=True)
+        else:
+            raw = buf.getvalue()
+        del buf
+    except Exception as exc:  # noqa: BLE001
+        log.warning("TXT download failed: %s", type(exc).__name__)
+        return await edit_safely(wait, "❌ Could not read the file. Please send it again.")
+    text = _decode_text(raw)
+    del raw
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    links = parse_links(text)
+    if not links:
+        return await edit_safely(wait, "❌ No valid link found in this file. Put one link per line (http/https"
+                                       + (", magnet" if config.TORRENT_ENABLED else "") + ").")
+    note = ""
+    if len(links) > config.TXT_MAX_URLS:
+        note += f"\n⚠️ Only the first {config.TXT_MAX_URLS} links are used."
+        links = links[:config.TXT_MAX_URLS]
+    ignored = max(0, len(lines) - len(links))
+    if ignored and not note:
+        note += f"\nℹ️ {ignored} line(s) were ignored (no link / duplicate)."
+    task = TxtTask(message.from_user, message.chat.id, name, [[u, n] for u, n in links])
+    await db.put_wait("txtlist", task.key, {"entries": task.entries})
+    await delete_quiet(wait)
+    task.msg = await message.reply_text(
+        f"📄 <b>TXT task started</b>  •  #{task.id}\n🗂 {esc(task.filename)}\n🔗 {task.total} link(s) • 🏆 Best quality\n"
+        f"📤 One download + one upload at a time. If the bot restarts, it continues from where it stopped.{note}",
+        quote=True, reply_markup=task.markup())
+    spawn_txt(task)
+
+
+@app.on_message(PRIVATE & filters.command("stoptxt"))
+@allowed_only
+async def stoptxt_cmd(_, message):
+    task = user_txt_task(message.from_user.id)
+    if not task:
+        return await message.reply_text("You have no running TXT task.")
+    await cancel_txt_task(task, "Stopped by you.")
+    await message.reply_text("🛑 Stopping your TXT task...")
+
+
+@app.on_callback_query(filters.regex(r"^tx:"))
+async def txt_callback(_, cq):
+    task = txt_tasks.get(int(cq.data.split(":", 1)[1]))
+    if not task:
+        return await cq.answer("This TXT task has already finished.")
+    if cq.from_user.id != task.user.id and not store.is_admin(cq.from_user.id):
+        return await cq.answer("This is not your task.", show_alert=True)
+    await cq.answer("🛑 Stopping...")
+    await cancel_txt_task(task, "Stopped by you.")
+
+
 @app.on_message(PRIVATE & filters.text & ~filters.regex(r"^/"))
 @allowed_only
 async def url_handler(_, message):
@@ -3100,16 +3356,12 @@ async def telegram_watchdog_loop():
     await asyncio.sleep(120)
     while True:
         try:
-            await asyncio.wait_for(app.get_me(), config.WATCHDOG_TIMEOUT)
+            await asyncio.wait_for(app.get_me(), 25)
             fails = 0
         except Exception as exc:  # noqa: BLE001
             fails += 1
-            # a small host is slow while uploading (CPU/bandwidth saturated): be twice as patient then
-            uploading = bool(fastupload.session_stats()["busy"])
-            limit = config.WATCHDOG_MAX_FAILS * (2 if uploading else 1)
-            log.warning("Telegram watchdog: get_me failed (%s) %d/%d%s", type(exc).__name__, fails, limit,
-                        " (upload running)" if uploading else "")
-            if fails >= limit:
+            log.warning("Telegram watchdog: get_me failed (%s) %d/3", type(exc).__name__, fails)
+            if fails >= 3:
                 await bot_api("sendMessage", chat_id=str(config.ADMIN_ID), parse_mode="HTML",
                               text="🚨 <b>Telegram connection lost</b> – the bot restarts itself now (queue is saved).")
                 await graceful_restart("telegram watchdog", wipe=False)
@@ -3163,7 +3415,7 @@ async def main():
 
     await db.start()                       # MongoDB (or local JSON fallback)
     await store.init()
-    # (not restored from the DB any more: a low value saved during a bad hour kept uploads slow after every restart)
+    fastupload.tuner.restore(((await db.get("kv", "tuner")) or {}).get("limit"))
     fastupload.tuner.on_change = lambda limit: db.put("kv", "tuner", {"limit": limit})
     for leftover in DOWNLOAD_DIR.iterdir():          # files of jobs that were running when the previous instance died
         shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
@@ -3197,6 +3449,7 @@ async def main():
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG, db.label)
     workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop(), telegram_watchdog_loop())]
     await restore_queue()
+    await restore_txt_tasks()
     if config.MONGO_URI and not db.mongo:
         bg(alert_admin("db", f"🗄 <b>MongoDB connection failed at startup.</b> Using local files (data is lost on redeploy).\n"
                              f"<code>{esc(db.error)}</code>", every=6 * 3600))
@@ -3205,9 +3458,9 @@ async def main():
     finally:
         state["ready"] = False
         state["shutting_down"] = True       # running jobs stay in the database and are restored by the next instance
-        for w in workers:
+        for w in list(workers) + list(txt_runners):
             w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*workers, *list(txt_runners), return_exceptions=True)
         try:
             await save_peers(force=True)
         except Exception:  # noqa: BLE001

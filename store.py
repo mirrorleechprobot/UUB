@@ -17,6 +17,7 @@ from db import db
 log = logging.getLogger("uub.store")
 _lock = threading.RLock()
 _premium = {}          # str(uid) -> {"added", "expires", "by", "quota_gb", "quota_files", "reminded": [days]}
+_plus = {}             # str(uid) -> {"added", "expires", "by"}   Premium Plus (TXT file upload); separate from _premium on purpose
 _users = {}            # str(uid) -> {"name", "first_seen", "last_seen", "settings": {...}, "usage": {...}}
 _stats = {}            # "YYYY-MM-DD" -> {"files", "bytes", "errors", "cache_hits", "jobs"}
 _stats_saved = 0.0
@@ -33,9 +34,11 @@ def today():
 async def init():
     global _stats
     with _lock:
-        _premium.clear(); _users.clear(); _stats.clear()
+        _premium.clear(); _users.clear(); _stats.clear(); _plus.clear()
         for d in await db.all("premium"):
             _premium[str(d["_id"])] = {k: v for k, v in d.items() if k != "_id"}
+        for d in await db.all("plus"):
+            _plus[str(d["_id"])] = {k: v for k, v in d.items() if k != "_id"}
         for d in await db.all("users"):
             _users[str(d["_id"])] = {k: v for k, v in d.items() if k != "_id"}
         for d in await db.all("stats"):
@@ -124,6 +127,49 @@ def list_premium():
                 if not rec.get("expires") or rec["expires"] >= now]
 
 
+# --------------------------------------------------------------------------- Premium Plus (TXT upload)
+def plus_info(user_id):
+    """Premium Plus record if active (not expired), else None."""
+    with _lock:
+        rec = _plus.get(str(user_id))
+    if not rec:
+        return None
+    expires = rec.get("expires")
+    if expires and expires < time.time():
+        return None
+    return rec
+
+
+def has_plus(user_id):
+    """Admins always have it. Everybody else needs an active Premium Plus record (set by the admin with /addplus)."""
+    return is_admin(user_id) or plus_info(user_id) is not None
+
+
+def add_plus(user_id, days=None, by=None):
+    """days=None -> lifetime. Returns the expiry timestamp (or None)."""
+    with _lock:
+        expires = time.time() + days * 86400 if days else None
+        rec = {"added": time.time(), "expires": expires, "by": by}
+        _plus[str(user_id)] = rec
+    db.put("plus", user_id, rec)
+    return expires
+
+
+def remove_plus(user_id):
+    with _lock:
+        existed = _plus.pop(str(user_id), None) is not None
+    if existed:
+        db.delete("plus", user_id)
+    return existed
+
+
+def list_plus():
+    now = time.time()
+    with _lock:
+        return [(int(uid), rec.get("expires")) for uid, rec in _plus.items()
+                if not rec.get("expires") or rec["expires"] >= now]
+
+
 def set_quota(user_id, gb=None, files=None):
     """Admin override of a premium user's daily limits (None = keep, 0 = unlimited)."""
     with _lock:
@@ -172,42 +218,9 @@ def _user(uid):
 def touch_user(uid, name=""):
     u = _user(uid)
     u["last_seen"] = time.time()
-    changed = False
     if name and u.get("name") != name:
         u["name"] = name
-        changed = True
-    if u.get("blocked"):                        # they wrote to the bot again -> broadcasts can reach them
-        u["blocked"] = False
-        changed = True
-    if changed:
         db.put("users", uid, u)
-
-
-def set_unreachable(uids):
-    """Broadcast: these users blocked the bot / deleted their account. Skipped by the next broadcast."""
-    with _lock:
-        for uid in uids:
-            u = _user(uid)
-            u["blocked"] = True
-            db.put("users", uid, u)
-
-
-def broadcast_targets(audience="all", exclude=()):
-    """User ids a broadcast can reach: 'all' | 'premium' (active) | 'free' (everybody else). Blocked users are skipped."""
-    with _lock:
-        users = {int(uid): dict(u) for uid, u in _users.items()}
-    prem = {uid for uid, _ in list_premium()}
-    ids = set(users) | prem
-    out = []
-    for uid in sorted(ids):
-        if uid in exclude or users.get(uid, {}).get("blocked") or is_admin(uid) and audience != "all":
-            continue
-        if audience == "premium" and uid not in prem:
-            continue
-        if audience == "free" and uid in prem:
-            continue
-        out.append(uid)
-    return out
 
 
 def get_settings(uid):

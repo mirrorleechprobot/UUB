@@ -26,16 +26,6 @@ def _norm_channel(value):
     return -int("100" + text)
 
 
-# PROFILE=turbo (default): original high-speed settings. PROFILE=free: gentle settings for tiny hosts (Koyeb free).
-# Any individual env variable (UPLOAD_CONNECTIONS ...) still overrides the profile.
-PROFILE = os.getenv("PROFILE", "turbo").strip().lower()
-_FREE = PROFILE == "free"
-
-
-def _p(turbo, free):
-    return free if _FREE else turbo
-
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 API_ID = env_int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "")
@@ -53,19 +43,19 @@ DATA_DIR = os.getenv("DATA_DIR", "/app/data")          # premium users DB + sess
 COOKIE_FILE = os.getenv("COOKIE_FILE", "/app/cookies.txt")
 COOKIES_TEXT = os.getenv("COOKIES_TEXT", "")
 
-PROGRESS_UPDATE_INTERVAL = max(5, env_int("PROGRESS_UPDATE_INTERVAL", _p(10, 15)))
+PROGRESS_UPDATE_INTERVAL = max(5, env_int("PROGRESS_UPDATE_INTERVAL", 10))
 MAX_RETRIES = max(1, min(10, env_int("MAX_RETRIES", 3)))
 AUTO_DELETE_AFTER_UPLOAD = True
 PORT = env_int("PORT", 8080)
 
 # ---- speed / limits ----
-ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", _p(16, 4))))      # connections per download
-CONCURRENT_FRAGMENTS = max(1, min(32, env_int("CONCURRENT_FRAGMENTS", _p(16, 4)))) # HLS/DASH fragments in parallel
-UPLOAD_CONNECTIONS = max(1, min(16, env_int("UPLOAD_CONNECTIONS", _p(8, 3))))               # MTProto connections per uploaded file (big files)
+ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", 16)))      # connections per download
+CONCURRENT_FRAGMENTS = max(1, min(32, env_int("CONCURRENT_FRAGMENTS", 32))) # HLS/DASH fragments in parallel
+UPLOAD_CONNECTIONS = max(1, min(16, env_int("UPLOAD_CONNECTIONS", 8)))               # MTProto connections per uploaded file (big files)
 UPLOAD_ADAPTIVE = env_bool("UPLOAD_ADAPTIVE", True)      # small/medium files use fewer connections (less handshake cost)
-UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, env_int("UPLOAD_WORKERS_PER_CONNECTION", _p(4, 2))))  # parts (512 KB) in flight per connection
-MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", _p(10, 2))))   # global cap: jobs running at once (all users)
-MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", _p(6, 2))))  # Pyrogram upload streams
+UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, env_int("UPLOAD_WORKERS_PER_CONNECTION", 4)))  # parts (512 KB) in flight per connection
+MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
+MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
 MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 1))          # per user: jobs running at the same time
 MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 50))        # per user: jobs waiting (format already chosen)
@@ -85,39 +75,8 @@ EDIT_TIMEOUT = max(5, env_int("EDIT_TIMEOUT", 15))          # a progress edit th
 # exactly like the main bot. Helpers upload into that channel and the main bot copies the file to the user (no re-upload).
 HELPER_BOT_TOKENS = [t for t in os.getenv("HELPER_BOT_TOKENS", "").replace(",", " ").split() if ":" in t]
 
-# ---- "Contact Admin" button shown to users without premium ----
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Satyajeetkumarofficial").strip().lstrip("@").replace("https://t.me/", "")
-
-# ---- /broadcast (admin) ----
-BROADCAST_RATE = max(1, min(30, env_int("BROADCAST_RATE", _p(15, 8))))     # messages per second (Telegram limit ~30)
-
-# ---- time shown to users/admins (premium expiry etc.) ----
-# Fixed UTC offset in minutes (India = 330, UTC = 0, Dubai = 240 ...) and the label printed after the time.
-TZ_OFFSET_MINUTES = env_int("TZ_OFFSET_MINUTES", 330)
-TZ_NAME = os.getenv("TZ_NAME", "IST").strip() or "IST"
-
-# ---- rate limits (HTTP 429 / "Too Many Requests") ----
-# Max downloads running against the SAME host at once (a CDN that sees many parallel jobs from one IP answers 429).
-PER_HOST_CONCURRENCY = max(1, env_int("PER_HOST_CONCURRENCY", 2))
-# On a 429 the bot waits (RATE_LIMIT_BASE_WAIT * 2^n seconds, max 300) and retries with FEWER connections/fragments.
-RATE_LIMIT_RETRIES = max(0, min(8, env_int("RATE_LIMIT_RETRIES", 4)))
-RATE_LIMIT_BASE_WAIT = max(5, env_int("RATE_LIMIT_BASE_WAIT", 20))
-
-# HLS/DASH fragments in parallel while an upload is running (fragment threads compete with the Telegram loop for CPU).
-FRAGMENTS_WHILE_UPLOADING = max(1, env_int("FRAGMENTS_WHILE_UPLOADING", _p(6, 3)))
-
-# ---- shared upload budget (several users uploading at the same time) ----
-# Max 512 KB parts in flight over ALL running uploads together. One upload can use all of it, 4 uploads share it fairly
-# (and Telegram is not flooded with 4 x 32 requests). 0 = auto (UPLOAD_CONNECTIONS x UPLOAD_WORKERS_PER_CONNECTION).
-UPLOAD_TOTAL_INFLIGHT = max(0, env_int("UPLOAD_TOTAL_INFLIGHT", 0))
-
-# ---- Telegram watchdog (restarts the bot when the connection is really dead) ----
-# A tiny host (Koyeb free: 0.1 vCPU) gets slow while uploading, so a single slow get_me() must not trigger a restart.
-WATCHDOG_TIMEOUT = max(15, env_int("WATCHDOG_TIMEOUT", 60))
-WATCHDOG_MAX_FAILS = max(2, env_int("WATCHDOG_MAX_FAILS", 5))   # doubled while an upload is running
-
 # ---- download tuning ----
-ARIA2_DISK_CACHE_MB = max(0, min(512, env_int("ARIA2_DISK_CACHE_MB", _p(64, 16))))
+ARIA2_DISK_CACHE_MB = max(0, min(512, env_int("ARIA2_DISK_CACHE_MB", 64)))
 
 # ---- MongoDB (persistence across redeploys) ----
 # MONGO_URI e.g. mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/   (Atlas free M0 is enough).
@@ -127,7 +86,7 @@ MONGO_DB = os.getenv("MONGO_DB", "uub").strip() or "uub"
 PERSIST_SESSION = env_bool("PERSIST_SESSION", True)           # keep the Pyrogram session + peer cache in the DB (needed to resume the queue)
 
 # ---- queue / pipeline ----
-PIPELINE = env_bool("PIPELINE", _p(True, False))                         # download the NEXT file while the previous one uploads (per user)
+PIPELINE = env_bool("PIPELINE", True)                         # download the NEXT file while the previous one uploads (per user)
 QUEUE_RESTORE_MAX_AGE_H = max(1, env_int("QUEUE_RESTORE_MAX_AGE_H", 24))   # queued jobs older than this are dropped after a restart
 
 # ---- URL -> file_id cache (same link again = instant resend, no download / upload) ----
@@ -167,3 +126,8 @@ KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
 # When the disk is this % full the bot cleans everything that no running job owns (orphaned folders, caches). Safe:
 # live jobs and anything younger than 2 minutes are never touched.
 DISK_CLEAN_PERCENT = max(50, min(99, env_int("DISK_CLEAN_PERCENT", 90)))
+
+# ---- Premium Plus: TXT file upload (one link per line) ----
+TXT_MAX_URLS = max(1, min(10000, env_int("TXT_MAX_URLS", 2000)))                 # links read from one .txt file
+TXT_MAX_FILE_KB = max(10, min(5120, env_int("TXT_MAX_FILE_KB", 2048)))           # biggest .txt file accepted
+TXT_RESTORE_MAX_AGE_H = max(1, env_int("TXT_RESTORE_MAX_AGE_H", 168))            # a TXT task older than this is dropped after a restart

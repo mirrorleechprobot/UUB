@@ -10,7 +10,6 @@ import json
 import logging
 import mimetypes
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -45,114 +44,8 @@ OTHER_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".pdf", ".txt"
 DIRECT_EXT = VIDEO_EXT | AUDIO_EXT | IMAGE_EXT | OTHER_EXT
 TEMP_SUFFIXES = (".part", ".ytdl", ".aria2", ".temp", ".tmp")
 
-NICE = ["nice", "-n", "10"] if shutil.which("nice") else []      # ffmpeg / aria2c must not starve the upload loop
 HAVE_ARIA2 = shutil.which("aria2c") is not None
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
-
-
-# --------------------------------------------------------------------------- rate limits (HTTP 429)
-_HOST_SEMS = {}
-_HOST_COOLDOWN = {}                 # host -> time.monotonic() until which we do not touch it
-_HOST_LOCK = threading.Lock()
-_HOST_STRICT = set()                # hosts that already refused us (429 / 503): only ONE job at a time from now on
-upload_active = lambda: False       # bot.py replaces this: True while an upload is running
-_RL_RE = re.compile(r"too many requests|rate.?limit|service (?:temporarily )?unavailable"
-                    r"|(?:http error|status[= ]|response code)\D{0,12}(?:429|503)|\b503 server error", re.I)
-
-
-def _host(url):
-    try:
-        return (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return ""
-
-
-def is_rate_limited(exc_or_text):
-    return bool(_RL_RE.search(str(exc_or_text)))
-
-
-class _HostSlot:
-    """Limits how many jobs hit the same host at once (cancel-aware, so a cancelled job never waits for a slot)."""
-
-    def __init__(self, url, cancel):
-        self.host, self.cancel, self.sem = _host(url), cancel, None
-
-    def __enter__(self):
-        if not self.host:
-            return self
-        limit = 1 if self.host in _HOST_STRICT else config.PER_HOST_CONCURRENCY
-        with _HOST_LOCK:
-            self.sem = _HOST_SEMS.setdefault((self.host, limit), threading.Semaphore(limit))
-        while not self.sem.acquire(timeout=1):
-            if self.cancel.is_set():
-                self.sem = None
-                raise Cancelled()
-        return self
-
-    def __exit__(self, *exc):
-        if self.sem is not None:
-            self.sem.release()
-
-
-def _wait_cooldown(host, cancel, progress=None):
-    while host:
-        left = _HOST_COOLDOWN.get(host, 0) - time.monotonic()
-        if left <= 0:
-            return
-        if cancel.is_set():
-            raise Cancelled()
-        if progress is not None:
-            progress.update({"status": "downloading", "speed": 0, "eta": left})
-        time.sleep(min(1.0, left))
-
-
-def _with_rate_limit_retry(url, cancel, progress, fn):
-    """fn(rl) runs the download; rl = how many times the server already said 429 (0 = first try).
-    On 429: wait with exponential back-off (shared by every job on that host) and try again with fewer connections."""
-    host, rl = _host(url), 0
-    while True:
-        _wait_cooldown(host, cancel, progress)
-        try:
-            return fn(rl)
-        except Cancelled:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if cancel.is_set():
-                raise Cancelled() from exc
-            if not is_rate_limited(exc):
-                raise
-            if rl >= config.RATE_LIMIT_RETRIES:
-                raise RuntimeError("The download server keeps refusing us (HTTP 429 / 503: too many requests or overloaded). "
-                                   "Please try again in a few minutes.") from exc
-            wait = min(300, config.RATE_LIMIT_BASE_WAIT * (2 ** rl)) + random.uniform(0, 5)
-            rl += 1
-            if host:
-                _HOST_COOLDOWN[host] = max(_HOST_COOLDOWN.get(host, 0), time.monotonic() + wait)
-                _HOST_STRICT.add(host)
-            log.warning("429 from %s: waiting %.0fs, retry %d/%d with fewer connections",
-                        host or "server", wait, rl, config.RATE_LIMIT_RETRIES)
-
-
-def _fragments(rl=0, cap=None):
-    """Parallel HLS/DASH fragments: fewer after a 429/503 and while an upload runs (0.1 vCPU: fragment threads would
-    starve the Telegram loop -> edit timeouts, dead connections)."""
-    n = max(1, config.CONCURRENT_FRAGMENTS >> rl)
-    try:
-        if upload_active():
-            n = min(n, config.FRAGMENTS_WHILE_UPLOADING)
-    except Exception:  # noqa: BLE001
-        pass
-    return max(1, min(n, cap) if cap else n)
-
-
-def _clean_partials(workdir):
-    """Remove half-written / vanished fragment files so the next attempt starts clean."""
-    try:
-        for p in Path(workdir).iterdir():
-            if p.is_file() and (".part" in p.name or p.name.endswith((".ytdl", ".aria2"))):
-                p.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 # --------------------------------------------------------------------------- cookies / session
@@ -296,9 +189,6 @@ def ytdlp_base_opts():
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
             "retries": config.MAX_RETRIES, "fragment_retries": config.MAX_RETRIES,
             "extractor_retries": config.MAX_RETRIES, "windowsfilenames": True,
-            # wait a little longer between retries instead of hammering the server (helps against 429)
-            "retry_sleep_functions": {"http": lambda n: min(2 ** n, 20), "fragment": lambda n: min(2 ** n, 20),
-                                      "extractor": lambda n: min(2 ** n, 20), "file_access": lambda n: 1},
             "http_headers": {"User-Agent": config.DIRECT_USER_AGENT},
             # YouTube needs a JS runtime (deno, see requirements) + EJS solver scripts for full-speed, all-quality formats.
             "remote_components": ["ejs:github"]}
@@ -388,7 +278,7 @@ _ARIA_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)\
 
 def _aria2(url, target, progress, cancel, expected_size, connections=None):
     n = connections or config.ARIA2_CONNECTIONS
-    cmd = [*NICE, "aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
+    cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", "--enable-http-keep-alive=true", "--http-accept-gzip=false",
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true", "-c",
            "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
@@ -536,7 +426,7 @@ def _looks_like_html(path):
         return False
 
 
-def download_direct(url, workdir, progress, cancel, filename=None, size=0, rl=0):
+def download_direct(url, workdir, progress, cancel, filename=None, size=0):
     if not filename:
         info = _probe_http(url)
         filename = info["filename"]
@@ -546,8 +436,7 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0, rl=0)
     errors = []
     if HAVE_ARIA2:
         # Some servers refuse many parallel connections (403/429): retry with fewer before the 1-connection fallback.
-        first = max(1, config.ARIA2_CONNECTIONS >> rl)          # fewer connections after every 429
-        ladder = [first] + ([4] if first > 4 else [])
+        ladder = [config.ARIA2_CONNECTIONS] + ([4] if config.ARIA2_CONNECTIONS > 4 else [])
         for conns in ladder:
             try:
                 _aria2(url, target, progress, cancel, size, conns)
@@ -559,15 +448,12 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0, rl=0)
                 log.warning("aria2c (%s conn) failed (%s)", conns, str(exc)[:120])
                 target.unlink(missing_ok=True)
                 Path(str(target) + ".aria2").unlink(missing_ok=True)
-                if is_rate_limited(exc):                       # back off first, do not hammer the same server again
-                    raise RuntimeError("Download failed: " + str(exc)[:200]) from exc
     if not target.is_file():
         try:
             _requests_download(url, target, progress, cancel)
         except Cancelled:
             raise
         except Exception as exc:  # noqa: BLE001
-            target.unlink(missing_ok=True)
             errors.append(str(exc))
             raise RuntimeError("Download failed: " + " | ".join(e[:200] for e in errors)) from exc
     if not target.is_file() or target.stat().st_size == 0:
@@ -594,8 +480,7 @@ def _fetch_format(url, workdir, fmt, tag):
     """Download ONE yt-dlp format selector into workdir as '<id>.<tag>.<ext>'; returns the files."""
     opts = ytdlp_base_opts()
     opts.update({"outtmpl": str(workdir / f"%(id)s.{tag}.%(ext)s"), "format": fmt, "overwrites": True,
-                 "file_access_retries": config.MAX_RETRIES,
-                 "concurrent_fragment_downloads": _fragments(0, 4)})
+                 "file_access_retries": config.MAX_RETRIES, "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS})
     with yt_dlp.YoutubeDL(opts) as ydl:
         ainfo = ydl.extract_info(url, download=True)
     files = [Path(d["filepath"]) for d in (ainfo.get("requested_downloads") or []) if d.get("filepath")]
@@ -624,22 +509,7 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
     log.warning("downloaded video has NO audio track (formats used: %s, site lists %d audio-only formats) - looking for sound",
                 chosen, len(_audio_only_formats(info)))
     progress["status"] = "processing"
-    # Only try a strategy that can find something DIFFERENT from what we already downloaded. Without this the bot
-    # re-downloaded the same silent stream up to 2 more times (minutes of bandwidth) before giving up.
-    used = {f.get("format_id") for f in (info.get("requested_formats") or [])} or {info.get("format_id")}
-    others = [f for f in (info.get("formats") or []) if f.get("format_id") not in used]
-    with_sound = [f for f in others if f.get("acodec") not in (None, "none")]
-    plan = []
     for tag, fmt, what in AUDIO_FALLBACKS:
-        if tag == "audio" and not _audio_only_formats(info):
-            continue
-        if tag in ("audio2", "muxed") and not with_sound:
-            continue
-        plan.append((tag, fmt, what))
-    if not plan:
-        log.warning("no other audio source exists on this site (0 audio-only formats, no other format with sound): "
-                    "the video is silent - not downloading it again")
-    for tag, fmt, what in plan:
         if cancel.is_set():
             raise Cancelled()
         try:
@@ -676,7 +546,7 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
     return result
 
 
-def download_media(url, option, workdir, progress, cancel, rl=0):
+def download_media(url, option, workdir, progress, cancel):
     def hook(d):
         if cancel.is_set():
             raise Cancelled()
@@ -689,12 +559,11 @@ def download_media(url, option, workdir, progress, cancel, rl=0):
             progress["status"] = "processing"
 
     def run(use_aria):
-        workdir.mkdir(parents=True, exist_ok=True)               # a vanished folder caused '[Errno 2] ... .part-Frag'
         opts = ytdlp_base_opts()
         opts.update({
             "outtmpl": str(workdir / "%(title).150B [%(id)s].%(ext)s"),
             "continuedl": True, "overwrites": False, "file_access_retries": config.MAX_RETRIES,
-            "concurrent_fragment_downloads": _fragments(rl),
+            "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS,
             "progress_hooks": [hook], "http_chunk_size": 10 * 1024 * 1024,
             "ignoreerrors": False,
         })
@@ -711,7 +580,7 @@ def download_media(url, option, workdir, progress, cancel, rl=0):
             opts["format_sort"] = ["res", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]
             opts["merge_output_format"] = "mp4"
         if use_aria and HAVE_ARIA2:
-            n = max(1, config.ARIA2_CONNECTIONS >> rl)
+            n = config.ARIA2_CONNECTIONS
             opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
             opts["external_downloader_args"] = {"aria2c": [f"-x{n}", f"-s{n}", "-k1M", "--file-allocation=none",
                                                             f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M"]}
@@ -731,7 +600,7 @@ def download_media(url, option, workdir, progress, cancel, rl=0):
         return result
 
     errors = []
-    for use_aria in ([True, False] if (HAVE_ARIA2 and rl == 0) else [False]):     # after a 429: no aria2c, gentle
+    for use_aria in ([True, False] if HAVE_ARIA2 else [False]):
         try:
             return run(use_aria)
         except Cancelled:
@@ -741,10 +610,6 @@ def download_media(url, option, workdir, progress, cancel, rl=0):
                 raise Cancelled() from exc
             errors.append(re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:280])
             log.warning("yt-dlp attempt (aria2=%s) failed: %s", use_aria, errors[-1][:120])
-            if is_rate_limited(errors[-1]):          # same server, same IP: the 2nd attempt would only make it worse
-                break
-            if "No such file" in errors[-1] or "Errno 2" in errors[-1]:
-                _clean_partials(workdir)
     raise RuntimeError("Download failed: " + errors[-1])
 
 
@@ -763,12 +628,9 @@ def download(job, workdir):
         safety.check_url(job.url)                  # also protects jobs restored from the database after a restart
     except safety.UnsafeURL as exc:
         raise RuntimeError(str(exc)) from exc
-    with _HostSlot(job.url, job.cancel):
-        if job.mode == "direct":
-            return _with_rate_limit_retry(job.url, job.cancel, job.progress, lambda rl: download_direct(
-                job.url, workdir, job.progress, job.cancel, job.direct_name, job.direct_size, rl))
-        return _with_rate_limit_retry(job.url, job.cancel, job.progress, lambda rl: download_media(
-            job.url, job.option, workdir, job.progress, job.cancel, rl))
+    if job.mode == "direct":
+        return download_direct(job.url, workdir, job.progress, job.cancel, job.direct_name, job.direct_size)
+    return download_media(job.url, job.option, workdir, job.progress, job.cancel)
 
 
 # --------------------------------------------------------------------------- post-processing
@@ -868,7 +730,7 @@ def _remux_mp4(path):
         # Opus / Vorbis inside MP4 plays SILENT in Telegram's players -> convert such audio to AAC (video stays untouched).
         acodec = ffprobe(path).get("acodec", "")
         audio = ["-c:a", "copy"] if (not acodec or acodec in TG_AUDIO_OK) else ["-c:a", "aac", "-b:a", "192k"]
-        r = _run([*NICE, "ffmpeg", "-y", "-threads", "1", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
+        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
                   "-sn", "-dn", *fast, str(tmp)])
     except Exception:  # noqa: BLE001
         tmp.unlink(missing_ok=True)
