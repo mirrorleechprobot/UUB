@@ -1,7 +1,7 @@
 # URL Uploader Bot — Complete Guide (Features • Config • Commands • "Kya karne par kya hoga")
 
 > Ye guide code se banayi gayi hai: har env variable ka naam aur default value `config.py` se, aur har command `bot.py` se liya gaya hai.
-> Hosting: **Koyeb** • Database: **MongoDB (Atlas)** • Library: Pyrogram 2.0.106 + yt-dlp + aria2c + ffmpeg.
+> Hosting: **Koyeb** • Database: **MongoDB (Atlas)** • Library: **wzgram** (Pyrogram fork) + yt-dlp + gallery-dl + aria2c + ffmpeg.
 
 ---
 
@@ -104,16 +104,11 @@ Baaki sab ke **default theek** hain. Neeche har variable ka asar likha hai.
 ### 3.4 Speed — Upload
 | Env | Default | Kya karta hai → badalne par kya hoga |
 |---|---|---|
-| `UPLOAD_CONNECTIONS` | 8 | Ek badi file ke liye max MTProto connections (1–16). Zyada → tez, par Telegram timeouts/FloodWait de sakta hai. Auto-tune isse **neeche** ghata/badha sakta hai, upar nahi |
-| `UPLOAD_WORKERS_PER_CONNECTION` | 4 | Har connection par ek saath bheje jaane wale 512 KB parts (1–8) |
-| `UPLOAD_ADAPTIVE` | true | File size ke hisab se connections: <10 MB → 1, <40 MB → 2, <150 MB → 4, <400 MB → 6, uske upar max. `false` → hamesha max (speedtest isi ke liye ise temporary off karta hai) |
-| `AUTOTUNE` | true | Upload timeouts par connections 30% kam, 2 clean uploads par +1 (min 2). Value DB me save hoti hai |
-| `SESSION_REUSE` | true | Upload connections files ke beech warm rakhta hai (har file par ~1–2 s bachta hai). Idle 120 s baad band |
 | `MAX_CONCURRENT_TRANSMISSIONS` | 6 | Ek client par ek saath upload streams |
 | `SPLIT_SIZE_MB` | 1950 | >2 GB files is size ke parts me kati jaati hain (Telegram bot limit 2 GB) |
 | `PROGRESS_UPDATE_INTERVAL` | 10 | Progress message kitne second me edit ho (min 5). Kam → FloodWait ka risk |
 
-> **Tune kaise karein:** admin `/speedtest 400 8 4` (MB, connections, workers) chalao → asli MB/s batata hai. `12 4`, `6 6` try karke best value env me daalo.
+> **Speed check:** admin `/speedtest 200` chalao → asli MB/s batata hai (upload engine: wzgram).
 
 ### 3.5 Queue / Limits
 | Env | Default | Kya karta hai → badalne par kya hoga |
@@ -202,7 +197,6 @@ Bot link dekhkar khud decide karta hai:
 ### 4.2 Upload kaise hota hai (speed)
 - Custom fast uploader: file size ke hisab se 1–8 connections × 4 workers.
 - Part-level **retry** + **FloodWait handling** (part khona nahi).
-- **Auto-tune**: timeouts aaye → connections kam; stable → dheere badhte hain.
 - **Session reuse**: connections warm rehte hain.
 - `uvloop` (kam CPU), disk read thread me.
 
@@ -348,7 +342,7 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | Command | Kaam |
 |---|---|
 | `/stats` | CPU/RAM/disk %, jobs, uploaders, tuner, DB, keep-alive, aaj/total usage |
-| `/speedtest [MB] [conns] [workers]` | Random data upload karke asli MB/s |
+| `/speedtest [MB]` | Random data upload karke asli MB/s |
 | `/helpers` | Helper bots ka status + wajah |
 | `/testlog` | Log channel check + test message |
 | `/cleanup` | Disk safai |
@@ -424,10 +418,8 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | Link `127.0.0.1` / `192.168…` ho | Block: "private / internal address" |
 | Expired direct link (HTML page) | "HTML page mila" error, file nahi |
 | Torrent 8 GB se bada | Abort: "above the 8 GB limit" |
-| `UPLOAD_CONNECTIONS=16` kiya | Zyada speed ho sakti hai, par timeouts par auto-tune khud kam karega |
 | `MAX_CONCURRENT_JOBS=1` | Poore bot par ek hi file ek time par |
 | `PIPELINE=false` | Download aur upload overlap nahi; strict ek-ek |
-| `AUTOTUNE=false` | Connections hamesha `UPLOAD_CONNECTIONS` (size-based scaling ke saath) |
 | `YTDLP_UPDATE_HOURS=0` | Auto-update restart band (start par update `YTDLP_UPDATE_ON_START` se) |
 | `KEEPALIVE_URL` na ho aur `KOYEB_PUBLIC_DOMAIN` bhi na mile | Keep-alive OFF; log me warning; `/uptime` me "no public URL" |
 | `/clearlinks all` | Cache + orphan queue records saaf; premium/users/settings/codes **nahi** chhute |
@@ -451,7 +443,6 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | `no audio found by any strategy` | Source me audio hai hi nahi / login cookies chahiye |
 | `sound added using: …` | Audio mux ho gaya |
 | `converting opus audio to AAC` | Telegram-safe audio |
-| `Upload auto-tune: connections 8 -> 5` | Timeouts mile, connections kam kiye |
 | `Upload FloodWait: sleeping Ns` | Part ke liye FloodWait, wait + retry |
 | `Janitor freed N MB` | Auto-clean chala |
 | `Keep-alive ping failed (status …)` | `KEEPALIVE_URL` / public domain check |
@@ -510,3 +501,14 @@ HELPER_BOT_TOKENS=       # extra bots
 DAILY_LIMIT_GB=0
 DISK_CLEAN_PERCENT=90
 ```
+
+## v7 additions
+| Setting | Default | Matlab |
+|---|---|---|
+| `GALLERYDL_ENABLED` | true | yt-dlp fail ho to gallery-dl fallback (sab users) |
+| `GALLERY_MAX_FILES` | 30 | Ek gallery link se max files |
+| `GALLERY_PROBE_TIMEOUT` | 60 | Gallery link analyse karne ka max time (sec) |
+| `HELPER_FIRST` | true | Helpers ready hon to pehle wahi upload karein |
+| `TXT_MAX_URLS` / `TXT_MAX_FILE_KB` / `TXT_RESTORE_MAX_AGE_H` | 2000 / 2048 / 168 | TXT upload limits |
+
+Admin commands: `/setcookies` `/cookies` `/delcookies` • `/addplus` `/removeplus` `/pluslist`. User: `/stoptxt`.

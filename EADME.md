@@ -1,6 +1,6 @@
 # URL Uploader Bot (v2)
 
-Telegram URL uploader — Pyrogram + yt-dlp + aria2c + ffmpeg. Sirf **Admin + Premium users** use kar sakte hain.
+Telegram URL uploader — **wzgram** (Pyrogram fork) + yt-dlp + gallery-dl (fallback) + aria2c + ffmpeg. Sirf **Admin + Premium users** use kar sakte hain.
 
 ## Features
 - **Direct link** → turant download start (aria2c, 16 connections) → upload
@@ -20,7 +20,7 @@ Telegram URL uploader — Pyrogram + yt-dlp + aria2c + ffmpeg. Sirf **Admin + Pr
 | `/premiumlist` | Sab premium users + expiry |
 | `/testlog` | Log channel check + test message |
 | `/helpers` | Helper bots ka status (ready / disabled + wajah) |
-| `/speedtest [MB] [conns] [workers]` | Asli upload speed naapo aur settings tune karo |
+| `/speedtest [MB]` | Asli upload speed naapo (wzgram) |
 | `/update` , `/restart` | yt-dlp update / bot restart |
 
 User commands: `/start /queue /cancel /myplan /id` (non-premium user ko apni ID dikhti hai jo admin ko bhejni hai).
@@ -42,13 +42,13 @@ Koyeb: port 8080, health check `/health`. Persistent volume `/app/data` laga sak
 
 ## Speed (v3)
 **Kya badla:**
-- `fastupload.py`: file size ke hisab se 2-8 MTProto connections x 4 workers (default max 8x4 = 32 parts in flight), disk read thread me, **per-part FloodWait handling + retry** (pehle part chupchap fail ho sakta tha).
+- **Upload engine = wzgram** (Pyrogram ka drop-in fork, Rust crypto, paced uploads). Purana `fastupload.py` aur `UPLOAD_*` / `AUTOTUNE` settings hata diye gaye hain.
 - `uvloop` (kam CPU per MB), aria2c disk-cache, aria2 fail ho to 16 → 4 → 1 connection fallback.
 - **Multi-bot**: `HELPER_BOT_TOKENS` (neeche).
 - **FloodWait**: Pyrogram `FLOOD_SLEEP_THRESHOLD` (600s) tak khud sleep karke *same request* retry karta hai (upload dobara nahi hota). Usse lamba wait `FLOOD_MAX_WAIT` (3600s) tak bot khud wait karta hai aur user ko message dikhata hai. Progress-edit FloodWait/slow-edit par us chat ke edits kuch der skip hote hain (job kabhi nahi rukta); Bot API (log channel) 429 par `retry_after` tak ruk kar retry; log channel requests ek-ek karke jaati hain.
 - Default `ADMIN_ID` ab 0 hai (pehle kisi aur ki ID hard-coded thi). `ADMIN_ID` env me daalna **zaruri** hai.
 
-**Speed tune karna:** `/speedtest 400 8 4` (MB, connections, workers) — random data upload karke asli MB/s batata hai. Alag values try karo (`/speedtest 400 12 4`, `/speedtest 400 6 6`) aur best ko env me set karo. Bahut zyada connections par Telegram FloodWait/throttle de sakta hai.
+**Speed check:** `/speedtest 200` — random data upload karke asli MB/s batata hai.
 
 **Asli limit kahan hai (Koyeb):**
 1. **Region**: bot ka home DC startup log me aata hai (`Bot home DC`). DC2/DC4 = Amsterdam → Koyeb **Frankfurt**; DC1/DC3 = Miami → **Washington D.C.**; DC5 = Singapore → **Singapore**. Telegram se RTT kam = upload tez.
@@ -73,7 +73,6 @@ Setup: Atlas me free cluster → *Database Access* me user banao → *Network Ac
 | **Queue restart-proof** | Har job DB me save hota hai. Redeploy/restart ke baad queue usi order me wapas aati hai, user ko message milta hai. 3 baar crash karne wali job ya 24h se purani job drop ho jati hai. |
 | **Download ∥ Upload (PIPELINE)** | File N upload hote waqt N+1 download hoti hai. Per user max 2 files disk par. Upload order hamesha queue order me. `PIPELINE=false` = pura ek-ek. |
 | **URL cache** | Same link + same quality dobara bhejo → `file_id` se turant resend (0 download/upload). Custom thumb/rename wale jobs cache bypass karte hain. `/clearlinks` (admin; sirf saved links + orphan queue records saaf karta hai, baaki DB nahi). Sirf main bot ke file_id (helper-delivered files bhi cache hote hain). |
-| **Auto-tune upload** | Part 8s se zyada le (timeouts) → connections 30% kam; 2 clean uploads → +1. 2..`UPLOAD_CONNECTIONS` ke beech. Warm connections reuse hote hain. |
 | **Disk guard** | Download se pehle size check (split wali files ~2x). Doosri jobs chal rahi hon to space ka intezaar (10 min), warna saaf error. Download ke dauran disk bhar rahi ho to rok kar admin ko alert. |
 | **SSRF block** | localhost / private IP / 169.254.x.x (cloud metadata) / redirects — sab block (`SSRF_PROTECTION`). |
 | **yt-dlp auto-update** | Idle hone par har `YTDLP_UPDATE_HOURS` ghante (aur start ke 90s baad) update + naya version bina restart ke load. |
@@ -119,3 +118,9 @@ Container har start par newest yt-dlp install karta hai (`YTDLP_UPDATE_ON_START`
 
 ## Cookies
 Login-wale sites ke liye Netscape `cookies.txt` (ya `COOKIES_TEXT`). Kabhi share/commit mat karo. Sirf apne authorized content ke liye use karo.
+
+## v7: gallery-dl fallback, cookies, wzgram, helper fix, TXT upload
+- **gallery-dl (fallback):** yt-dlp link na samjhe (image galleries, Instagram/Twitter/Pinterest posts ...) to bot apne aap gallery-dl try karta hai. Sab allowed users (Premium + Admin) ke liye. Ek link se kai file mili to "File 1/5" ... ke roop me jaati hain. Limits: `GALLERYDL_ENABLED`, `GALLERY_MAX_FILES` (30), `GALLERY_PROBE_TIMEOUT` (60).
+- **Cookies:** Admin `cookies.txt` (Netscape) bot ko caption `/setcookies` ke saath bheje (ya file par reply karke `/setcookies`). DB me save hoti hai (redeploy me bachti hai) aur yt-dlp, gallery-dl, aria2, direct links sab use karte hain. `/cookies` = status (values kabhi nahi dikhte), `/delcookies` = hatao. Priority: `/setcookies` > `COOKIES_TEXT` env > `cookies.txt` file.
+- **Helper bots:** ab ready hone par pehle helpers upload karte hain (`HELPER_FIRST=true`), disabled helper har 5 min me khud dobara check hota hai, 3 lagataar fail par 5 min rest, aur channel ka peer DB me yaad rehta hai. `/helpers` me wajah dikhti hai.
+- **TXT upload (Premium Plus):** `/addplus id [days]`, `/removeplus id`, `/pluslist`; user `.txt` bheje (ek line = ek link), Best quality, ek download + ek upload, restart par wahin se resume, `/stoptxt`.

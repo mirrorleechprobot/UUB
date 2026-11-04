@@ -51,9 +51,6 @@ PORT = env_int("PORT", 8080)
 # ---- speed / limits ----
 ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", 16)))      # connections per download
 CONCURRENT_FRAGMENTS = max(1, min(32, env_int("CONCURRENT_FRAGMENTS", 32))) # HLS/DASH fragments in parallel
-UPLOAD_CONNECTIONS = max(1, min(16, env_int("UPLOAD_CONNECTIONS", 8)))               # MTProto connections per uploaded file (big files)
-UPLOAD_ADAPTIVE = env_bool("UPLOAD_ADAPTIVE", True)      # small/medium files use fewer connections (less handshake cost)
-UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, env_int("UPLOAD_WORKERS_PER_CONNECTION", 4)))  # parts (512 KB) in flight per connection
 MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
 MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
@@ -93,9 +90,6 @@ QUEUE_RESTORE_MAX_AGE_H = max(1, env_int("QUEUE_RESTORE_MAX_AGE_H", 24))   # que
 CACHE_ENABLED = env_bool("CACHE_ENABLED", True)
 CACHE_TTL_DAYS = max(1, env_int("CACHE_TTL_DAYS", 30))
 
-# ---- upload auto-tune (lowers connections on timeouts, raises them again when stable) ----
-AUTOTUNE = env_bool("AUTOTUNE", True)
-SESSION_REUSE = env_bool("SESSION_REUSE", True)               # keep upload connections warm between files
 
 # ---- safety ----
 SSRF_PROTECTION = env_bool("SSRF_PROTECTION", True)           # refuse localhost / private-network / cloud-metadata links
@@ -126,3 +120,14 @@ KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
 # When the disk is this % full the bot cleans everything that no running job owns (orphaned folders, caches). Safe:
 # live jobs and anything younger than 2 minutes are never touched.
 DISK_CLEAN_PERCENT = max(50, min(99, env_int("DISK_CLEAN_PERCENT", 90)))
+
+# ---- Premium Plus: TXT file upload (one link per line) ----
+TXT_MAX_URLS = max(1, min(10000, env_int("TXT_MAX_URLS", 2000)))                 # links read from one .txt file
+TXT_MAX_FILE_KB = max(10, min(5120, env_int("TXT_MAX_FILE_KB", 2048)))           # biggest .txt file accepted
+TXT_RESTORE_MAX_AGE_H = max(1, env_int("TXT_RESTORE_MAX_AGE_H", 168))            # a TXT task older than this is dropped after a restart
+
+# ---- gallery-dl (fallback downloader) ----
+GALLERYDL_ENABLED = env_bool("GALLERYDL_ENABLED", True)
+GALLERY_MAX_FILES = max(1, min(200, env_int("GALLERY_MAX_FILES", 30)))              # files taken from one gallery link
+GALLERY_PROBE_TIMEOUT = max(10, min(300, env_int("GALLERY_PROBE_TIMEOUT", 60)))     # seconds
+HELPER_FIRST = env_bool("HELPER_FIRST", True)                                       # helper bots upload first when they are ready

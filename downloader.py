@@ -2,10 +2,12 @@
 
 - probe():          decide direct-file vs yt-dlp media, and build quality options
 - download():       aria2c (multi-connection) -> requests fallback for direct links,
-                    yt-dlp (+aria2c for plain HTTP, parallel fragments for HLS/DASH) for media
+                    yt-dlp (+aria2c for plain HTTP, parallel fragments for HLS/DASH) for media,
+                    gallery-dl as the FALLBACK (image galleries / posts that yt-dlp cannot handle)
 - prepare_upload(): ffprobe metadata, thumbnail, remux to mp4, split files > 2 GB
 """
 import http.cookiejar
+import importlib.util
 import json
 import logging
 import mimetypes
@@ -13,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -46,15 +49,50 @@ TEMP_SUFFIXES = (".part", ".ytdl", ".aria2", ".temp", ".tmp")
 
 HAVE_ARIA2 = shutil.which("aria2c") is not None
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+HAVE_GALLERYDL = importlib.util.find_spec("gallery_dl") is not None
 
 
 # --------------------------------------------------------------------------- cookies / session
 
+_runtime_cookies = ""        # set by the bot from the database (Admin command /setcookies)
+
+
+def set_runtime_cookies(text):
+    global _runtime_cookies
+    _runtime_cookies = (text or "").strip()
+
+
+def runtime_cookies():
+    return _runtime_cookies
+
+
+def normalize_cookies(text):
+    """Return (clean_netscape_text, cookie_count, domains). Accepts tabs or spaces between the 7 fields. No cookie -> ('', 0, [])."""
+    lines, domains = [], set()
+    for raw in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            parts = line.split(None, 6)
+        if len(parts) != 7 or parts[1].upper() not in ("TRUE", "FALSE") or parts[3].upper() not in ("TRUE", "FALSE"):
+            continue
+        lines.append("\t".join(parts))
+        domains.add(parts[0].replace("#HttpOnly_", "").lstrip("."))
+    if not lines:
+        return "", 0, []
+    return "# Netscape HTTP Cookie File\n" + "\n".join(lines) + "\n", len(lines), sorted(domains)
+
+
 def cookie_path():
-    """Netscape cookie file: COOKIES_TEXT env (secret) wins over the cookies.txt file."""
-    if config.COOKIES_TEXT.strip():
+    """Netscape cookie file. Priority: Admin /setcookies (database) > COOKIES_TEXT env (secret) > cookies.txt file."""
+    text = _runtime_cookies or config.COOKIES_TEXT.strip()
+    if text:
         path = Path(tempfile.gettempdir()) / "uub-cookies.txt"
-        path.write_text(config.COOKIES_TEXT.strip() + "\n", encoding="utf-8")
+        path.write_text(text.strip() + "\n", encoding="utf-8")
         try:
             path.chmod(0o600)
         except OSError:
@@ -239,11 +277,17 @@ def probe(url):
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001
         msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:300]
+        gal = gallery_probe(url)               # yt-dlp cannot read it: maybe it is an image gallery / post (gallery-dl)
+        if gal:
+            return gal
         if http_info is None or http_info["status"] >= 400:
             # Page unreachable for our probe; let the downloader try anyway (signed/odd URLs).
             raise ProbeError(f"Could not open this link ({http_err or 'HTTP ' + str(http_info['status'])}). {msg}")
         raise ProbeError(f"No downloadable video, audio or file found at this link. {msg}")
     if not info:
+        gal = gallery_probe(url)
+        if gal:
+            return gal
         raise ProbeError("No media found at this link.")
 
     if info.get("_type") == "playlist":
@@ -260,9 +304,134 @@ def probe(url):
 
     options = _build_options(info)
     if not options:
+        gal = gallery_probe(url)
+        if gal:
+            return gal
         raise ProbeError("No downloadable format found.")
     return {"kind": "media", "title": info.get("title") or url, "duration": info.get("duration") or 0,
             "uploader": info.get("uploader") or "", "options": options}
+
+
+# --------------------------------------------------------------------------- gallery-dl (FALLBACK when yt-dlp cannot handle a link)
+def gallery_enabled():
+    return config.GALLERYDL_ENABLED and HAVE_GALLERYDL
+
+
+def _gallery_cmd():
+    cmd = [sys.executable, "-m", "gallery_dl"]
+    cp = cookie_path()
+    if _cookies_usable(cp):
+        cmd += ["--cookies", str(cp)]
+    return cmd
+
+
+def _json_values(text):
+    """gallery-dl --dump-json prints one JSON array per input link (possibly several, possibly pretty-printed)."""
+    dec, pos, out = json.JSONDecoder(), 0, []
+    text = text.strip()
+    while pos < len(text):
+        try:
+            val, end = dec.raw_decode(text, pos)
+        except ValueError:
+            break
+        out.append(val)
+        pos = end
+        while pos < len(text) and text[pos] in " \r\n\t":
+            pos += 1
+    return out
+
+
+def gallery_probe(url):
+    """{"kind": "gallery", ...} if gallery-dl knows this link and it holds files, else None. Never raises."""
+    if not gallery_enabled():
+        return None
+    cmd = _gallery_cmd() + ["--dump-json", "--range", f"1-{config.GALLERY_MAX_FILES}", url]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=config.GALLERY_PROBE_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.info("gallery-dl probe: %s", type(exc).__name__)
+        return None
+    out = r.stdout.decode("utf-8", errors="ignore")
+    files, meta = 0, {}
+    for value in _json_values(out):
+        for msg in value if isinstance(value, list) else []:
+            if not isinstance(msg, list) or not msg:
+                continue
+            if msg[0] == 3:
+                files += 1
+            elif msg[0] == 2 and len(msg) > 1 and isinstance(msg[1], dict) and not meta:
+                meta = msg[1]
+    if files == 0:
+        log.info("gallery-dl probe: nothing for %s (%s)", url[:80], r.stderr.decode("utf-8", errors="ignore").strip()[-150:])
+        return None
+    title = ""
+    for key in ("title", "gallery", "description", "content", "caption", "album", "board", "fullname", "username"):
+        val = meta.get(key)
+        if isinstance(val, dict):
+            val = val.get("title") or val.get("name")
+        if isinstance(val, str) and val.strip():
+            title = " ".join(val.split())[:100]
+            break
+    if not title:
+        title = f"{meta.get('category', 'gallery')} {meta.get('subcategory', '')}".strip()
+    return {"kind": "gallery", "title": f"{title} ({files} file{'s' if files != 1 else ''})", "count": files, "size": 0}
+
+
+def download_gallery(url, workdir, progress, cancel, title=""):
+    """gallery-dl -> every file of the link into workdir (one result, or several: result["paths"])."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    cmd = _gallery_cmd() + ["-D", str(workdir), "-f", "{num:>03}_{filename}.{extension}", "--range", f"1-{config.GALLERY_MAX_FILES}",
+                            "-R", str(config.MAX_RETRIES), url]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    done = threading.Event()
+
+    def folder_bytes():
+        total = 0
+        try:
+            for p in workdir.iterdir():
+                if p.is_file():
+                    total += p.stat().st_size
+        except OSError:
+            pass
+        return total
+
+    def watcher():
+        last_b, last_t = 0, time.monotonic()
+        while not done.wait(1.0):
+            if cancel.is_set() and proc.poll() is None:
+                proc.terminate()
+                return
+            now, cur = time.monotonic(), folder_bytes()
+            speed = max(0, cur - last_b) / max(0.001, now - last_t)
+            last_b, last_t = cur, now
+            progress.update({"status": "downloading", "current": cur, "total": 0, "speed": speed, "eta": None})
+
+    threading.Thread(target=watcher, daemon=True).start()
+    tail = []
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line and line.startswith("[") :             # [error] / [warning] lines (downloaded file paths are not kept)
+                tail.append(line)
+                tail = tail[-6:]
+        proc.wait()
+    finally:
+        done.set()
+        if proc.poll() is None:
+            proc.kill()
+    if cancel.is_set():
+        raise Cancelled()
+    files = sorted(p for p in workdir.iterdir() if p.is_file() and not p.name.endswith(TEMP_SUFFIXES))
+    if not files:
+        reason = " | ".join(tail)[-250:] or f"exit code {proc.returncode}"
+        raise RuntimeError("gallery-dl found nothing to download: " + reason)
+    if proc.returncode not in (0, None):
+        log.warning("gallery-dl finished with code %s but %s file(s) were downloaded (partial)", proc.returncode, len(files))
+    title = re.sub(r"\s*\(\d+ files?\)\s*$", "", title or "").strip() or files[0].stem
+    result = {"path": files[0], "title": title if len(files) > 1 else files[0].name}
+    if len(files) > 1:
+        result["paths"] = files
+    return result
 
 
 # --------------------------------------------------------------------------- downloading
@@ -630,7 +799,25 @@ def download(job, workdir):
         raise RuntimeError(str(exc)) from exc
     if job.mode == "direct":
         return download_direct(job.url, workdir, job.progress, job.cancel, job.direct_name, job.direct_size)
-    return download_media(job.url, job.option, workdir, job.progress, job.cancel)
+    if job.mode == "gallery":
+        return download_gallery(job.url, workdir, job.progress, job.cancel, job.title)
+    try:
+        return download_media(job.url, job.option, workdir, job.progress, job.cancel)
+    except Cancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if job.cancel.is_set() or not gallery_enabled():
+            raise
+        log.info("yt-dlp failed (%s); trying gallery-dl", type(exc).__name__)
+        for leftover in workdir.iterdir():                  # remove yt-dlp leftovers before the second downloader starts
+            shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+        try:
+            return download_gallery(job.url, workdir, job.progress, job.cancel, job.title)
+        except Cancelled:
+            raise
+        except Exception as gexc:  # noqa: BLE001
+            log.info("gallery-dl fallback failed too: %s", str(gexc)[:150])
+            raise exc
 
 
 # --------------------------------------------------------------------------- post-processing
