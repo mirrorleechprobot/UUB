@@ -50,7 +50,7 @@ PORT = env_int("PORT", 8080)
 
 # ---- speed / limits ----
 ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", 16)))      # connections per download
-CONCURRENT_FRAGMENTS = max(1, min(32, env_int("CONCURRENT_FRAGMENTS", 32))) # HLS/DASH fragments in parallel
+CONCURRENT_FRAGMENTS = max(1, min(64, env_int("CONCURRENT_FRAGMENTS", 48))) # HLS/DASH fragments in parallel
 MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
 MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
@@ -131,3 +131,6 @@ GALLERYDL_ENABLED = env_bool("GALLERYDL_ENABLED", True)
 GALLERY_MAX_FILES = max(1, min(200, env_int("GALLERY_MAX_FILES", 30)))              # files taken from one gallery link
 GALLERY_PROBE_TIMEOUT = max(10, min(300, env_int("GALLERY_PROBE_TIMEOUT", 60)))     # seconds
 HELPER_FIRST = env_bool("HELPER_FIRST", True)                                       # helper bots upload first when they are ready
+
+# ---- download speed ----
+FORCE_SPEED = env_bool("FORCE_SPEED", True)     # aggressive aria2 / yt-dlp options (adaptive mirrors, drops slow connections, bigger buffers)

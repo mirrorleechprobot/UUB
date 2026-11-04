@@ -96,7 +96,7 @@ Baaki sab ke **default theek** hain. Neeche har variable ka asar likha hai.
 |---|---|---|
 | `ARIA2_CONNECTIONS` | 16 | Ek file ke liye aria2c connections (max 16). Server 403/429 de to bot khud 16 → 4 → 1 connection fallback karta hai |
 | `ARIA2_DISK_CACHE_MB` | 64 | aria2 ka RAM disk-cache (0–512). Zyada → kam disk writes; chhoti RAM par kam rakho |
-| `CONCURRENT_FRAGMENTS` | 32 | HLS/DASH (YouTube, m3u8) fragments ek saath. Zyada → tez, par server block kar sakta hai |
+| `CONCURRENT_FRAGMENTS` | 48 (max 64) | HLS/DASH (YouTube, m3u8) fragments ek saath. Zyada → tez, par server block kar sakta hai |
 | `MAX_RETRIES` | 3 | Download retry count (1–10) |
 | `DIRECT_REFERER` | "" | Direct link ke liye Referer header (kuch sites ke liye) |
 | `DIRECT_USER_AGENT` | Chrome UA | Direct downloads ka User-Agent |
@@ -512,3 +512,4 @@ DISK_CLEAN_PERCENT=90
 | `TXT_MAX_URLS` / `TXT_MAX_FILE_KB` / `TXT_RESTORE_MAX_AGE_H` | 2000 / 2048 / 168 | TXT upload limits |
 
 Admin commands: `/setcookies` `/cookies` `/delcookies` • `/addplus` `/removeplus` `/pluslist`. User: `/stoptxt`.
+| `FORCE_SPEED` | true | Aggressive download options: aria2 adaptive mirrors, slow connections (<20 KB/s) dropped and retried, bigger buffers, unlimited torrent peers. `false` = purane safe options |

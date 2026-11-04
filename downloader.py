@@ -445,6 +445,37 @@ def _unit_bytes(value, unit):
 _ARIA_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)\((\d+)%\).*?DL:([\d.]+)(B|KiB|MiB|GiB)")
 
 
+_ARIA_HELP = None
+
+
+def _aria_supports(flag):
+    """True if the installed aria2c knows this option (an unknown option would make the whole download fail)."""
+    global _ARIA_HELP
+    if _ARIA_HELP is None:
+        try:
+            _ARIA_HELP = subprocess.run(["aria2c", "--help=#all"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        timeout=10).stdout.decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            _ARIA_HELP = ""
+    return flag.split("=")[0] in _ARIA_HELP
+
+
+def aria_force_args(torrent=False):
+    """FORCE_SPEED: aggressive aria2 options (only those the installed aria2c supports)."""
+    if not config.FORCE_SPEED:
+        return []
+    wanted = ["--max-concurrent-downloads=16", "--optimize-concurrent-downloads=true", "--check-integrity=false",
+              "--realtime-chunk-checksum=false", "--conditional-get=false", "--http-no-cache=true", "--no-netrc=true",
+              "--max-download-limit=0", "--max-overall-download-limit=0"]
+    if torrent:
+        wanted += ["--bt-max-peers=0", "--bt-request-peer-speed-limit=100M", "--bt-max-open-files=200",
+                   "--bt-prioritize-piece=head=8M,tail=8M"]
+    else:
+        wanted += ["--uri-selector=adaptive", "--stream-piece-selector=geom", "--retry-wait=1",
+                   "--lowest-speed-limit=20K", "--max-resume-failure-tries=5"]
+    return [a for a in wanted if _aria_supports(a)]
+
+
 def _aria2(url, target, progress, cancel, expected_size, connections=None):
     n = connections or config.ARIA2_CONNECTIONS
     cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
@@ -452,7 +483,7 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None):
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true", "-c",
            "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
            f"--max-tries={config.MAX_RETRIES + 2}", "--retry-wait=3", "--connect-timeout=20", "--timeout=60",
-           "--user-agent=" + config.DIRECT_USER_AGENT, "-d", str(target.parent), "-o", target.name]
+           "--user-agent=" + config.DIRECT_USER_AGENT, "-d", str(target.parent), "-o", target.name] + aria_force_args()
     if config.DIRECT_REFERER:
         cmd.append("--referer=" + config.DIRECT_REFERER)
     cp = cookie_path()
@@ -538,7 +569,7 @@ def download_torrent(url, workdir, progress, cancel):
            "--follow-torrent=true", "--bt-save-metadata=false", "--bt-tracker=" + trackers,
            "--max-overall-upload-limit=256K", f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M",
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true",
-           "--summary-interval=1", "--console-log-level=warn", "--download-result=hide", "-d", str(workdir), url]
+           "--summary-interval=1", "--console-log-level=warn", "--download-result=hide", "-d", str(workdir)] + aria_force_args(torrent=True) + [url]
     progress.update({"status": "downloading", "current": 0, "total": 0, "speed": 0, "eta": None})
     _aria2_proc(cmd, progress, cancel, 0, max_bytes=config.TORRENT_MAX_GB * 1024 ** 3)
     files = [p for p in workdir.rglob("*") if p.is_file() and not p.name.endswith(TEMP_SUFFIXES + (".torrent",))]
@@ -568,7 +599,7 @@ def _requests_download(url, target, progress, cancel):
             total = int(r.headers.get("Content-Length") or 0)
             current, last_bytes, last_time = 0, 0, time.monotonic()
             with target.open("wb") as out:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024):
                     if cancel.is_set():
                         raise Cancelled()
                     if not chunk:
@@ -731,7 +762,7 @@ def download_media(url, option, workdir, progress, cancel):
         opts = ytdlp_base_opts()
         opts.update({
             "outtmpl": str(workdir / "%(title).150B [%(id)s].%(ext)s"),
-            "continuedl": True, "overwrites": False, "file_access_retries": config.MAX_RETRIES,
+            "continuedl": True, "overwrites": False, "buffersize": 4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024, "file_access_retries": config.MAX_RETRIES,
             "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS,
             "progress_hooks": [hook], "http_chunk_size": 10 * 1024 * 1024,
             "ignoreerrors": False,
@@ -752,7 +783,7 @@ def download_media(url, option, workdir, progress, cancel):
             n = config.ARIA2_CONNECTIONS
             opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
             opts["external_downloader_args"] = {"aria2c": [f"-x{n}", f"-s{n}", "-k1M", "--file-allocation=none",
-                                                            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M"]}
+                                                            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M"] + aria_force_args()}
             opts.pop("http_chunk_size", None)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)

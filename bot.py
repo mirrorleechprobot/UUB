@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import hashlib
+import inspect
 import html
 import io
 import itertools
@@ -86,7 +87,8 @@ Path(config.DATA_DIR).mkdir(parents=True, exist_ok=True)
 POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="uub")          # downloads / ffmpeg (one thread per running job)
 API_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="uub-api")   # Bot API calls: never starved by long downloads
 state = {"ready": False, "bot_id": 0, "log_ok": False, "shutting_down": False, "started": time.time()}
-URL_RE = re.compile(r"(?:https?://|magnet:\?)[^\s<>\"']+", re.I)
+URL_RE = re.compile(r"(?:https?://|magnet:\?)[^\s<>\"“”]+", re.I)     # an apostrophe is valid inside a URL (Tom.Clancy's.Jack.Ryan...)
+URL_TRAIL = ".,;:!?)]}'’‘"                                           # punctuation / closing quote stuck to the end of a link
 PENDING_TTL = 30 * 60
 
 
@@ -1418,7 +1420,7 @@ async def save_helper_peers(uc):
     if conn is None or not config.PERSIST_SESSION:
         return
     try:
-        blob = _export_conn_peers(conn)
+        blob = await _export_conn_peers_async(conn)
         if blob:
             await db.put_blob(f"peers_helper_{uc.id}", blob)
     except Exception as exc:  # noqa: BLE001
@@ -1432,7 +1434,7 @@ async def load_helper_peers(uc):
     try:
         blob = await db.get_blob(f"peers_helper_{uc.id}")
         if blob:
-            _import_conn_peers(conn, blob)
+            await _import_conn_peers(conn, blob)
     except Exception as exc:  # noqa: BLE001
         log.info("[%s] could not restore its peer cache: %s", uc.name, type(exc).__name__)
 
@@ -2844,10 +2846,10 @@ def parse_links(text):
     """[(url, custom_name|None)] in the order sent. A line 'link | new name.ext' renames that file."""
     out, seen = [], set()
     for line in (text or "").splitlines():
-        found = [u.rstrip(".,;:!?)]}") for u in URL_RE.findall(line)]
+        found = [u.rstrip(URL_TRAIL) for u in URL_RE.findall(line)]
         name = None
         if len(found) == 1:
-            rest = line.split(URL_RE.findall(line)[0], 1)[1].strip()
+            rest = line.split(URL_RE.findall(line)[0], 1)[1].lstrip("\"'”’").strip()
             if rest.startswith("|"):
                 name = rest[1:].strip()[:150] or None
         for u in found:
@@ -3422,26 +3424,50 @@ def _export_peers_sync():
         con.close()
 
 
-def _import_peers_sync(blob):
-    conn = getattr(app.storage, "conn", None)
-    return 0 if conn is None else _import_conn_peers(conn, blob)
+async def _db(x):
+    """wzgram's storage is async (aiosqlite), stock Pyrogram's is sync: accept both."""
+    return await x if inspect.isawaitable(x) else x
 
 
-def _import_conn_peers(conn, blob):
+async def _export_conn_peers_async(con):
+    import gzip
+    import json
+    out = {}
+    for table in ("peers", "usernames"):
+        try:
+            cur = await _db(con.execute(f"SELECT * FROM {table}"))
+            cols = [c[0] for c in cur.description]
+            out[table] = {"columns": cols, "rows": [list(r) for r in await _db(cur.fetchall())]}
+        except Exception:  # noqa: BLE001  (table missing in this storage format)
+            continue
+    return gzip.compress(json.dumps(out).encode()) if out else None
+
+
+async def _import_conn_peers(conn, blob):
+    """Insert saved peers into a storage connection (sync sqlite3 or async aiosqlite). Returns the number of rows."""
     import gzip
     import json
     data, n = json.loads(gzip.decompress(blob)), 0
     for table, d in data.items():
-        have = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        try:
+            cur = await _db(conn.execute(f"PRAGMA table_info({table})"))
+            have = [r[1] for r in await _db(cur.fetchall())]
+        except Exception:  # noqa: BLE001
+            continue
         cols = [c for c in d["columns"] if c in have]
         if not cols:
             continue
         idx = [d["columns"].index(c) for c in cols]
-        conn.executemany(f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                         [[row[i] for i in idx] for row in d["rows"]])
+        await _db(conn.executemany(f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                                   [[row[i] for i in idx] for row in d["rows"]]))
         n += len(d["rows"])
-    conn.commit()
+    await _db(conn.commit())
     return n
+
+
+async def _import_peers(blob):
+    conn = getattr(app.storage, "conn", None)
+    return 0 if conn is None else await _import_conn_peers(conn, blob)
 
 
 async def save_peers(force=False):
@@ -3468,7 +3494,7 @@ async def load_peers():
     blob = await db.get_blob("peers")
     if blob:
         try:
-            log.info("Peer cache restored: %s entries", _import_peers_sync(blob))
+            log.info("Peer cache restored: %s entries", await _import_peers(blob))
         except Exception as exc:  # noqa: BLE001
             log.warning("peer cache restore failed: %s", type(exc).__name__)
 
