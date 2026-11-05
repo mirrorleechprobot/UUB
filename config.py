@@ -134,3 +134,7 @@ HELPER_FIRST = env_bool("HELPER_FIRST", True)                                   
 
 # ---- download speed ----
 FORCE_SPEED = env_bool("FORCE_SPEED", True)     # aggressive aria2 / yt-dlp options (adaptive mirrors, drops slow connections, bigger buffers)
+
+# ---- video without sound: how hard to look for the audio (candidates are probed remotely first, no re-download) ----
+AUDIO_SEARCH_MAX_SEC = max(10, min(1800, env_int("AUDIO_SEARCH_MAX_SEC", 240)))
+AUDIO_SEARCH_MAX_CANDIDATES = max(1, min(20, env_int("AUDIO_SEARCH_MAX_CANDIDATES", 6)))
