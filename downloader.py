@@ -687,37 +687,90 @@ def _fetch_format(url, workdir, fmt, tag):
     return [p for p in files if p.is_file()] or sorted(workdir.glob(f"*.{tag}.*"))
 
 
-# Tried in this order when a downloaded video has no sound. The site's own format labels are NOT trusted (Instagram /
-# Facebook often leave acodec empty), only what ffprobe finds inside the downloaded files.
-AUDIO_FALLBACKS = (("audio", "ba/bestaudio", "separate audio stream"),
-                   ("audio2", "ba*", "audio taken from a format that also contains video"),
-                   ("muxed", "b/best", "a complete video+audio file"))
+def _remote_has_audio(fmt, timeout=20):
+    """True / False / None (could not tell). ffprobe reads only the first KB of the remote stream: NO download."""
+    if not HAVE_FFMPEG or not fmt.get("url"):
+        return None
+    headers = dict(fmt.get("http_headers") or {})
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+           "-rw_timeout", str(int(timeout * 1_000_000 * 0.75))]
+    if headers.get("User-Agent"):
+        cmd += ["-user_agent", headers.pop("User-Agent")]
+    if headers:
+        cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+    cmd.append(fmt["url"])
+    try:
+        r = _run(cmd, timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    return "audio" in (r.stdout or b"").decode("utf-8", errors="ignore")
+
+
+def _fmt_weight(f, duration):
+    size = _fmt_size(f)
+    if not size and f.get("tbr") and duration:
+        size = f["tbr"] * 1000 / 8 * duration
+    return size or 10 ** 12                 # unknown size = assume big (tried last)
+
+
+def _audio_candidates(info, used_ids):
+    """Formats that may carry the missing sound, cheapest first. A site's own labels are not trusted (Instagram / Facebook
+    leave acodec empty): ffprobe on the remote stream decides. We only need the SOUND, so among complete (video+audio)
+    formats the SMALLEST is taken - the audio track is the same."""
+    fmts = [f for f in (info.get("formats") or []) if f.get("url") and f.get("format_id") not in used_ids
+            and f.get("protocol") not in ("mhtml",) and f.get("ext") != "mhtml"]
+    dur = info.get("duration") or 0
+    has_v = lambda f: f.get("vcodec") not in (None, "none")                       # noqa: E731
+    audio_only = [f for f in fmts if not has_v(f) and f.get("acodec") not in (None, "none")]
+    with_audio = [f for f in fmts if has_v(f) and f.get("acodec") not in (None, "none")]
+    unknown = [f for f in fmts if f.get("acodec") is None]
+    ordered, seen = [], set()
+    for group in (sorted(audio_only, key=lambda f: _fmt_weight(f, dur)), sorted(with_audio, key=lambda f: _fmt_weight(f, dur)),
+                  sorted(unknown, key=lambda f: _fmt_weight(f, dur))):
+        for f in group:
+            if f["format_id"] not in seen:
+                seen.add(f["format_id"])
+                ordered.append(f)
+    return ordered
 
 
 def _ensure_audio(url, result, info, workdir, progress, cancel):
-    """Instagram / Facebook / Reels often deliver video and audio separately, or label them wrongly. If the downloaded
-    file has a video track but NO audio track, try (1) the separate audio stream, (2) the audio of any format that has
-    sound, (3) a complete muxed file, and mux the sound into the video (video copied, audio -> AAC so every Telegram
-    player has sound). Only a video for which no strategy finds audio is treated as really silent."""
+    """The downloaded file has a video track but NO audio. Look for the sound WITHOUT re-downloading the whole video:
+    every candidate stream is first checked with ffprobe (a few KB), and only a stream that really has audio is downloaded
+    (an audio-only stream is small, a complete format is the smallest one). Then the sound is muxed into the video
+    (video copied, audio -> AAC). If nothing has sound the video is really silent: it is delivered at once."""
     path = Path(result["path"])
     if not HAVE_FFMPEG:
         return result
     meta = ffprobe(path)
     if not meta["has_video"] or meta["has_audio"]:
         return result
-    chosen = [(f.get("format_id"), f.get("vcodec"), f.get("acodec")) for f in (info.get("requested_formats") or [])]
-    log.warning("downloaded video has NO audio track (formats used: %s, site lists %d audio-only formats) - looking for sound",
-                chosen, len(_audio_only_formats(info)))
+    used = {f.get("format_id") for f in (info.get("requested_formats") or [])} | {info.get("format_id")}
+    candidates = _audio_candidates(info, used)[:config.AUDIO_SEARCH_MAX_CANDIDATES]
+    log.warning("downloaded video has NO audio track (used formats: %s) - %d other format(s) to check", sorted(map(str, used)), len(candidates))
     progress["status"] = "processing"
-    for tag, fmt, what in AUDIO_FALLBACKS:
+    deadline = time.monotonic() + config.AUDIO_SEARCH_MAX_SEC
+    for n, f in enumerate(candidates):
         if cancel.is_set():
             raise Cancelled()
+        if time.monotonic() > deadline:
+            log.warning("audio search stopped: time budget (%ss) used", config.AUDIO_SEARCH_MAX_SEC)
+            break
+        has_audio = _remote_has_audio(f)
+        has_v = f.get("vcodec") not in (None, "none")
+        small = not has_v and (not _fmt_size(f) or _fmt_size(f) < 80 * 1024 * 1024)
+        if has_audio is False or (has_audio is None and not small):
+            log.info("audio candidate %s skipped (%s)", f["format_id"], "no sound" if has_audio is False else "cannot verify, too big to risk")
+            continue
+        tag = f"aud{n}"
         try:
-            files = _fetch_format(url, workdir, fmt, tag)
+            files = _fetch_format(url, workdir, str(f["format_id"]), tag)
         except Cancelled:
             raise
-        except Exception as exc:  # noqa: BLE001  ("format not available" = this strategy has nothing)
-            log.info("audio strategy '%s' found nothing: %s", tag, str(exc)[:120])
+        except Exception as exc:  # noqa: BLE001
+            log.info("audio candidate %s failed: %s", f["format_id"], str(exc)[:120])
             continue
         src = next((p for p in files if ffprobe(p)["has_audio"]), None)
         if src is None:
@@ -732,16 +785,13 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
                 p.unlink(missing_ok=True)
             final = path.with_suffix(".mp4")
             out.replace(final)
-            log.info("sound added using: %s", what)
+            log.info("sound added from format %s", f["format_id"])
             return {"path": final, "title": result["title"]}
         out.unlink(missing_ok=True)
-        log.warning("muxing audio from '%s' failed: %s", tag, (r.stderr or b"")[-160:].decode(errors="ignore"))
-        if tag == "muxed" and ffprobe(src)["has_video"]:       # last resort: use the complete file as it is
-            path.unlink(missing_ok=True)
-            return {"path": src, "title": result["title"]}
+        log.warning("muxing audio from format %s failed: %s", f["format_id"], (r.stderr or b"")[-160:].decode(errors="ignore"))
         for p in files:
             p.unlink(missing_ok=True)
-    log.warning("no audio found by any strategy: this video is really silent (or the site needs login cookies)")
+    log.warning("no audio found: this video is really silent (or the site needs login cookies)")
     result["silent"] = True
     return result
 
