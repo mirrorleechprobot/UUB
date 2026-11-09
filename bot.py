@@ -418,7 +418,7 @@ async def log_mirror(job, text, force=False):
 async def job_edit(job, text, markup=None):
     """Edit the user's status message AND mirror it in the log channel."""
     bg(log_mirror(job, text, force=not job.log_mid))
-    await job_edit(job, text, markup)
+    await edit_safely(job.status_msg, text, markup)
 
 
 async def send_log(text):
