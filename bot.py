@@ -128,11 +128,47 @@ def progress_text(job, stage, title, current, total, speed, eta, elapsed):
     bar = "█" * filled + "░" * (20 - filled)
     icon = "📥" if stage == "Downloading" else "📤"
     extra = f" ({job.part_label})" if stage == "Uploading" and job.part_label else ""
-    return (f"{icon} <b>{stage}</b>{extra}  •  #{job.id}\n\n🎬 {esc(title[:130])}\n\n"
+    plan = split_plan_line(job.est_size or total) if stage == "Downloading" else ""
+    return (f"{icon} <b>{stage}</b>{extra}  •  #{job.id}\n\n🎬 {esc(title[:130])}\n"
+            + (plan + "\n" if plan else "") + "\n"
             f"<code>{bar}</code> {percent:.1f}%\n"
             f"📦 {size_text(current)} / {size_text(total) if total else '?'}\n"
             f"⚡ Speed: {size_text(speed)}/s\n⏳ ETA: {time_text(eta)}\n"
             f"🕒 Elapsed: {time_text(elapsed)}")
+
+
+def split_plan_line(size):
+    """'✂️ Will be split: 3 parts' when the file is bigger than the Telegram part size (SPLIT_SIZE_MB, default 1950 MB)."""
+    limit = config.SPLIT_SIZE_MB * 1024 * 1024
+    if size and size > limit:
+        n = -(-size // limit)
+        return f"✂️ <b>Will be split:</b> {n} parts (each up to {config.SPLIT_SIZE_MB} MB)"
+    return ""
+
+
+def processing_text(job, size, p, elapsed):
+    """Remux / split stage with percent, speed and ETA (p = job.progress written by downloader.prepare_upload)."""
+    p = p or {}
+    stage = p.get("stage") or "Processing"
+    lines = [f"✂️ <b>{esc(stage)}</b>  •  #{job.id}" if "plit" in stage else f"⚙️ <b>{esc(stage)}</b>  •  #{job.id}",
+             "", f"🎬 {esc(job.title[:130])}", f"📦 {size_text(size)}"]
+    plan = split_plan_line(size)
+    if plan:
+        lines.append(plan)
+    total = p.get("ptotal") or 0
+    if total:
+        cur = p.get("pcur") or 0
+        pct = min(100.0, cur * 100.0 / total)
+        bar = "█" * max(0, min(20, int(pct / 5))) + "░" * (20 - max(0, min(20, int(pct / 5))))
+        lines += ["", f"<code>{bar}</code> {pct:.1f}%"]
+        if p.get("punit") == "B":
+            lines.append(f"📦 {size_text(cur)} / {size_text(total)}")
+            lines.append(f"⚡ Speed: {size_text(p.get('pspeed') or 0)}/s")
+        else:
+            lines.append(f"⚡ Speed: {(p.get('pspeed') or 0):.1f}x")
+        lines.append(f"⏳ ETA: {time_text(p.get('peta'))}")
+    lines.append(f"🕒 Elapsed: {time_text(elapsed)}")
+    return "\n".join(lines)
 
 
 def cancel_markup(job):
@@ -354,6 +390,37 @@ def explain_log_error(description):
     return description or "unknown error"
 
 
+def log_head(job):
+    return f"\n\n👤 {esc(job.user_label)}\n🔗 {esc(job.url[:300])}"
+
+
+async def log_mirror(job, text, force=False):
+    """The same live status the user sees (download / processing / upload / result) as ONE edited message in the log channel."""
+    if not config.LOG_MIRROR or not config.LOG_CHANNEL_ID:
+        return
+    if not force and time.monotonic() - job.log_last < config.LOG_MIRROR_INTERVAL_SEC:
+        return
+    async with job.log_lock:
+        job.log_last = time.monotonic()
+        body = (text + log_head(job))[:4000]
+        chat = str(config.LOG_CHANNEL_ID)
+        if not job.log_mid:
+            r = await _log_call("sendMessage", chat_id=chat, text=body, parse_mode="HTML", disable_web_page_preview="true")
+            if r.get("ok"):
+                job.log_mid = r["result"]["message_id"]
+        else:
+            r = await _log_call("editMessageText", chat_id=chat, message_id=str(job.log_mid), text=body, parse_mode="HTML",
+                                disable_web_page_preview="true")
+            if not r.get("ok") and "not found" in (r.get("description") or "").lower():
+                job.log_mid = 0                       # the message was deleted: the next update sends a new one
+
+
+async def job_edit(job, text, markup=None):
+    """Edit the user's status message AND mirror it in the log channel."""
+    bg(log_mirror(job, text, force=not job.log_mid))
+    await job_edit(job, text, markup)
+
+
 async def send_log(text):
     if not config.LOG_CHANNEL_ID:
         return False
@@ -474,6 +541,13 @@ class Job:
         self.channel = None                   # {"id","title","username"} while delivering to a channel
         self.channel_msg_id = 0               # first message in the channel (for the link)
         self.channel_note = ""                # why the channel could not be used (fallback to the chat)
+        self.workdir = None                   # this job's download folder (its child processes are found by this path)
+        self.cancel_since = 0.0               # monotonic time the cancel was requested
+        self.log_mid = 0                      # message id of this job's live mirror in the log channel
+        self.log_last = 0.0                   # monotonic time of the last mirror edit
+        self.log_lock = asyncio.Lock()
+        self.upload_started = 0.0             # monotonic time this job got its upload turn
+        self.too_big = False                  # stopped because the file is bigger than MAX_FILE_GB
         self.dl_started = 0.0                 # monotonic time the download slot was given (warm-up for the adaptive slot)
         self.speed_ema = 0.0                  # smoothed download speed, bytes/s
         self.multi = False                    # the link gave several files (gallery): they are sent as "File i/n"
@@ -514,6 +588,7 @@ pending = {}                   # token -> quality-selection session (NOT counted
 probe_sem = asyncio.Semaphore(config.PROBE_CONCURRENCY)
 upload_line = {}               # uid -> [jobs that finished downloading and wait for their upload turn]
 uploading_now = {}             # uid -> the job uploading right now
+uploading_extra = {}           # uid -> more jobs uploading at the same time (only when the running upload is > LONG_JOB_MIN minutes old)
 
 
 def user_jobs(uid):
@@ -542,14 +617,20 @@ def user_download_limit(uid):
     touched. Needs: every running download warmed up and still downloading, none of them fast, the total below the target,
     fewer than AUTO_PARALLEL_MAX, and enough free disk for another file."""
     base = config.MAX_RUNNING_PER_USER
-    if not config.AUTO_PARALLEL:
-        return base
     if any(j.user_id != uid for j in waiting):
         return base                                                # fairness: another user is waiting for a slot - he goes first
     active = download_slot_jobs(uid)
+    now, mb = time.monotonic(), 1024 * 1024
+    # LONG_JOB_RELEASE: every running file of this user is busy for more than LONG_JOB_MIN minutes -> the next file may start too
+    if (config.LONG_JOB_RELEASE and len(active) >= base and len(active) < config.LONG_JOB_MAX_PARALLEL
+            and all(j.state in ("downloading", "processing") and j.dl_started
+                    and now - j.dl_started > config.LONG_JOB_MIN * 60 for j in active)
+            and safety.free_bytes() >= config.AUTO_PARALLEL_MIN_FREE_MB * mb):
+        return len(active) + 1
+    if not config.AUTO_PARALLEL:
+        return base
     if len(active) < base or len(active) >= config.AUTO_PARALLEL_MAX:
         return base
-    now, mb = time.monotonic(), 1024 * 1024
     for j in active:
         if j.state != "downloading" or not j.dl_started or now - j.dl_started < config.AUTO_PARALLEL_WARMUP_SEC:
             return base
@@ -730,6 +811,11 @@ async def enqueue(job, status_msg, batch=None):
                                       f"{config.MAX_WAITING_PER_USER} waiting. Wait for some jobs to finish or cancel them with /queue "
                                       "(or /clear), then send the link again.")
         return False
+    if job.est_size and job.est_size > config.MAX_FILE_GB * 1024 ** 3:
+        job.error = f"file bigger than {config.MAX_FILE_GB} GB"
+        await edit_safely(status_msg, f"❌ <b>File too big</b>: {size_text(job.est_size)}.\n"
+                                      f"The maximum file size is {config.MAX_FILE_GB} GB (files over {config.SPLIT_SIZE_MB} MB are split into parts).")
+        return False
     job.status_msg = status_msg
     if batch is not None:
         job.batch = batch
@@ -751,9 +837,40 @@ async def enqueue(job, status_msg, batch=None):
     return True
 
 
+def kill_job_processes(job):
+    """Kill every child process that works on this job's folder (aria2c, ffmpeg, gallery-dl ...): blocking code that never
+    looks at the cancel flag (a merge, a split, yt-dlp's own aria2c) stops at once instead of running to the end."""
+    wd = getattr(job, "workdir", None)
+    if not wd:
+        return 0
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    key, killed = str(wd), 0
+    try:
+        children = psutil.Process(os.getpid()).children(recursive=True)
+    except Exception:  # noqa: BLE001
+        return 0
+    for ch in children:
+        try:
+            if key in " ".join(ch.cmdline()):
+                ch.kill()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return killed
+
+
 async def cancel_job(job):
-    """Cancel a job; a job still waiting is removed at once and frees its waiting slot."""
+    """Cancel a job; a job still waiting is removed at once and frees its waiting slot. A running job is stopped
+    right now (its child processes are killed) and the user sees 'Cancelling...' immediately."""
+    if not job.cancel.is_set():
+        job.cancel_since = time.monotonic()
     job.cancel.set()
+    if job not in waiting and job.state in ("downloading", "processing", "ready", "uploading"):
+        kill_job_processes(job)
+        bg(edit_safely(job.status_msg, f"🚫 <b>Cancelling...</b>  •  #{job.id}\nStopping now, one moment."))
     if job in waiting:
         waiting.remove(job)
         jobs.pop(job.id, None)
@@ -808,18 +925,35 @@ def _txt_waits_for_earlier(j):
                                      and k.state in ("downloading", "processing", "ready") for k in running_jobs)
 
 
+def _upload_slot_free(uid):
+    """One upload per user at a time - unless every running upload of this user already takes more than LONG_JOB_MIN minutes."""
+    cur = uploading_now.get(uid)
+    if cur is None:
+        return True
+    if not config.LONG_JOB_RELEASE:
+        return False
+    running = [cur] + uploading_extra.get(uid, [])
+    if len(running) >= config.LONG_JOB_MAX_PARALLEL:
+        return False
+    now = time.monotonic()
+    return all(j.upload_started and now - j.upload_started > config.LONG_JOB_MIN * 60 for j in running)
+
+
 def _advance_uploads(uid):
-    if uploading_now.get(uid) is None:
-        line = upload_line.get(uid) or []
-        for j in list(line):
-            if not j.cancel.is_set() and _txt_waits_for_earlier(j):
-                continue                      # keep the order of the TXT file; this one goes after the earlier file
-            line.remove(j)
-            if not j.cancel.is_set():
+    line = upload_line.get(uid) or []
+    for j in list(line):
+        if uploading_now.get(uid) is not None and not _upload_slot_free(uid):
+            break
+        if not j.cancel.is_set() and _txt_waits_for_earlier(j):
+            continue                          # keep the order of the TXT file; this one goes after the earlier file
+        line.remove(j)
+        if not j.cancel.is_set():
+            j.upload_started = time.monotonic()
+            if uploading_now.get(uid) is None:
                 uploading_now[uid] = j
-            j.upload_go.set()                 # a cancelled job is woken too and raises Cancelled itself
-            if uploading_now.get(uid) is j:
-                break
+            else:
+                uploading_extra.setdefault(uid, []).append(j)
+        j.upload_go.set()                     # a cancelled job is woken too and raises Cancelled itself
     if not upload_line.get(uid):
         upload_line.pop(uid, None)
 
@@ -849,6 +983,13 @@ def release_upload_turn(job):
     uid = job.user_id
     if uploading_now.get(uid) is job:
         uploading_now.pop(uid, None)
+        extra = uploading_extra.get(uid)
+        if extra:
+            uploading_now[uid] = extra.pop(0)           # a parallel upload becomes the main one
+    elif job in uploading_extra.get(uid, []):
+        uploading_extra[uid].remove(job)
+    if not uploading_extra.get(uid):
+        uploading_extra.pop(uid, None)
     line = upload_line.get(uid)
     if line and job in line:
         line.remove(job)
@@ -921,7 +1062,7 @@ async def flood_retry(job, uc, factory, what):
                 raise RuntimeError(f"Telegram FloodWait: {fw.value}s required ({what}). Please try again later.") from fw
             uc.flood_until = time.monotonic() + wait
             log.warning("[%s] FloodWait %ss during %s (job #%s)", uc.name, wait, what, job.id)
-            await edit_safely(job.status_msg, f"⏳ <b>Telegram FloodWait</b>  •  #{job.id}\n"
+            await job_edit(job, f"⏳ <b>Telegram FloodWait</b>  •  #{job.id}\n"
                                               f"Resuming automatically in {time_text(wait)}...", cancel_markup(job))
             await sleep_cancellable(job, wait)
 
@@ -1150,8 +1291,8 @@ async def upload_reporter(job, started, stop):
             inst = max(0, cur - prev_b) / (now - prev_t)
             speed = inst if speed == 0 else 0.6 * speed + 0.4 * inst
             prev_b, prev_t = cur, now
-        if now - last >= config.PROGRESS_UPDATE_INTERVAL:
-            await edit_safely(job.status_msg, progress_text(
+        if now - last >= config.PROGRESS_UPDATE_INTERVAL and not job.cancel.is_set():
+            await job_edit(job, progress_text(
                 job, "Uploading", job.title, cur, job.up_total, speed,
                 (job.up_total - cur) / speed if speed > 0 else None, now - started), cancel_markup(job))
             last = now
@@ -1200,7 +1341,7 @@ async def wait_for_disk(job):
             bg(alert_admin("disk", f"💾 <b>Low disk space</b>: {esc(msg)}"))
             raise RuntimeError(msg)
         if waited % 30 == 0:
-            await edit_safely(job.status_msg, f"⏳ <b>Waiting for free disk space</b>  •  #{job.id}\n"
+            await job_edit(job, f"⏳ <b>Waiting for free disk space</b>  •  #{job.id}\n"
                                               "Other files are still being processed; this job starts automatically.", cancel_markup(job))
         await sleep_cancellable(job, 5)
         waited += 5
@@ -1243,7 +1384,7 @@ async def run_job(job):
     loop = asyncio.get_running_loop()
     started = time.monotonic()
     workdir = DOWNLOAD_DIR / f"job{job.id}_{int(time.time())}"
-    log_bg(f"🆕 Job #{job.id} start\n👤 {job.user_label}\n🔗 {job.url}\n🎞 {job.option.get('label', job.mode)}")
+    job.workdir = workdir
     final_text = None
     try:
         ok_q, why = store.quota_check(job.user_id, extra_files=1)     # the day may have rolled over while the job waited
@@ -1252,23 +1393,31 @@ async def run_job(job):
         await wait_for_disk(job)
 
         # ---- download
-        await edit_safely(job.status_msg, progress_text(job, "Downloading", job.title, 0, job.est_size, 0, None, 0),
+        await job_edit(job, progress_text(job, "Downloading", job.title, 0, job.est_size, 0, None, 0),
                           cancel_markup(job))
         fut = loop.run_in_executor(POOL, dl.download, job, workdir)
         last = last_disk = time.monotonic()
         while not fut.done():
             await asyncio.wait({fut}, timeout=1)
             now = time.monotonic()
+            if job.cancel.is_set():
+                kill_job_processes(job)                       # aria2c / ffmpeg of this job
+                if now - (job.cancel_since or now) > 15:      # a thread stuck in a blocked network read: do not wait for it
+                    log.warning("job #%s: cancelled, the download thread did not stop within 15 s - abandoned", job.id)
+                    raise dl.Cancelled()
             sp = float(job.progress.get("speed") or 0)
             job.speed_ema = sp if not job.speed_ema else 0.7 * job.speed_ema + 0.3 * sp
+            if not job.too_big and (job.progress.get("current") or 0) > config.MAX_FILE_GB * 1024 ** 3:
+                job.too_big = True                                   # size was unknown before: stop as soon as it is over the limit
+                job.cancel.set()
             if now - last_disk >= 3:
                 last_disk = now
                 if safety.disk_low() and not job.disk_full:      # the disk is filling up: stop before everything breaks
                     job.disk_full = True
                     job.cancel.set()
-            if now - last >= config.PROGRESS_UPDATE_INTERVAL and not fut.done():
+            if now - last >= config.PROGRESS_UPDATE_INTERVAL and not fut.done() and not job.cancel.is_set():
                 p = job.progress
-                await edit_safely(job.status_msg, progress_text(
+                await job_edit(job, progress_text(
                     job, "Downloading", job.title, p["current"], p["total"], p["speed"], p["eta"], now - started),
                     cancel_markup(job))
                 last = now
@@ -1286,22 +1435,38 @@ async def run_job(job):
         job.title = result["title"] or job.title
         size = sum(p.stat().st_size for p in paths)
         job.size_bytes = size
-        log_bg(f"✅ Download complete #{job.id}\n🎬 {job.title}\n📦 {size_text(size)}")
+        if size > config.MAX_FILE_GB * 1024 ** 3:
+            job.too_big = True
+            raise RuntimeError(f"This file is {size_text(size)}. The maximum file size is {config.MAX_FILE_GB} GB.")
 
         # ---- post-process (remux to mp4, thumbnail, split >2GB)
         job.state = "processing"
-        await edit_safely(job.status_msg, f"⚙️ <b>Processing</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
-                                          f"📦 {size_text(size)}", cancel_markup(job))
+        proc_started = time.monotonic()
+        job.progress.pop("stage", None)
+        job.progress.pop("ptotal", None)
+        await job_edit(job, processing_text(job, size, None, 0), cancel_markup(job))
         items = []
         for one in paths:
-            items += await loop.run_in_executor(POOL, dl.prepare_upload, one)
+            pfut = loop.run_in_executor(POOL, dl.prepare_upload, one, job.cancel, job.progress)
+            last_p = time.monotonic()
+            while not pfut.done():
+                await asyncio.wait({pfut}, timeout=1)
+                now = time.monotonic()
+                if job.cancel.is_set():
+                    kill_job_processes(job)
+                    if now - (job.cancel_since or now) > 15:
+                        raise dl.Cancelled()
+                if now - last_p >= config.PROGRESS_UPDATE_INTERVAL and not pfut.done() and not job.cancel.is_set():
+                    await job_edit(job, processing_text(job, size, job.progress, now - proc_started), cancel_markup(job))
+                    last_p = now
+            items += await pfut
         if job.cancel.is_set():
             raise dl.Cancelled()
         await apply_user_settings(job, items, workdir)
 
         # ---- wait for our upload turn (the previous file of this user may still be uploading), then upload
         if job.state != "uploading":
-            await edit_safely(job.status_msg, f"📤 <b>Ready – waiting for the previous upload</b>  •  #{job.id}\n"
+            await job_edit(job, f"📤 <b>Ready – waiting for the previous upload</b>  •  #{job.id}\n"
                                               f"🎬 {esc(job.title[:130])}", cancel_markup(job))
         await acquire_upload_turn(job)
         await upload_all(job, items, started)
@@ -1312,7 +1477,7 @@ async def run_job(job):
         cache_store(job, items)
         elapsed = time.monotonic() - started
         final_text = (f"✅ <b>Completed</b>  •  #{job.id}\n\n🎬 {esc(job.title[:130])}\n📦 {size_text(size)}"
-                      + (f"\n🖼 {len(items)} files" if job.multi else f"\n📚 {len(items)} parts (Telegram 2GB limit)" if len(items) > 1 else "")
+                      + (f"\n🖼 {len(items)} files" if job.multi else f"\n✂️ Split into {len(items)} parts (each up to {config.SPLIT_SIZE_MB} MB)" if len(items) > 1 else "")
                       + (f"\n🔇 <b>No audio in the source:</b> the site delivered this video without sound "
                          f"(Instagram/Facebook do this when not logged in, or the music was removed). The admin can add login cookies."
                          if job.silent else "")
@@ -1320,9 +1485,14 @@ async def run_job(job):
                       + (f"\n⚡ Download speed: {size_text(size / dl_seconds)}/s (avg)" if size and dl_seconds > 3 else "")
                       + f"\n🕒 Total time: {time_text(elapsed)}")
         notify_channel_delivery(job)
-        log_bg(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
     except dl.Cancelled:
-        if job.disk_full:
+        if job.too_big:
+            job.outcome = "failed"
+            job.error = f"file bigger than {config.MAX_FILE_GB} GB"
+            store.bump("errors")
+            final_text = (f"❌ <b>File too big</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                          f"The maximum file size is {config.MAX_FILE_GB} GB (it is split into {config.SPLIT_SIZE_MB} MB parts for Telegram).")
+        elif job.disk_full:
             job.outcome = "failed"
             job.error = "server disk was full"
             store.bump("errors")
@@ -1337,21 +1507,24 @@ async def run_job(job):
         else:
             job.outcome = "cancelled"
             final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
-            log_bg(f"🚫 Job #{job.id} cancelled by user\n👤 {job.user_label}")
     except Exception as exc:  # noqa: BLE001
-        log.exception("Job #%s failed", job.id)
-        job.outcome = "failed"
-        job.error = str(exc)[:200]
-        store.bump("errors")
-        note_failure(job, exc)
-        final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
-        log_bg(f"❌ Job #{job.id} failed\n👤 {job.user_label}\n🔗 {job.url}\n⚠️ {str(exc)[:700]}")
+        if job.cancel.is_set() and not (job.disk_full or job.too_big or state["shutting_down"]):
+            job.outcome = "cancelled"            # the process died because /cancel killed it: that is a cancel, not a failure
+            final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
+        else:
+            log.exception("Job #%s failed", job.id)
+            job.outcome = "failed"
+            job.error = str(exc)[:200]
+            store.bump("errors")
+            note_failure(job, exc)
+            final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
     finally:
         release_upload_turn(job)
         shutil.rmtree(workdir, ignore_errors=True)   # always clean: failed jobs must not fill the disk
         if job.txt is not None:
             gc.collect()                             # TXT tasks run for hours: give the memory back after every file
     if final_text:
+        bg(log_mirror(job, final_text, force=True))      # the log channel keeps the result of every job
         if job.txt is not None and (job.outcome == "ok" or state["shutting_down"]):
             await delete_quiet(job.status_msg)       # keep the chat clean: the delivered file is the proof (summary shows the rest)
         else:
@@ -1407,6 +1580,8 @@ async def adaptive_slot_loop():
         await asyncio.sleep(5)
         if waiting:                                                # speeds / RAM change without any event: look again
             wake.set()
+        for uid in list(upload_line):                              # a long upload may now allow the next file to upload too
+            _advance_uploads(uid)
 
 
 async def restore_queue():
@@ -2678,7 +2853,7 @@ def stats_text():
         f"🗄 Database: {esc(db.label)}" + (f"  ⚠️ {esc(db.error)}" if db.error else ""),
         keepalive_text(),
         "",
-        f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now)} uploading",
+        f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now) + sum(len(v) for v in uploading_extra.values())} uploading",
         f"🤖 Uploaders: " + " • ".join(f"{'main' if u.is_main else u.name}:{'🟢' if u.usable else '🔴'}{u.active}" for u in uploaders),
         f"🧠 RAM in use: {safety.memory_percent():.0f}% of {config.MEMORY_MB} MB • max {config.MAX_CONCURRENT_JOBS} jobs at once "
         f"(new jobs pause above {config.MEMORY_START_LIMIT_PCT}% RAM)",

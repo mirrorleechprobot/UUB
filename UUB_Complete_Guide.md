@@ -534,3 +534,14 @@ Admin commands: `/setcookies` `/cookies` `/delcookies` • `/addplus` `/removepl
 | `eco-large` | 2 / 4 GB / 20 GB | $21.43 | 5+ users comfortable (profile auto → `max`: 10 jobs) |
 Eco plans Washington D.C., Frankfurt aur **Singapore** me milte hain (aapka bot DC5 = Singapore). Free sirf Frankfurt / Washington me.
 Bot khud: har user ka apna download slot + apni upload line (ek ka lamba TXT baaki ko nahi rokta), auto-parallel sirf tab jab koi aur user wait na kar raha ho, RAM `MEMORY_START_LIMIT_PCT` (85%) se upar ho to naya job ruk jata hai, disk kam ho to job wait karta hai.
+
+## Badi files, lambe jobs, log channel
+| Setting | Default | Matlab |
+|---|---|---|
+| `MAX_FILE_GB` | 4 | Sabse badi file. Usse badi ho to download se pehle ya beech me hi "File too big" |
+| `SPLIT_SIZE_MB` | 1950 | Is size se badi file parts me tootti hai (4 GB = 3 parts). Download ke dauran "Will be split: N parts" dikhta hai, split ke waqt % + speed + ETA |
+| `LONG_JOB_RELEASE` / `LONG_JOB_MIN` / `LONG_JOB_MAX_PARALLEL` | true / 10 / 3 | Ek file 10 min se zyada (download/split ya upload) le to agli file bhi shuru ho jaati hai |
+| `LOG_MIRROR` / `LOG_MIRROR_INTERVAL_SEC` | true / 15 | Log channel me har job ka live status (user wala hi) ek edited message me |
+
+## Cancel (v7.1)
+Running job ko cancel karte hi uske saare child processes (aria2c, ffmpeg, gallery-dl) kill ho jaate hain, "Cancelling..." turant dikhta hai, aur agar download ka thread 15 sec me na ruke to bot uska intezaar chhod deta hai. Kill hone se aaya error "Failed" nahi, "Cancelled" ginta hai.

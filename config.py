@@ -182,3 +182,15 @@ UPLOAD_STALL_RETRIES = max(0, min(5, env_int("UPLOAD_STALL_RETRIES", 2)))
 
 # ---- RAM guard: no NEW job starts while the container uses more than this % of its memory (running jobs are never touched) ----
 MEMORY_START_LIMIT_PCT = max(50, min(98, env_int("MEMORY_START_LIMIT_PCT", 85)))
+
+# ---- big files: biggest file accepted; it is split into SPLIT_SIZE_MB parts (1.95 GB) for Telegram ----
+MAX_FILE_GB = max(1, min(20, env_int("MAX_FILE_GB", 4)))
+
+# ---- a file that takes very long must not block the next one ----
+LONG_JOB_RELEASE = env_bool("LONG_JOB_RELEASE", True)
+LONG_JOB_MIN = max(1, env_int("LONG_JOB_MIN", 10))                              # minutes in the same stage (download / upload)
+LONG_JOB_MAX_PARALLEL = max(2, min(6, env_int("LONG_JOB_MAX_PARALLEL", 3)))     # most files of ONE user in the same stage then
+
+# ---- log channel: the progress the user sees is mirrored live (one message per job, edited) ----
+LOG_MIRROR = env_bool("LOG_MIRROR", True)
+LOG_MIRROR_INTERVAL_SEC = max(5, env_int("LOG_MIRROR_INTERVAL_SEC", 15))

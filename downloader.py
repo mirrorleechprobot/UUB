@@ -907,6 +907,42 @@ def _run(cmd, timeout=None):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
 
+def _set_stage(progress, stage, current=0, total=0, speed=0.0, eta=None, unit="x"):
+    if progress is not None:
+        progress.update({"status": "processing", "stage": stage, "pcur": current, "ptotal": total, "pspeed": speed, "peta": eta, "punit": unit})
+
+
+def _run_progress(cmd, duration, progress, stage, cancel=None, timeout=7200):
+    """ffmpeg with live progress (percent + speed + ETA from `-progress`). Same result shape as _run()."""
+    if progress is None or not duration:
+        return _run(cmd, timeout)
+    full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+    proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    err = []
+    threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True).start()
+    start = time.monotonic()
+    try:
+        for line in proc.stdout:
+            if cancel is not None and cancel.is_set():
+                proc.terminate()
+                break
+            key, _, val = line.strip().partition("=")
+            if key == "out_time_us" and val.lstrip("-").isdigit():
+                done_s = max(0.0, int(val) / 1_000_000)
+                frac = min(0.995, done_s / duration)
+                elapsed = max(0.001, time.monotonic() - start)
+                _set_stage(progress, stage, int(frac * 1000), 1000, done_s / elapsed,
+                           elapsed * (1 - frac) / frac if frac > 0.02 else None)
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                break
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    return subprocess.CompletedProcess(full, proc.returncode, b"", ("".join(err)).encode("utf-8", errors="ignore"))
+
+
 def ffprobe(path):
     meta = {"duration": 0, "width": 0, "height": 0, "has_video": False, "has_audio": False,
             "title": "", "artist": "", "acodec": "", "vcodec": ""}
@@ -987,7 +1023,7 @@ def _fix_mp4_audio(path):
     return path
 
 
-def _remux_mp4(path):
+def _remux_mp4(path, progress=None, cancel=None, duration=0):
     out = path.with_suffix(".mp4")
     if out == path:
         return path
@@ -998,8 +1034,8 @@ def _remux_mp4(path):
         # Opus / Vorbis inside MP4 plays SILENT in Telegram's players -> convert such audio to AAC (video stays untouched).
         acodec = ffprobe(path).get("acodec", "")
         audio = ["-c:a", "copy"] if (not acodec or acodec in TG_AUDIO_OK) else ["-c:a", "aac", "-b:a", "192k"]
-        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
-                  "-sn", "-dn", *fast, str(tmp)])
+        r = _run_progress(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
+                          "-sn", "-dn", *fast, str(tmp)], duration, progress, "Converting to MP4", cancel)
     except Exception:  # noqa: BLE001
         tmp.unlink(missing_ok=True)
         return path
@@ -1011,8 +1047,11 @@ def _remux_mp4(path):
     return path
 
 
-def _byte_split(path, max_bytes):
+def _byte_split(path, max_bytes, progress=None, cancel=None):
     parts = []
+    total = path.stat().st_size
+    n_parts = max(1, -(-total // max_bytes))
+    done, start = 0, time.monotonic()
     with path.open("rb") as src:
         index = 1
         while True:
@@ -1025,6 +1064,12 @@ def _byte_split(path, max_bytes):
                         break
                     dst.write(chunk)
                     written += len(chunk)
+                    done += len(chunk)
+                    if progress is not None:
+                        el = max(0.001, time.monotonic() - start)
+                        _set_stage(progress, f"Splitting into {n_parts} parts", done, total, done / el, (total - done) / (done / el), "B")
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
             if written == 0:
                 part.unlink(missing_ok=True)
                 break
@@ -1033,16 +1078,18 @@ def _byte_split(path, max_bytes):
     return parts
 
 
-def _video_split(path, max_bytes, duration):
+def _video_split(path, max_bytes, duration, progress=None, cancel=None):
     size = path.stat().st_size
+    n_parts = max(1, -(-size // max_bytes))
     for factor in (0.9, 0.7, 0.5):
         seg = max(5, int(duration * max_bytes / size * factor))
         pattern = path.with_name(path.stem + ".part%03d.mp4")
         for old in path.parent.glob(path.stem + ".part*.mp4"):
             old.unlink(missing_ok=True)
         try:
-            r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
-                      "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1", str(pattern)])
+            r = _run_progress(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
+                               "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1", str(pattern)],
+                              duration, progress, f"Splitting into ~{n_parts} parts", cancel)
         except Exception:  # noqa: BLE001
             return None
         parts = sorted(path.parent.glob(path.stem + ".part*.mp4"))
@@ -1053,7 +1100,7 @@ def _video_split(path, max_bytes, duration):
     return None
 
 
-def prepare_upload(path, cancel=None):
+def prepare_upload(path, cancel=None, progress=None):
     """Return a list of upload items: {path, kind, duration, width, height, thumb, title, artist}."""
     path = Path(path)
     ext = path.suffix.lower()
@@ -1069,7 +1116,7 @@ def prepare_upload(path, cancel=None):
         kind = "document"
 
     if kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
-        new = _remux_mp4(path)
+        new = _remux_mp4(path, progress, cancel, meta["duration"])
         if new != path:
             path, ext = new, ".mp4"
             meta = ffprobe(path)
@@ -1083,12 +1130,13 @@ def prepare_upload(path, cancel=None):
     max_bytes = int(config.SPLIT_SIZE_MB * 1024 * 1024)
     paths = [path]
     if path.stat().st_size > max_bytes:
-        parts = _video_split(path, max_bytes, meta["duration"]) if kind == "video" and meta["duration"] and HAVE_FFMPEG else None
+        parts = (_video_split(path, max_bytes, meta["duration"], progress, cancel)
+                 if kind == "video" and meta["duration"] and HAVE_FFMPEG else None)
         if parts:
             path.unlink(missing_ok=True)
             paths = parts
         else:
-            paths = _byte_split(path, max_bytes)
+            paths = _byte_split(path, max_bytes, progress, cancel)
             path.unlink(missing_ok=True)
             kind = "document"
 
