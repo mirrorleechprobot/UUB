@@ -474,6 +474,8 @@ class Job:
         self.channel = None                   # {"id","title","username"} while delivering to a channel
         self.channel_msg_id = 0               # first message in the channel (for the link)
         self.channel_note = ""                # why the channel could not be used (fallback to the chat)
+        self.dl_started = 0.0                 # monotonic time the download slot was given (warm-up for the adaptive slot)
+        self.speed_ema = 0.0                  # smoothed download speed, bytes/s
         self.multi = False                    # the link gave several files (gallery): they are sent as "File i/n"
         self.txt = None                       # TxtTask this job belongs to (Premium Plus TXT upload), else None
         self.txt_idx = -1                     # position of this link inside the TXT file
@@ -522,12 +524,42 @@ def running_count(uid):
     return sum(1 for j in running_jobs if j.user_id == uid)
 
 
+def download_slot_jobs(uid):
+    stages = ("downloading", "processing", "ready") + (() if config.PIPELINE else ("uploading",))
+    return [j for j in running_jobs if j.user_id == uid and j.state in stages]
+
+
 def busy_download(uid):
     """Jobs of this user occupying the DOWNLOAD slot. With PIPELINE a job that already uploads frees the slot, so the
     next file downloads while the previous one is still uploading (a downloaded file waiting for its turn keeps the slot:
     at most 2 files per user on disk)."""
-    stages = ("downloading", "processing", "ready") + (() if config.PIPELINE else ("uploading",))
-    return sum(1 for j in running_jobs if j.user_id == uid and j.state in stages)
+    return len(download_slot_jobs(uid))
+
+
+def user_download_limit(uid):
+    """Normally MAX_RUNNING_PER_USER. AUTO_PARALLEL: when the running download(s) of this user are SLOW (sites that give
+    < 1-3 MB/s per file), one more file may start so the total gets near AUTO_PARALLEL_TARGET_MBPS. Fast downloads are never
+    touched. Needs: every running download warmed up and still downloading, none of them fast, the total below the target,
+    fewer than AUTO_PARALLEL_MAX, and enough free disk for another file."""
+    base = config.MAX_RUNNING_PER_USER
+    if not config.AUTO_PARALLEL:
+        return base
+    if any(j.user_id != uid for j in waiting):
+        return base                                                # fairness: another user is waiting for a slot - he goes first
+    active = download_slot_jobs(uid)
+    if len(active) < base or len(active) >= config.AUTO_PARALLEL_MAX:
+        return base
+    now, mb = time.monotonic(), 1024 * 1024
+    for j in active:
+        if j.state != "downloading" or not j.dl_started or now - j.dl_started < config.AUTO_PARALLEL_WARMUP_SEC:
+            return base
+        if j.speed_ema >= config.AUTO_PARALLEL_SLOW_MBPS * mb:
+            return base                                            # a fast download is on its own: leave it alone
+    if sum(j.speed_ema for j in active) >= config.AUTO_PARALLEL_TARGET_MBPS * mb:
+        return base
+    if safety.free_bytes() < config.AUTO_PARALLEL_MIN_FREE_MB * mb:
+        return base
+    return len(active) + 1
 
 
 def waiting_count(uid):
@@ -770,11 +802,19 @@ def make_job_from_probe(user, chat_id, url, pr, option=None, custom_name=None):
 
 
 # --------------------------------------------------------------------------- upload turns (per user, strictly in queue order)
+def _txt_waits_for_earlier(j):
+    """TXT task: file N must not upload before file N-1 of the same task (parallel downloads may finish out of order)."""
+    return j.txt is not None and any(k is not j and k.txt is j.txt and k.txt_idx < j.txt_idx
+                                     and k.state in ("downloading", "processing", "ready") for k in running_jobs)
+
+
 def _advance_uploads(uid):
     if uploading_now.get(uid) is None:
         line = upload_line.get(uid) or []
-        while line:
-            j = line.pop(0)
+        for j in list(line):
+            if not j.cancel.is_set() and _txt_waits_for_earlier(j):
+                continue                      # keep the order of the TXT file; this one goes after the earlier file
+            line.remove(j)
             if not j.cancel.is_set():
                 uploading_now[uid] = j
             j.upload_go.set()                 # a cancelled job is woken too and raises Cancelled itself
@@ -916,8 +956,26 @@ async def send_item(uc, chat_id, job, item, caption, cb):
     return await flood_retry(job, uc, attempt, "upload")
 
 
+class UploadStalled(Exception):
+    """The upload made no progress for UPLOAD_STALL_SEC seconds (hung connection / dead media session)."""
+
+
+async def reset_media_sessions(uc):
+    """Drop the client's cached upload sessions: the next upload opens fresh ones (a hung session would hang again)."""
+    sessions = getattr(uc.client, "media_sessions", None)
+    if isinstance(sessions, dict):
+        for sess in list(sessions.values()):
+            try:
+                await asyncio.wait_for(sess.stop(), 10)
+            except Exception:  # noqa: BLE001
+                pass
+        sessions.clear()
+
+
 async def upload_one(job, uc, item, slot, chat_id, caption):
-    """Upload one file with one client into chat_id. Progress goes into job.up_cur[slot]."""
+    """Upload one file with one client into chat_id. Progress goes into job.up_cur[slot].
+    Watchdog: no new byte for UPLOAD_STALL_SEC seconds -> the attempt is cancelled and UploadStalled is raised
+    (the caller falls back to another uploader / retries) instead of hanging for ever at 0%."""
     size = Path(item["path"]).stat().st_size
 
     def callback(current, total_bytes):
@@ -926,18 +984,60 @@ async def upload_one(job, uc, item, slot, chat_id, caption):
         job.up_cur[slot] = current
 
     job.up_cur[slot] = 0
-    sent = await send_item(uc, chat_id, job, item, caption, callback)
+    task = asyncio.ensure_future(send_item(uc, chat_id, job, item, caption, callback))
+    last_bytes, last_move = 0, time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=5)
+            if done:
+                break
+            now, cur = time.monotonic(), job.up_cur.get(slot, 0)
+            if cur != last_bytes:
+                last_bytes, last_move = cur, now
+            # all bytes sent but Telegram is still finishing the message: allow more time before calling it a stall
+            limit = config.UPLOAD_STALL_SEC * (2 if size and cur >= size else 1)
+            if job.cancel.is_set():
+                limit = min(limit, 30)                       # a cancelled upload must not linger
+            if now - last_move > limit:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                if job.cancel.is_set():
+                    raise dl.Cancelled()
+                raise UploadStalled(f"no upload progress for {int(now - last_move)}s at {last_bytes}/{size} bytes")
+        sent = task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
     if sent is None or job.cancel.is_set():
         raise dl.Cancelled()
     job.up_cur[slot] = size
     return sent
 
 
+async def upload_main_with_retry(job, item, slot, chat_id, caption):
+    """The main bot's upload; a stalled upload is restarted (fresh sessions) up to UPLOAD_STALL_RETRIES times."""
+    for attempt in range(config.UPLOAD_STALL_RETRIES + 1):
+        try:
+            return await upload_one(job, main_uc, item, slot, chat_id, caption)
+        except UploadStalled as exc:
+            log.warning("[main] upload stalled (attempt %s/%s): %s", attempt + 1, config.UPLOAD_STALL_RETRIES + 1, exc)
+            if attempt >= config.UPLOAD_STALL_RETRIES:
+                raise RuntimeError("Upload stalled several times (Telegram connection hung). Please try again later.") from exc
+            await reset_media_sessions(main_uc)
+            job.up_cur[slot] = 0
+
+
 def note_helper_failure(uc, exc):
     name = type(exc).__name__
     log.warning("[%s] upload via helper failed: %s: %s", uc.name, name, str(exc)[:200])
     uc.fails += 1
-    if name in PERMANENT_HELPER_ERRORS or "Peer id invalid" in str(exc):
+    if isinstance(exc, UploadStalled):
+        uc.flood_until = time.monotonic() + 600           # a hung helper: rest 10 minutes, the main bot takes over now
+        uc.fails = 0
+        uc.note = "resting 10 min: its upload hung"
+        bg(reset_media_sessions(uc))
+        log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) upload hung ({exc}). The main bot delivered instead; the helper rests 10 minutes.")
+    elif name in PERMANENT_HELPER_ERRORS or "Peer id invalid" in str(exc):
         uc.ok = False
         uc.note = f"disabled: {name} (check admin rights in the storage channel; it is re-checked automatically)"
         log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) disabled: {name}. Make sure it is Admin (Post Messages) of this channel. "
@@ -977,7 +1077,7 @@ async def deliver_item(job, item, uc, slot, label):
     main_uc.active += 1
     try:
         try:
-            sent = await upload_one(job, main_uc, item, slot, job.target_chat, caption)
+            sent = await upload_main_with_retry(job, item, slot, job.target_chat, caption)
         except dl.Cancelled:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -986,7 +1086,7 @@ async def deliver_item(job, item, uc, slot, label):
             if job.target_chat == job.chat_id or not channel_unusable(exc):
                 raise
             channel_fallback(job, exc)                 # the channel does not accept our posts: deliver to the chat instead
-            sent = await upload_one(job, main_uc, item, slot, job.chat_id, caption)
+            sent = await upload_main_with_retry(job, item, slot, job.chat_id, caption)
         main_uc.uploaded += 1
         note_channel_message(job, sent.id)
         fid = msg_file_id(sent)
@@ -1159,6 +1259,8 @@ async def run_job(job):
         while not fut.done():
             await asyncio.wait({fut}, timeout=1)
             now = time.monotonic()
+            sp = float(job.progress.get("speed") or 0)
+            job.speed_ema = sp if not job.speed_ema else 0.7 * job.speed_ema + 0.3 * sp
             if now - last_disk >= 3:
                 last_disk = now
                 if safety.disk_low() and not job.disk_full:      # the disk is filling up: stop before everything breaks
@@ -1171,6 +1273,7 @@ async def run_job(job):
                     cancel_markup(job))
                 last = now
         result = await fut
+        dl_seconds = max(0.001, time.monotonic() - started)
         job.title = result["title"] or job.title
         paths = [Path(p) for p in (result.get("paths") or [])]
         job.multi = len(paths) > 1                 # gallery-dl: several files from one link
@@ -1214,6 +1317,7 @@ async def run_job(job):
                          f"(Instagram/Facebook do this when not logged in, or the music was removed). The admin can add login cookies."
                          if job.silent else "")
                       + channel_text_line(job)
+                      + (f"\n⚡ Download speed: {size_text(size / dl_seconds)}/s (avg)" if size and dl_seconds > 3 else "")
                       + f"\n🕒 Total time: {time_text(elapsed)}")
         notify_channel_delivery(job)
         log_bg(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
@@ -1282,15 +1386,27 @@ async def dispatcher():
         await wake.wait()
         wake.clear()
         while len(running_jobs) < config.MAX_CONCURRENT_JOBS and not state["shutting_down"]:
-            job = next((j for j in waiting if busy_download(j.user_id) < config.MAX_RUNNING_PER_USER), None)
+            if running_jobs and safety.memory_percent() > config.MEMORY_START_LIMIT_PCT:
+                break                                              # RAM nearly full: wait for a running job to finish (checked every 5 s)
+            job = next((j for j in waiting if busy_download(j.user_id) < user_download_limit(j.user_id)), None)
             if job is None:
                 break
             waiting.remove(job)
             running_jobs.add(job)
             job.state = "downloading"
+            job.dl_started = time.monotonic()
+            job.speed_ema = 0.0
             job.attempts += 1
             persist_job(job)                       # attempts counter: a job that keeps crashing the bot is dropped after 3 tries
             asyncio.create_task(run_wrapper(job))
+
+
+async def adaptive_slot_loop():
+    """Wake the dispatcher every 5 s while jobs wait: a slow download may now deserve one more parallel slot."""
+    while True:
+        await asyncio.sleep(5)
+        if waiting:                                                # speeds / RAM change without any event: look again
+            wake.set()
 
 
 async def restore_queue():
@@ -2564,7 +2680,11 @@ def stats_text():
         "",
         f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now)} uploading",
         f"🤖 Uploaders: " + " • ".join(f"{'main' if u.is_main else u.name}:{'🟢' if u.usable else '🔴'}{u.active}" for u in uploaders),
-        f"🚀 Upload engine: {esc(_wzgram_version())}",
+        f"🧠 RAM in use: {safety.memory_percent():.0f}% of {config.MEMORY_MB} MB • max {config.MAX_CONCURRENT_JOBS} jobs at once "
+        f"(new jobs pause above {config.MEMORY_START_LIMIT_PCT}% RAM)",
+        f"🚀 Upload engine: {esc(_wzgram_version())} • {config.MAX_CONCURRENT_TRANSMISSIONS} streams",
+        f"⚙️ Speed profile: <b>{config.SPEED_PROFILE}</b> (RAM {config.MEMORY_MB} MB) • aria2 {config.ARIA2_CONNECTIONS} conn • "
+        f"{config.CONCURRENT_FRAGMENTS} fragments • auto-parallel {'on' if config.AUTO_PARALLEL else 'off'}",
         "",
         f"📅 <b>Today</b>: {today.get('jobs', 0)} jobs • {today.get('files', 0)} files • {size_text(today.get('bytes', 0))} • "
         f"❌ {today.get('errors', 0)} errors • ⚡ {today.get('cache_hits', 0)} cache hits",
@@ -2867,7 +2987,9 @@ def parse_links(text):
 
 txt_tasks = {}                 # id -> TxtTask (running)
 txt_runners = set()            # asyncio tasks of the running TxtTasks
-TXT_WINDOW = 2                 # links of one task alive at once: one downloading/uploading + the next one waiting (pipeline)
+def txt_window():
+    """Links of one task alive at once: 2 (one downloading/uploading + the next waiting); more when AUTO_PARALLEL may start extra downloads."""
+    return config.AUTO_PARALLEL_MAX + 1 if config.AUTO_PARALLEL else 2
 
 
 class TxtTask:
@@ -3061,7 +3183,7 @@ async def run_txt_task(task):
             if not (store.is_allowed(uid) and store.has_plus(uid)):
                 task.stop_reason = "Premium / Premium Plus is no longer active."
                 break
-            while len(task.jobs) >= TXT_WINDOW and not (state["shutting_down"] or task.cancelled):
+            while len(task.jobs) >= txt_window() and not (state["shutting_down"] or task.cancelled):
                 await asyncio.sleep(1)
             if state["shutting_down"] or task.cancelled:
                 break
@@ -3670,11 +3792,11 @@ async def main():
     if ok:
         await send_log(f"🟢 Bot @{me.username} online (DC{dc})\n⚙️ aria2c: {dl.HAVE_ARIA2} • ffmpeg: {dl.HAVE_FFMPEG} • "
                        f"yt-dlp {yt_dlp.version.__version__}\n🗄 Database: {db.label}\n🤖 Helper bots ready: {n_help}/{len(config.HELPER_BOT_TOKENS)}\n"
-                       f"🚀 Upload engine: {_wzgram_version()}")
+                       f"🚀 Upload engine: {_wzgram_version()} • speed profile {config.SPEED_PROFILE} (RAM {config.MEMORY_MB} MB)")
     state["ready"] = True
     log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s | db=%s", me.username, yt_dlp.version.__version__,
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG, db.label)
-    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop(), telegram_watchdog_loop(), helper_watchdog_loop())]
+    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop(), telegram_watchdog_loop(), helper_watchdog_loop(), adaptive_slot_loop())]
     await restore_queue()
     await restore_txt_tasks()
     if config.MONGO_URI and not db.mongo:

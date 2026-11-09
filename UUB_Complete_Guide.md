@@ -513,3 +513,24 @@ DISK_CLEAN_PERCENT=90
 
 Admin commands: `/setcookies` `/cookies` `/delcookies` • `/addplus` `/removeplus` `/pluslist`. User: `/stoptxt`.
 | `FORCE_SPEED` | true | Aggressive download options: aria2 adaptive mirrors, slow connections (<20 KB/s) dropped and retried, bigger buffers, unlimited torrent peers. `false` = purane safe options |
+| `AUTO_PARALLEL` | true | Slow download (< `AUTO_PARALLEL_SLOW_MBPS`) ho to usi user ki agli file bhi ek saath shuru. Tez download ko kabhi nahi chhuta. Upload ek-ek hi, TXT me order same |
+| `AUTO_PARALLEL_MAX` / `_TARGET_MBPS` / `_SLOW_MBPS` | 3 / 10 / 3 | Max parallel files / total speed target / "slow" ki seema (MB/s) |
+| `AUTO_PARALLEL_WARMUP_SEC` / `_MIN_FREE_MB` | 20 / 3000 | Speed judge karne se pehle wait / extra file ke liye free disk |
+| `UPLOAD_STALL_SEC` / `UPLOAD_STALL_RETRIES` | 240 / 2 | Upload me itni der koi naya byte na jaye to wo cancel hoke dobara chalta hai (helper hang ho to main bot se). Pehle ye 0% par hamesha atak sakta tha |
+
+## SPEED_PROFILE (ek switch, sabse tez settings ke liye)
+| Profile | Upload streams | HLS fragments | aria2 cache | Parallel downloads |
+|---|---|---|---|---|
+| `max` | 16 | 64 | 128 MB | haan (3 tak) |
+| `balanced` | 6 | 48 | 64 MB | haan (3 tak) |
+| `low` | 4 | 16 | 16 MB | nahi |
+`auto` (default): RAM > 1 GB → `max`, warna `low` (Koyeb free 512 MB par `max` bot ko OOM-kill kar sakta hai). Koi bhi alag variable set karoge to wahi chalega. `/stats` me chalta hua profile dikhta hai.
+
+## 4-5 Premium users ek saath (Koyeb sizing, docs May 2026)
+| Plan | vCPU / RAM / Disk | Price/mahina | Kitne users |
+|---|---|---|---|
+| Free | 0.1 / 512 MB / 2 GB | $0 | 1-2 halke users, choti files |
+| `eco-medium` | 1 / 2 GB / 16 GB | $10.71 | 4-5 users (profile auto → `balanced`: 6 jobs) |
+| `eco-large` | 2 / 4 GB / 20 GB | $21.43 | 5+ users comfortable (profile auto → `max`: 10 jobs) |
+Eco plans Washington D.C., Frankfurt aur **Singapore** me milte hain (aapka bot DC5 = Singapore). Free sirf Frankfurt / Washington me.
+Bot khud: har user ka apna download slot + apni upload line (ek ka lamba TXT baaki ko nahi rokta), auto-parallel sirf tab jab koi aur user wait na kar raha ho, RAM `MEMORY_START_LIMIT_PCT` (85%) se upar ho to naya job ruk jata hai, disk kam ho to job wait karta hai.
