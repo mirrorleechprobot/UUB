@@ -194,3 +194,8 @@ LONG_JOB_MAX_PARALLEL = max(2, min(6, env_int("LONG_JOB_MAX_PARALLEL", 3)))     
 # ---- log channel: the progress the user sees is mirrored live (one message per job, edited) ----
 LOG_MIRROR = env_bool("LOG_MIRROR", True)
 LOG_MIRROR_INTERVAL_SEC = max(5, env_int("LOG_MIRROR_INTERVAL_SEC", 15))
+
+# ---- MKV / AVI ... -> MP4 (Telegram only plays MP4 inside the app). MP4 keeps just the first audio track, so a file with
+# several audio tracks (Hindi + Tamil + Malayalam ...) is sent as the original file instead, nothing is lost ----
+KEEP_MULTI_TRACK_ORIGINAL = env_bool("KEEP_MULTI_TRACK_ORIGINAL", True)
+CONVERT_TO_MP4 = env_bool("CONVERT_TO_MP4", True)     # false = MKV / AVI ... are never converted: sent as the original file (all tracks kept)

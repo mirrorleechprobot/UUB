@@ -545,3 +545,7 @@ Bot khud: har user ka apna download slot + apni upload line (ek ka lamba TXT baa
 
 ## Cancel (v7.1)
 Running job ko cancel karte hi uske saare child processes (aria2c, ffmpeg, gallery-dl) kill ho jaate hain, "Cancelling..." turant dikhta hai, aur agar download ka thread 15 sec me na ruke to bot uska intezaar chhod deta hai. Kill hone se aaya error "Failed" nahi, "Cancelled" ginta hai.
+
+## MKV -> MP4 (v7.2)
+Telegram app ke andar sirf MP4 chalta hai, isliye MKV/AVI jaisi video MP4 me badli jaati hai (sirf container badalta hai, quality same). MP4 conversion me sirf PEHLA audio track bachta hai, isliye **1 se zyada audio track wali file (Hin+Tam+Mal) convert nahi hoti, original file ki tarah jaati hai** (`KEEP_MULTI_TRACK_ORIGINAL=true`). `/settings` me "Document" chuna ho to bhi conversion skip hota hai (time bachta hai).
+| `CONVERT_TO_MP4` | true | `false` = MKV/AVI kabhi MP4 nahi banti, original file jaati hai (saare audio tracks + subtitles bachte hain) |

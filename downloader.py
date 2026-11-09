@@ -945,7 +945,7 @@ def _run_progress(cmd, duration, progress, stage, cancel=None, timeout=7200):
 
 def ffprobe(path):
     meta = {"duration": 0, "width": 0, "height": 0, "has_video": False, "has_audio": False,
-            "title": "", "artist": "", "acodec": "", "vcodec": ""}
+            "title": "", "artist": "", "acodec": "", "vcodec": "", "audio_count": 0}
     if not HAVE_FFMPEG:
         return meta
     try:
@@ -983,7 +983,10 @@ def ffprobe(path):
                     pass
         elif st.get("codec_type") == "audio" and not meta["has_audio"]:
             meta["has_audio"] = True
+            meta["audio_count"] += 1
             meta["acodec"] = st.get("codec_name") or ""
+        elif st.get("codec_type") == "audio":
+            meta["audio_count"] += 1
     return meta
 
 
@@ -1100,7 +1103,7 @@ def _video_split(path, max_bytes, duration, progress=None, cancel=None):
     return None
 
 
-def prepare_upload(path, cancel=None, progress=None):
+def prepare_upload(path, cancel=None, progress=None, keep_original=False):
     """Return a list of upload items: {path, kind, duration, width, height, thumb, title, artist}."""
     path = Path(path)
     ext = path.suffix.lower()
@@ -1115,7 +1118,15 @@ def prepare_upload(path, cancel=None, progress=None):
     else:
         kind = "document"
 
-    if kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
+    note = ""
+    multi_audio = meta.get("audio_count", 0) > 1
+    keep_original = keep_original or not config.CONVERT_TO_MP4
+    if kind == "video" and ext != ".mp4" and HAVE_FFMPEG and (keep_original or (multi_audio and config.KEEP_MULTI_TRACK_ORIGINAL)):
+        # MP4 conversion keeps only the FIRST audio track: files with several audio languages stay as they are (sent as a file)
+        kind = "document"
+        note = "original" if keep_original else f"{meta['audio_count']} audio tracks kept (no MP4 conversion)"
+        log.info("%s: not converted to mp4 (%s)", path.name, note)
+    elif kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
         new = _remux_mp4(path, progress, cancel, meta["duration"])
         if new != path:
             path, ext = new, ".mp4"
@@ -1143,7 +1154,7 @@ def prepare_upload(path, cancel=None, progress=None):
     items = []
     for p in paths:
         item = {"path": p, "kind": kind, "duration": 0, "width": 0, "height": 0, "thumb": None,
-                "title": meta["title"], "artist": meta["artist"]}
+                "title": meta["title"], "artist": meta["artist"], "note": note}
         if kind in ("video", "audio") and p.suffix.lower() in VIDEO_EXT | AUDIO_EXT:
             m = meta if len(paths) == 1 else ffprobe(p)
             item.update(duration=m["duration"], width=m["width"], height=m["height"])

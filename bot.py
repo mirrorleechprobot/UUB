@@ -155,6 +155,8 @@ def processing_text(job, size, p, elapsed):
     plan = split_plan_line(size)
     if plan:
         lines.append(plan)
+    if "MP4" in stage:
+        lines.append("ℹ️ Telegram plays only MP4 inside the app. Only the container changes: the video is copied, no quality loss.")
     total = p.get("ptotal") or 0
     if total:
         cur = p.get("pcur") or 0
@@ -1447,7 +1449,8 @@ async def run_job(job):
         await job_edit(job, processing_text(job, size, None, 0), cancel_markup(job))
         items = []
         for one in paths:
-            pfut = loop.run_in_executor(POOL, dl.prepare_upload, one, job.cancel, job.progress)
+            pfut = loop.run_in_executor(POOL, dl.prepare_upload, one, job.cancel, job.progress,
+                                        job.settings.get("send_as") == "document")
             last_p = time.monotonic()
             while not pfut.done():
                 await asyncio.wait({pfut}, timeout=1)
@@ -1481,6 +1484,8 @@ async def run_job(job):
                       + (f"\n🔇 <b>No audio in the source:</b> the site delivered this video without sound "
                          f"(Instagram/Facebook do this when not logged in, or the music was removed). The admin can add login cookies."
                          if job.silent else "")
+                      + (f"\n🎧 <b>{esc(items[0]['note'])}</b>: sent as the original file, so no audio language is lost."
+                         if items and items[0].get("note") and items[0]["note"] != "original" else "")
                       + channel_text_line(job)
                       + (f"\n⚡ Download speed: {size_text(size / dl_seconds)}/s (avg)" if size and dl_seconds > 3 else "")
                       + f"\n🕒 Total time: {time_text(elapsed)}")
