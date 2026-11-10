@@ -1,9 +1,11 @@
-Pyrogram==2.0.106
-TgCrypto
+# Telegram engine: wzgram is a drop-in Pyrogram fork (fast Rust crypto, paced uploads). It installs the `pyrogram` module name,
+# so NEVER install Pyrogram / TgCrypto next to it (the two would overwrite each other).
+wzgram
 uvloop; sys_platform != "win32"
 motor>=3.3
 dnspython>=2.4
 psutil>=5.9
 yt-dlp[default,curl-cffi]
+gallery-dl
 requests>=2.31.0
 deno

@@ -2,10 +2,12 @@
 
 - probe():          decide direct-file vs yt-dlp media, and build quality options
 - download():       aria2c (multi-connection) -> requests fallback for direct links,
-                    yt-dlp (+aria2c for plain HTTP, parallel fragments for HLS/DASH) for media
+                    yt-dlp (+aria2c for plain HTTP, parallel fragments for HLS/DASH) for media,
+                    gallery-dl as the FALLBACK (image galleries / posts that yt-dlp cannot handle)
 - prepare_upload(): ffprobe metadata, thumbnail, remux to mp4, split files > 2 GB
 """
 import http.cookiejar
+import importlib.util
 import json
 import logging
 import mimetypes
@@ -13,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -46,15 +49,50 @@ TEMP_SUFFIXES = (".part", ".ytdl", ".aria2", ".temp", ".tmp")
 
 HAVE_ARIA2 = shutil.which("aria2c") is not None
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+HAVE_GALLERYDL = importlib.util.find_spec("gallery_dl") is not None
 
 
 # --------------------------------------------------------------------------- cookies / session
 
+_runtime_cookies = ""        # set by the bot from the database (Admin command /setcookies)
+
+
+def set_runtime_cookies(text):
+    global _runtime_cookies
+    _runtime_cookies = (text or "").strip()
+
+
+def runtime_cookies():
+    return _runtime_cookies
+
+
+def normalize_cookies(text):
+    """Return (clean_netscape_text, cookie_count, domains). Accepts tabs or spaces between the 7 fields. No cookie -> ('', 0, [])."""
+    lines, domains = [], set()
+    for raw in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            parts = line.split(None, 6)
+        if len(parts) != 7 or parts[1].upper() not in ("TRUE", "FALSE") or parts[3].upper() not in ("TRUE", "FALSE"):
+            continue
+        lines.append("\t".join(parts))
+        domains.add(parts[0].replace("#HttpOnly_", "").lstrip("."))
+    if not lines:
+        return "", 0, []
+    return "# Netscape HTTP Cookie File\n" + "\n".join(lines) + "\n", len(lines), sorted(domains)
+
+
 def cookie_path():
-    """Netscape cookie file: COOKIES_TEXT env (secret) wins over the cookies.txt file."""
-    if config.COOKIES_TEXT.strip():
+    """Netscape cookie file. Priority: Admin /setcookies (database) > COOKIES_TEXT env (secret) > cookies.txt file."""
+    text = _runtime_cookies or config.COOKIES_TEXT.strip()
+    if text:
         path = Path(tempfile.gettempdir()) / "uub-cookies.txt"
-        path.write_text(config.COOKIES_TEXT.strip() + "\n", encoding="utf-8")
+        path.write_text(text.strip() + "\n", encoding="utf-8")
         try:
             path.chmod(0o600)
         except OSError:
@@ -239,11 +277,17 @@ def probe(url):
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001
         msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:300]
+        gal = gallery_probe(url)               # yt-dlp cannot read it: maybe it is an image gallery / post (gallery-dl)
+        if gal:
+            return gal
         if http_info is None or http_info["status"] >= 400:
             # Page unreachable for our probe; let the downloader try anyway (signed/odd URLs).
             raise ProbeError(f"Could not open this link ({http_err or 'HTTP ' + str(http_info['status'])}). {msg}")
         raise ProbeError(f"No downloadable video, audio or file found at this link. {msg}")
     if not info:
+        gal = gallery_probe(url)
+        if gal:
+            return gal
         raise ProbeError("No media found at this link.")
 
     if info.get("_type") == "playlist":
@@ -260,9 +304,134 @@ def probe(url):
 
     options = _build_options(info)
     if not options:
+        gal = gallery_probe(url)
+        if gal:
+            return gal
         raise ProbeError("No downloadable format found.")
     return {"kind": "media", "title": info.get("title") or url, "duration": info.get("duration") or 0,
             "uploader": info.get("uploader") or "", "options": options}
+
+
+# --------------------------------------------------------------------------- gallery-dl (FALLBACK when yt-dlp cannot handle a link)
+def gallery_enabled():
+    return config.GALLERYDL_ENABLED and HAVE_GALLERYDL
+
+
+def _gallery_cmd():
+    cmd = [sys.executable, "-m", "gallery_dl"]
+    cp = cookie_path()
+    if _cookies_usable(cp):
+        cmd += ["--cookies", str(cp)]
+    return cmd
+
+
+def _json_values(text):
+    """gallery-dl --dump-json prints one JSON array per input link (possibly several, possibly pretty-printed)."""
+    dec, pos, out = json.JSONDecoder(), 0, []
+    text = text.strip()
+    while pos < len(text):
+        try:
+            val, end = dec.raw_decode(text, pos)
+        except ValueError:
+            break
+        out.append(val)
+        pos = end
+        while pos < len(text) and text[pos] in " \r\n\t":
+            pos += 1
+    return out
+
+
+def gallery_probe(url):
+    """{"kind": "gallery", ...} if gallery-dl knows this link and it holds files, else None. Never raises."""
+    if not gallery_enabled():
+        return None
+    cmd = _gallery_cmd() + ["--dump-json", "--range", f"1-{config.GALLERY_MAX_FILES}", url]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=config.GALLERY_PROBE_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.info("gallery-dl probe: %s", type(exc).__name__)
+        return None
+    out = r.stdout.decode("utf-8", errors="ignore")
+    files, meta = 0, {}
+    for value in _json_values(out):
+        for msg in value if isinstance(value, list) else []:
+            if not isinstance(msg, list) or not msg:
+                continue
+            if msg[0] == 3:
+                files += 1
+            elif msg[0] == 2 and len(msg) > 1 and isinstance(msg[1], dict) and not meta:
+                meta = msg[1]
+    if files == 0:
+        log.info("gallery-dl probe: nothing for %s (%s)", url[:80], r.stderr.decode("utf-8", errors="ignore").strip()[-150:])
+        return None
+    title = ""
+    for key in ("title", "gallery", "description", "content", "caption", "album", "board", "fullname", "username"):
+        val = meta.get(key)
+        if isinstance(val, dict):
+            val = val.get("title") or val.get("name")
+        if isinstance(val, str) and val.strip():
+            title = " ".join(val.split())[:100]
+            break
+    if not title:
+        title = f"{meta.get('category', 'gallery')} {meta.get('subcategory', '')}".strip()
+    return {"kind": "gallery", "title": f"{title} ({files} file{'s' if files != 1 else ''})", "count": files, "size": 0}
+
+
+def download_gallery(url, workdir, progress, cancel, title=""):
+    """gallery-dl -> every file of the link into workdir (one result, or several: result["paths"])."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    cmd = _gallery_cmd() + ["-D", str(workdir), "-f", "{num:>03}_{filename}.{extension}", "--range", f"1-{config.GALLERY_MAX_FILES}",
+                            "-R", str(config.MAX_RETRIES), url]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    done = threading.Event()
+
+    def folder_bytes():
+        total = 0
+        try:
+            for p in workdir.iterdir():
+                if p.is_file():
+                    total += p.stat().st_size
+        except OSError:
+            pass
+        return total
+
+    def watcher():
+        last_b, last_t = 0, time.monotonic()
+        while not done.wait(1.0):
+            if cancel.is_set() and proc.poll() is None:
+                proc.terminate()
+                return
+            now, cur = time.monotonic(), folder_bytes()
+            speed = max(0, cur - last_b) / max(0.001, now - last_t)
+            last_b, last_t = cur, now
+            progress.update({"status": "downloading", "current": cur, "total": 0, "speed": speed, "eta": None})
+
+    threading.Thread(target=watcher, daemon=True).start()
+    tail = []
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line and line.startswith("[") :             # [error] / [warning] lines (downloaded file paths are not kept)
+                tail.append(line)
+                tail = tail[-6:]
+        proc.wait()
+    finally:
+        done.set()
+        if proc.poll() is None:
+            proc.kill()
+    if cancel.is_set():
+        raise Cancelled()
+    files = sorted(p for p in workdir.iterdir() if p.is_file() and not p.name.endswith(TEMP_SUFFIXES))
+    if not files:
+        reason = " | ".join(tail)[-250:] or f"exit code {proc.returncode}"
+        raise RuntimeError("gallery-dl found nothing to download: " + reason)
+    if proc.returncode not in (0, None):
+        log.warning("gallery-dl finished with code %s but %s file(s) were downloaded (partial)", proc.returncode, len(files))
+    title = re.sub(r"\s*\(\d+ files?\)\s*$", "", title or "").strip() or files[0].stem
+    result = {"path": files[0], "title": title if len(files) > 1 else files[0].name}
+    if len(files) > 1:
+        result["paths"] = files
+    return result
 
 
 # --------------------------------------------------------------------------- downloading
@@ -276,14 +445,46 @@ def _unit_bytes(value, unit):
 _ARIA_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)\((\d+)%\).*?DL:([\d.]+)(B|KiB|MiB|GiB)")
 
 
-def _aria2(url, target, progress, cancel, expected_size, connections=None):
+_ARIA_HELP = None
+
+
+def _aria_supports(flag):
+    """True if the installed aria2c knows this option (an unknown option would make the whole download fail)."""
+    global _ARIA_HELP
+    if _ARIA_HELP is None:
+        try:
+            _ARIA_HELP = subprocess.run(["aria2c", "--help=#all"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        timeout=10).stdout.decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            _ARIA_HELP = ""
+    return flag.split("=")[0] in _ARIA_HELP
+
+
+def aria_force_args(torrent=False):
+    """FORCE_SPEED: aggressive aria2 options (only those the installed aria2c supports)."""
+    if not config.FORCE_SPEED:
+        return []
+    wanted = ["--max-concurrent-downloads=16", "--optimize-concurrent-downloads=true", "--check-integrity=false",
+              "--realtime-chunk-checksum=false", "--conditional-get=false", "--http-no-cache=true", "--no-netrc=true",
+              "--max-download-limit=0", "--max-overall-download-limit=0"]
+    if torrent:
+        wanted += ["--bt-max-peers=0", "--bt-request-peer-speed-limit=100M", "--bt-max-open-files=200",
+                   "--bt-prioritize-piece=head=8M,tail=8M"]
+    else:
+        wanted += ["--uri-selector=adaptive", "--stream-piece-selector=geom", "--retry-wait=1",
+                   "--lowest-speed-limit=20K", "--max-resume-failure-tries=5"]
+    return [a for a in wanted if _aria_supports(a)]
+
+
+def _aria2(url, target, progress, cancel, expected_size, connections=None, force=True, keepalive=True):
     n = connections or config.ARIA2_CONNECTIONS
     cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
-           f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", "--enable-http-keep-alive=true", "--http-accept-gzip=false",
+           f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", f"--enable-http-keep-alive={'true' if keepalive else 'false'}",
+           "--http-accept-gzip=false",
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true", "-c",
            "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
            f"--max-tries={config.MAX_RETRIES + 2}", "--retry-wait=3", "--connect-timeout=20", "--timeout=60",
-           "--user-agent=" + config.DIRECT_USER_AGENT, "-d", str(target.parent), "-o", target.name]
+           "--user-agent=" + config.DIRECT_USER_AGENT, "-d", str(target.parent), "-o", target.name] + (aria_force_args() if force else [])
     if config.DIRECT_REFERER:
         cmd.append("--referer=" + config.DIRECT_REFERER)
     cp = cookie_path()
@@ -369,7 +570,7 @@ def download_torrent(url, workdir, progress, cancel):
            "--follow-torrent=true", "--bt-save-metadata=false", "--bt-tracker=" + trackers,
            "--max-overall-upload-limit=256K", f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M",
            "--file-allocation=none", "--auto-file-renaming=false", "--allow-overwrite=true",
-           "--summary-interval=1", "--console-log-level=warn", "--download-result=hide", "-d", str(workdir), url]
+           "--summary-interval=1", "--console-log-level=warn", "--download-result=hide", "-d", str(workdir)] + aria_force_args(torrent=True) + [url]
     progress.update({"status": "downloading", "current": 0, "total": 0, "speed": 0, "eta": None})
     _aria2_proc(cmd, progress, cancel, 0, max_bytes=config.TORRENT_MAX_GB * 1024 ** 3)
     files = [p for p in workdir.rglob("*") if p.is_file() and not p.name.endswith(TEMP_SUFFIXES + (".torrent",))]
@@ -391,27 +592,58 @@ def download_torrent(url, workdir, progress, cancel):
     return {"path": archive, "title": archive.name}
 
 
+def _sleep_cancel(cancel, seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if cancel.is_set():
+            raise Cancelled()
+        time.sleep(0.5)
+
+
 def _requests_download(url, target, progress, cancel):
+    """Plain HTTP download with RETRIES and RESUME (Range): a dropped connection continues where it stopped."""
     s = _session()
+    attempts = config.MAX_RETRIES + 3
+    current, total = 0, 0
+    last_bytes, last_time = 0, time.monotonic()
     try:
-        with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60)) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("Content-Length") or 0)
-            current, last_bytes, last_time = 0, 0, time.monotonic()
-            with target.open("wb") as out:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if cancel.is_set():
-                        raise Cancelled()
-                    if not chunk:
-                        continue
-                    out.write(chunk)
-                    current += len(chunk)
-                    now = time.monotonic()
-                    if now - last_time >= 1:
-                        speed = (current - last_bytes) / (now - last_time)
-                        last_bytes, last_time = current, now
-                        progress.update({"status": "downloading", "current": current, "total": total,
-                                         "speed": speed, "eta": (total - current) / speed if total and speed else None})
+        for attempt in range(attempts):
+            headers = {"Range": f"bytes={current}-"} if current > 0 else {}
+            try:
+                with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60), headers=headers) as r:
+                    if r.status_code == 416 and total and current >= total:
+                        break                                         # nothing left to fetch
+                    r.raise_for_status()
+                    resumed = current > 0 and r.status_code == 206
+                    if current > 0 and not resumed:
+                        current = 0                                   # the server ignores Range: start again from the beginning
+                    clen = int(r.headers.get("Content-Length") or 0)
+                    m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range", ""))
+                    total = int(m.group(1)) if m else (current + clen if clen else total)
+                    with target.open("ab" if resumed else "wb") as out:
+                        for chunk in r.iter_content(chunk_size=4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024):
+                            if cancel.is_set():
+                                raise Cancelled()
+                            if not chunk:
+                                continue
+                            out.write(chunk)
+                            current += len(chunk)
+                            now = time.monotonic()
+                            if now - last_time >= 1:
+                                speed = (current - last_bytes) / (now - last_time)
+                                last_bytes, last_time = current, now
+                                progress.update({"status": "downloading", "current": current, "total": total,
+                                                 "speed": speed, "eta": (total - current) / speed if total and speed else None})
+                if total and current < total:
+                    raise ConnectionError(f"connection closed early at {current}/{total} bytes")
+                break
+            except Cancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if attempt >= attempts - 1:
+                    raise
+                log.warning("direct download interrupted (%s) at %s bytes; retry %s/%s", type(exc).__name__, current, attempt + 1, attempts - 1)
+                _sleep_cancel(cancel, min(20, 3 * (attempt + 1)))
     finally:
         s.close()
 
@@ -426,6 +658,9 @@ def _looks_like_html(path):
         return False
 
 
+_HOST_RUNG = {}        # host -> (aria2 rung that worked, time): servers that cannot take 16 connections
+
+
 def download_direct(url, workdir, progress, cancel, filename=None, size=0):
     if not filename:
         info = _probe_http(url)
@@ -434,28 +669,45 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
     target = workdir / safe_filename(filename)
     progress.update({"status": "downloading", "current": 0, "total": size, "speed": 0, "eta": None})
     errors = []
+    aria_done = False
+    host = urlparse(url).netloc.lower()
     if HAVE_ARIA2:
-        # Some servers refuse many parallel connections (403/429): retry with fewer before the 1-connection fallback.
-        ladder = [config.ARIA2_CONNECTIONS] + ([4] if config.ARIA2_CONNECTIONS > 4 else [])
-        for conns in ladder:
+        # Servers that drop connections (TLS "non-properly terminated", 403/429 ...) get fewer connections, keep-alive off and no
+        # aggressive options, with a pause between the tries. The partial file is KEPT (aria2 resumes it). A host that needed a
+        # lower rung is remembered for an hour, so the next file from it starts there.
+        n = config.ARIA2_CONNECTIONS
+        rungs = [(n, True, True)] + ([(4, False, False)] if n > 4 else []) + [(1, False, False)]
+        start = _HOST_RUNG.get(host, (0, 0))
+        first = start[0] if time.time() - start[1] < 3600 else 0
+        for i, (conns, force, keepalive) in enumerate(rungs):
+            if i < first:
+                continue
             try:
-                _aria2(url, target, progress, cancel, size, conns)
+                _aria2(url, target, progress, cancel, size, conns, force, keepalive)
+                aria_done = True
+                if i > 0:
+                    _HOST_RUNG[host] = (i, time.time())
                 break
             except Cancelled:
                 raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
                 log.warning("aria2c (%s conn) failed (%s)", conns, str(exc)[:120])
-                target.unlink(missing_ok=True)
-                Path(str(target) + ".aria2").unlink(missing_ok=True)
-    if not target.is_file():
+                if i < len(rungs) - 1:
+                    _sleep_cancel(cancel, 3 * (i + 1))
+    if not aria_done:                                    # aria2 gave up (or is not installed): plain HTTP with retries + resume
+        target.unlink(missing_ok=True)               # aria2's half-written file may be sparse: not resumable by size
+        Path(str(target) + ".aria2").unlink(missing_ok=True)
         try:
             _requests_download(url, target, progress, cancel)
         except Cancelled:
             raise
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
-            raise RuntimeError("Download failed: " + " | ".join(e[:200] for e in errors)) from exc
+            hint = ""
+            if any(k in " ".join(errors).lower() for k in ("tls", "remotedisconnected", "connection aborted", "reset by peer", "failed to receive")):
+                hint = " (The server keeps closing the connection: it limits parallel connections or is rate-limiting this server's IP. Try again later.)"
+            raise RuntimeError("Download failed: " + " | ".join(e[:160] for e in errors[-3:]) + hint) from exc
     if not target.is_file() or target.stat().st_size == 0:
         raise RuntimeError("The server returned an empty file.")
     if _looks_like_html(target) and target.suffix.lower() not in (".html", ".htm", ".txt"):
@@ -487,37 +739,90 @@ def _fetch_format(url, workdir, fmt, tag):
     return [p for p in files if p.is_file()] or sorted(workdir.glob(f"*.{tag}.*"))
 
 
-# Tried in this order when a downloaded video has no sound. The site's own format labels are NOT trusted (Instagram /
-# Facebook often leave acodec empty), only what ffprobe finds inside the downloaded files.
-AUDIO_FALLBACKS = (("audio", "ba/bestaudio", "separate audio stream"),
-                   ("audio2", "ba*", "audio taken from a format that also contains video"),
-                   ("muxed", "b/best", "a complete video+audio file"))
+def _remote_has_audio(fmt, timeout=20):
+    """True / False / None (could not tell). ffprobe reads only the first KB of the remote stream: NO download."""
+    if not HAVE_FFMPEG or not fmt.get("url"):
+        return None
+    headers = dict(fmt.get("http_headers") or {})
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+           "-rw_timeout", str(int(timeout * 1_000_000 * 0.75))]
+    if headers.get("User-Agent"):
+        cmd += ["-user_agent", headers.pop("User-Agent")]
+    if headers:
+        cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+    cmd.append(fmt["url"])
+    try:
+        r = _run(cmd, timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    return "audio" in (r.stdout or b"").decode("utf-8", errors="ignore")
+
+
+def _fmt_weight(f, duration):
+    size = _fmt_size(f)
+    if not size and f.get("tbr") and duration:
+        size = f["tbr"] * 1000 / 8 * duration
+    return size or 10 ** 12                 # unknown size = assume big (tried last)
+
+
+def _audio_candidates(info, used_ids):
+    """Formats that may carry the missing sound, cheapest first. A site's own labels are not trusted (Instagram / Facebook
+    leave acodec empty): ffprobe on the remote stream decides. We only need the SOUND, so among complete (video+audio)
+    formats the SMALLEST is taken - the audio track is the same."""
+    fmts = [f for f in (info.get("formats") or []) if f.get("url") and f.get("format_id") not in used_ids
+            and f.get("protocol") not in ("mhtml",) and f.get("ext") != "mhtml"]
+    dur = info.get("duration") or 0
+    has_v = lambda f: f.get("vcodec") not in (None, "none")                       # noqa: E731
+    audio_only = [f for f in fmts if not has_v(f) and f.get("acodec") not in (None, "none")]
+    with_audio = [f for f in fmts if has_v(f) and f.get("acodec") not in (None, "none")]
+    unknown = [f for f in fmts if f.get("acodec") is None]
+    ordered, seen = [], set()
+    for group in (sorted(audio_only, key=lambda f: _fmt_weight(f, dur)), sorted(with_audio, key=lambda f: _fmt_weight(f, dur)),
+                  sorted(unknown, key=lambda f: _fmt_weight(f, dur))):
+        for f in group:
+            if f["format_id"] not in seen:
+                seen.add(f["format_id"])
+                ordered.append(f)
+    return ordered
 
 
 def _ensure_audio(url, result, info, workdir, progress, cancel):
-    """Instagram / Facebook / Reels often deliver video and audio separately, or label them wrongly. If the downloaded
-    file has a video track but NO audio track, try (1) the separate audio stream, (2) the audio of any format that has
-    sound, (3) a complete muxed file, and mux the sound into the video (video copied, audio -> AAC so every Telegram
-    player has sound). Only a video for which no strategy finds audio is treated as really silent."""
+    """The downloaded file has a video track but NO audio. Look for the sound WITHOUT re-downloading the whole video:
+    every candidate stream is first checked with ffprobe (a few KB), and only a stream that really has audio is downloaded
+    (an audio-only stream is small, a complete format is the smallest one). Then the sound is muxed into the video
+    (video copied, audio -> AAC). If nothing has sound the video is really silent: it is delivered at once."""
     path = Path(result["path"])
     if not HAVE_FFMPEG:
         return result
     meta = ffprobe(path)
     if not meta["has_video"] or meta["has_audio"]:
         return result
-    chosen = [(f.get("format_id"), f.get("vcodec"), f.get("acodec")) for f in (info.get("requested_formats") or [])]
-    log.warning("downloaded video has NO audio track (formats used: %s, site lists %d audio-only formats) - looking for sound",
-                chosen, len(_audio_only_formats(info)))
+    used = {f.get("format_id") for f in (info.get("requested_formats") or [])} | {info.get("format_id")}
+    candidates = _audio_candidates(info, used)[:config.AUDIO_SEARCH_MAX_CANDIDATES]
+    log.warning("downloaded video has NO audio track (used formats: %s) - %d other format(s) to check", sorted(map(str, used)), len(candidates))
     progress["status"] = "processing"
-    for tag, fmt, what in AUDIO_FALLBACKS:
+    deadline = time.monotonic() + config.AUDIO_SEARCH_MAX_SEC
+    for n, f in enumerate(candidates):
         if cancel.is_set():
             raise Cancelled()
+        if time.monotonic() > deadline:
+            log.warning("audio search stopped: time budget (%ss) used", config.AUDIO_SEARCH_MAX_SEC)
+            break
+        has_audio = _remote_has_audio(f)
+        has_v = f.get("vcodec") not in (None, "none")
+        small = not has_v and (not _fmt_size(f) or _fmt_size(f) < 80 * 1024 * 1024)
+        if has_audio is False or (has_audio is None and not small):
+            log.info("audio candidate %s skipped (%s)", f["format_id"], "no sound" if has_audio is False else "cannot verify, too big to risk")
+            continue
+        tag = f"aud{n}"
         try:
-            files = _fetch_format(url, workdir, fmt, tag)
+            files = _fetch_format(url, workdir, str(f["format_id"]), tag)
         except Cancelled:
             raise
-        except Exception as exc:  # noqa: BLE001  ("format not available" = this strategy has nothing)
-            log.info("audio strategy '%s' found nothing: %s", tag, str(exc)[:120])
+        except Exception as exc:  # noqa: BLE001
+            log.info("audio candidate %s failed: %s", f["format_id"], str(exc)[:120])
             continue
         src = next((p for p in files if ffprobe(p)["has_audio"]), None)
         if src is None:
@@ -532,16 +837,13 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
                 p.unlink(missing_ok=True)
             final = path.with_suffix(".mp4")
             out.replace(final)
-            log.info("sound added using: %s", what)
+            log.info("sound added from format %s", f["format_id"])
             return {"path": final, "title": result["title"]}
         out.unlink(missing_ok=True)
-        log.warning("muxing audio from '%s' failed: %s", tag, (r.stderr or b"")[-160:].decode(errors="ignore"))
-        if tag == "muxed" and ffprobe(src)["has_video"]:       # last resort: use the complete file as it is
-            path.unlink(missing_ok=True)
-            return {"path": src, "title": result["title"]}
+        log.warning("muxing audio from format %s failed: %s", f["format_id"], (r.stderr or b"")[-160:].decode(errors="ignore"))
         for p in files:
             p.unlink(missing_ok=True)
-    log.warning("no audio found by any strategy: this video is really silent (or the site needs login cookies)")
+    log.warning("no audio found: this video is really silent (or the site needs login cookies)")
     result["silent"] = True
     return result
 
@@ -562,7 +864,7 @@ def download_media(url, option, workdir, progress, cancel):
         opts = ytdlp_base_opts()
         opts.update({
             "outtmpl": str(workdir / "%(title).150B [%(id)s].%(ext)s"),
-            "continuedl": True, "overwrites": False, "file_access_retries": config.MAX_RETRIES,
+            "continuedl": True, "overwrites": False, "buffersize": 4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024, "file_access_retries": config.MAX_RETRIES,
             "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS,
             "progress_hooks": [hook], "http_chunk_size": 10 * 1024 * 1024,
             "ignoreerrors": False,
@@ -583,7 +885,7 @@ def download_media(url, option, workdir, progress, cancel):
             n = config.ARIA2_CONNECTIONS
             opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
             opts["external_downloader_args"] = {"aria2c": [f"-x{n}", f"-s{n}", "-k1M", "--file-allocation=none",
-                                                            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M"]}
+                                                            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M"] + aria_force_args()}
             opts.pop("http_chunk_size", None)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -630,7 +932,25 @@ def download(job, workdir):
         raise RuntimeError(str(exc)) from exc
     if job.mode == "direct":
         return download_direct(job.url, workdir, job.progress, job.cancel, job.direct_name, job.direct_size)
-    return download_media(job.url, job.option, workdir, job.progress, job.cancel)
+    if job.mode == "gallery":
+        return download_gallery(job.url, workdir, job.progress, job.cancel, job.title)
+    try:
+        return download_media(job.url, job.option, workdir, job.progress, job.cancel)
+    except Cancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if job.cancel.is_set() or not gallery_enabled():
+            raise
+        log.info("yt-dlp failed (%s); trying gallery-dl", type(exc).__name__)
+        for leftover in workdir.iterdir():                  # remove yt-dlp leftovers before the second downloader starts
+            shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+        try:
+            return download_gallery(job.url, workdir, job.progress, job.cancel, job.title)
+        except Cancelled:
+            raise
+        except Exception as gexc:  # noqa: BLE001
+            log.info("gallery-dl fallback failed too: %s", str(gexc)[:150])
+            raise exc
 
 
 # --------------------------------------------------------------------------- post-processing
@@ -639,9 +959,45 @@ def _run(cmd, timeout=None):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
 
+def _set_stage(progress, stage, current=0, total=0, speed=0.0, eta=None, unit="x"):
+    if progress is not None:
+        progress.update({"status": "processing", "stage": stage, "pcur": current, "ptotal": total, "pspeed": speed, "peta": eta, "punit": unit})
+
+
+def _run_progress(cmd, duration, progress, stage, cancel=None, timeout=7200):
+    """ffmpeg with live progress (percent + speed + ETA from `-progress`). Same result shape as _run()."""
+    if progress is None or not duration:
+        return _run(cmd, timeout)
+    full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+    proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    err = []
+    threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True).start()
+    start = time.monotonic()
+    try:
+        for line in proc.stdout:
+            if cancel is not None and cancel.is_set():
+                proc.terminate()
+                break
+            key, _, val = line.strip().partition("=")
+            if key == "out_time_us" and val.lstrip("-").isdigit():
+                done_s = max(0.0, int(val) / 1_000_000)
+                frac = min(0.995, done_s / duration)
+                elapsed = max(0.001, time.monotonic() - start)
+                _set_stage(progress, stage, int(frac * 1000), 1000, done_s / elapsed,
+                           elapsed * (1 - frac) / frac if frac > 0.02 else None)
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                break
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    return subprocess.CompletedProcess(full, proc.returncode, b"", ("".join(err)).encode("utf-8", errors="ignore"))
+
+
 def ffprobe(path):
     meta = {"duration": 0, "width": 0, "height": 0, "has_video": False, "has_audio": False,
-            "title": "", "artist": "", "acodec": "", "vcodec": ""}
+            "title": "", "artist": "", "acodec": "", "vcodec": "", "audio_count": 0}
     if not HAVE_FFMPEG:
         return meta
     try:
@@ -679,7 +1035,10 @@ def ffprobe(path):
                     pass
         elif st.get("codec_type") == "audio" and not meta["has_audio"]:
             meta["has_audio"] = True
+            meta["audio_count"] += 1
             meta["acodec"] = st.get("codec_name") or ""
+        elif st.get("codec_type") == "audio":
+            meta["audio_count"] += 1
     return meta
 
 
@@ -719,7 +1078,7 @@ def _fix_mp4_audio(path):
     return path
 
 
-def _remux_mp4(path):
+def _remux_mp4(path, progress=None, cancel=None, duration=0):
     out = path.with_suffix(".mp4")
     if out == path:
         return path
@@ -730,8 +1089,8 @@ def _remux_mp4(path):
         # Opus / Vorbis inside MP4 plays SILENT in Telegram's players -> convert such audio to AAC (video stays untouched).
         acodec = ffprobe(path).get("acodec", "")
         audio = ["-c:a", "copy"] if (not acodec or acodec in TG_AUDIO_OK) else ["-c:a", "aac", "-b:a", "192k"]
-        r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
-                  "-sn", "-dn", *fast, str(tmp)])
+        r = _run_progress(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio,
+                          "-sn", "-dn", *fast, str(tmp)], duration, progress, "Converting to MP4", cancel)
     except Exception:  # noqa: BLE001
         tmp.unlink(missing_ok=True)
         return path
@@ -743,8 +1102,11 @@ def _remux_mp4(path):
     return path
 
 
-def _byte_split(path, max_bytes):
+def _byte_split(path, max_bytes, progress=None, cancel=None):
     parts = []
+    total = path.stat().st_size
+    n_parts = max(1, -(-total // max_bytes))
+    done, start = 0, time.monotonic()
     with path.open("rb") as src:
         index = 1
         while True:
@@ -757,6 +1119,12 @@ def _byte_split(path, max_bytes):
                         break
                     dst.write(chunk)
                     written += len(chunk)
+                    done += len(chunk)
+                    if progress is not None:
+                        el = max(0.001, time.monotonic() - start)
+                        _set_stage(progress, f"Splitting into {n_parts} parts", done, total, done / el, (total - done) / (done / el), "B")
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
             if written == 0:
                 part.unlink(missing_ok=True)
                 break
@@ -765,16 +1133,18 @@ def _byte_split(path, max_bytes):
     return parts
 
 
-def _video_split(path, max_bytes, duration):
+def _video_split(path, max_bytes, duration, progress=None, cancel=None):
     size = path.stat().st_size
+    n_parts = max(1, -(-size // max_bytes))
     for factor in (0.9, 0.7, 0.5):
         seg = max(5, int(duration * max_bytes / size * factor))
         pattern = path.with_name(path.stem + ".part%03d.mp4")
         for old in path.parent.glob(path.stem + ".part*.mp4"):
             old.unlink(missing_ok=True)
         try:
-            r = _run(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
-                      "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1", str(pattern)])
+            r = _run_progress(["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
+                               "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1", str(pattern)],
+                              duration, progress, f"Splitting into ~{n_parts} parts", cancel)
         except Exception:  # noqa: BLE001
             return None
         parts = sorted(path.parent.glob(path.stem + ".part*.mp4"))
@@ -785,7 +1155,7 @@ def _video_split(path, max_bytes, duration):
     return None
 
 
-def prepare_upload(path, cancel=None):
+def prepare_upload(path, cancel=None, progress=None, keep_original=False):
     """Return a list of upload items: {path, kind, duration, width, height, thumb, title, artist}."""
     path = Path(path)
     ext = path.suffix.lower()
@@ -800,8 +1170,16 @@ def prepare_upload(path, cancel=None):
     else:
         kind = "document"
 
-    if kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
-        new = _remux_mp4(path)
+    note = ""
+    multi_audio = meta.get("audio_count", 0) > 1
+    keep_original = keep_original or not config.CONVERT_TO_MP4
+    if kind == "video" and ext != ".mp4" and HAVE_FFMPEG and (keep_original or (multi_audio and config.KEEP_MULTI_TRACK_ORIGINAL)):
+        # MP4 conversion keeps only the FIRST audio track: files with several audio languages stay as they are.
+        # The file is NOT converted but keeps kind="video": the user's /settings (Video / Document) decides how it is sent
+        note = "original" if keep_original else f"{meta['audio_count']} audio tracks kept (no MP4 conversion)"
+        log.info("%s: not converted to mp4 (%s)", path.name, note)
+    elif kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
+        new = _remux_mp4(path, progress, cancel, meta["duration"])
         if new != path:
             path, ext = new, ".mp4"
             meta = ffprobe(path)
@@ -815,19 +1193,20 @@ def prepare_upload(path, cancel=None):
     max_bytes = int(config.SPLIT_SIZE_MB * 1024 * 1024)
     paths = [path]
     if path.stat().st_size > max_bytes:
-        parts = _video_split(path, max_bytes, meta["duration"]) if kind == "video" and meta["duration"] and HAVE_FFMPEG else None
+        parts = (_video_split(path, max_bytes, meta["duration"], progress, cancel)
+                 if kind == "video" and meta["duration"] and HAVE_FFMPEG else None)
         if parts:
             path.unlink(missing_ok=True)
             paths = parts
         else:
-            paths = _byte_split(path, max_bytes)
+            paths = _byte_split(path, max_bytes, progress, cancel)
             path.unlink(missing_ok=True)
             kind = "document"
 
     items = []
     for p in paths:
         item = {"path": p, "kind": kind, "duration": 0, "width": 0, "height": 0, "thumb": None,
-                "title": meta["title"], "artist": meta["artist"]}
+                "title": meta["title"], "artist": meta["artist"], "note": note}
         if kind in ("video", "audio") and p.suffix.lower() in VIDEO_EXT | AUDIO_EXT:
             m = meta if len(paths) == 1 else ffprobe(p)
             item.update(duration=m["duration"], width=m["width"], height=m["height"])

@@ -1,7 +1,7 @@
 # URL Uploader Bot — Complete Guide (Features • Config • Commands • "Kya karne par kya hoga")
 
 > Ye guide code se banayi gayi hai: har env variable ka naam aur default value `config.py` se, aur har command `bot.py` se liya gaya hai.
-> Hosting: **Koyeb** • Database: **MongoDB (Atlas)** • Library: Pyrogram 2.0.106 + yt-dlp + aria2c + ffmpeg.
+> Hosting: **Koyeb** • Database: **MongoDB (Atlas)** • Library: **wzgram** (Pyrogram fork) + yt-dlp + gallery-dl + aria2c + ffmpeg.
 
 ---
 
@@ -96,7 +96,7 @@ Baaki sab ke **default theek** hain. Neeche har variable ka asar likha hai.
 |---|---|---|
 | `ARIA2_CONNECTIONS` | 16 | Ek file ke liye aria2c connections (max 16). Server 403/429 de to bot khud 16 → 4 → 1 connection fallback karta hai |
 | `ARIA2_DISK_CACHE_MB` | 64 | aria2 ka RAM disk-cache (0–512). Zyada → kam disk writes; chhoti RAM par kam rakho |
-| `CONCURRENT_FRAGMENTS` | 32 | HLS/DASH (YouTube, m3u8) fragments ek saath. Zyada → tez, par server block kar sakta hai |
+| `CONCURRENT_FRAGMENTS` | 48 (max 64) | HLS/DASH (YouTube, m3u8) fragments ek saath. Zyada → tez, par server block kar sakta hai |
 | `MAX_RETRIES` | 3 | Download retry count (1–10) |
 | `DIRECT_REFERER` | "" | Direct link ke liye Referer header (kuch sites ke liye) |
 | `DIRECT_USER_AGENT` | Chrome UA | Direct downloads ka User-Agent |
@@ -104,16 +104,11 @@ Baaki sab ke **default theek** hain. Neeche har variable ka asar likha hai.
 ### 3.4 Speed — Upload
 | Env | Default | Kya karta hai → badalne par kya hoga |
 |---|---|---|
-| `UPLOAD_CONNECTIONS` | 8 | Ek badi file ke liye max MTProto connections (1–16). Zyada → tez, par Telegram timeouts/FloodWait de sakta hai. Auto-tune isse **neeche** ghata/badha sakta hai, upar nahi |
-| `UPLOAD_WORKERS_PER_CONNECTION` | 4 | Har connection par ek saath bheje jaane wale 512 KB parts (1–8) |
-| `UPLOAD_ADAPTIVE` | true | File size ke hisab se connections: <10 MB → 1, <40 MB → 2, <150 MB → 4, <400 MB → 6, uske upar max. `false` → hamesha max (speedtest isi ke liye ise temporary off karta hai) |
-| `AUTOTUNE` | true | Upload timeouts par connections 30% kam, 2 clean uploads par +1 (min 2). Value DB me save hoti hai |
-| `SESSION_REUSE` | true | Upload connections files ke beech warm rakhta hai (har file par ~1–2 s bachta hai). Idle 120 s baad band |
 | `MAX_CONCURRENT_TRANSMISSIONS` | 6 | Ek client par ek saath upload streams |
 | `SPLIT_SIZE_MB` | 1950 | >2 GB files is size ke parts me kati jaati hain (Telegram bot limit 2 GB) |
 | `PROGRESS_UPDATE_INTERVAL` | 10 | Progress message kitne second me edit ho (min 5). Kam → FloodWait ka risk |
 
-> **Tune kaise karein:** admin `/speedtest 400 8 4` (MB, connections, workers) chalao → asli MB/s batata hai. `12 4`, `6 6` try karke best value env me daalo.
+> **Speed check:** admin `/speedtest 200` chalao → asli MB/s batata hai (upload engine: wzgram).
 
 ### 3.5 Queue / Limits
 | Env | Default | Kya karta hai → badalne par kya hoga |
@@ -202,7 +197,6 @@ Bot link dekhkar khud decide karta hai:
 ### 4.2 Upload kaise hota hai (speed)
 - Custom fast uploader: file size ke hisab se 1–8 connections × 4 workers.
 - Part-level **retry** + **FloodWait handling** (part khona nahi).
-- **Auto-tune**: timeouts aaye → connections kam; stable → dheere badhte hain.
 - **Session reuse**: connections warm rehte hain.
 - `uvloop` (kam CPU), disk read thread me.
 
@@ -348,7 +342,7 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | Command | Kaam |
 |---|---|
 | `/stats` | CPU/RAM/disk %, jobs, uploaders, tuner, DB, keep-alive, aaj/total usage |
-| `/speedtest [MB] [conns] [workers]` | Random data upload karke asli MB/s |
+| `/speedtest [MB]` | Random data upload karke asli MB/s |
 | `/helpers` | Helper bots ka status + wajah |
 | `/testlog` | Log channel check + test message |
 | `/cleanup` | Disk safai |
@@ -424,10 +418,8 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | Link `127.0.0.1` / `192.168…` ho | Block: "private / internal address" |
 | Expired direct link (HTML page) | "HTML page mila" error, file nahi |
 | Torrent 8 GB se bada | Abort: "above the 8 GB limit" |
-| `UPLOAD_CONNECTIONS=16` kiya | Zyada speed ho sakti hai, par timeouts par auto-tune khud kam karega |
 | `MAX_CONCURRENT_JOBS=1` | Poore bot par ek hi file ek time par |
 | `PIPELINE=false` | Download aur upload overlap nahi; strict ek-ek |
-| `AUTOTUNE=false` | Connections hamesha `UPLOAD_CONNECTIONS` (size-based scaling ke saath) |
 | `YTDLP_UPDATE_HOURS=0` | Auto-update restart band (start par update `YTDLP_UPDATE_ON_START` se) |
 | `KEEPALIVE_URL` na ho aur `KOYEB_PUBLIC_DOMAIN` bhi na mile | Keep-alive OFF; log me warning; `/uptime` me "no public URL" |
 | `/clearlinks all` | Cache + orphan queue records saaf; premium/users/settings/codes **nahi** chhute |
@@ -451,7 +443,6 @@ Duration units: `m`/`min` minute • `h` ghanta • `d` din • `w` hafta • `m
 | `no audio found by any strategy` | Source me audio hai hi nahi / login cookies chahiye |
 | `sound added using: …` | Audio mux ho gaya |
 | `converting opus audio to AAC` | Telegram-safe audio |
-| `Upload auto-tune: connections 8 -> 5` | Timeouts mile, connections kam kiye |
 | `Upload FloodWait: sleeping Ns` | Part ke liye FloodWait, wait + retry |
 | `Janitor freed N MB` | Auto-clean chala |
 | `Keep-alive ping failed (status …)` | `KEEPALIVE_URL` / public domain check |
@@ -510,3 +501,54 @@ HELPER_BOT_TOKENS=       # extra bots
 DAILY_LIMIT_GB=0
 DISK_CLEAN_PERCENT=90
 ```
+
+## v7 additions
+| Setting | Default | Matlab |
+|---|---|---|
+| `GALLERYDL_ENABLED` | true | yt-dlp fail ho to gallery-dl fallback (sab users) |
+| `GALLERY_MAX_FILES` | 30 | Ek gallery link se max files |
+| `GALLERY_PROBE_TIMEOUT` | 60 | Gallery link analyse karne ka max time (sec) |
+| `HELPER_FIRST` | true | Helpers ready hon to pehle wahi upload karein |
+| `TXT_MAX_URLS` / `TXT_MAX_FILE_KB` / `TXT_RESTORE_MAX_AGE_H` | 2000 / 2048 / 168 | TXT upload limits |
+
+Admin commands: `/setcookies` `/cookies` `/delcookies` • `/addplus` `/removeplus` `/pluslist`. User: `/stoptxt`.
+| `FORCE_SPEED` | true | Aggressive download options: aria2 adaptive mirrors, slow connections (<20 KB/s) dropped and retried, bigger buffers, unlimited torrent peers. `false` = purane safe options |
+| `AUTO_PARALLEL` | true | Slow download (< `AUTO_PARALLEL_SLOW_MBPS`) ho to usi user ki agli file bhi ek saath shuru. Tez download ko kabhi nahi chhuta. Upload ek-ek hi, TXT me order same |
+| `AUTO_PARALLEL_MAX` / `_TARGET_MBPS` / `_SLOW_MBPS` | 3 / 10 / 3 | Max parallel files / total speed target / "slow" ki seema (MB/s) |
+| `AUTO_PARALLEL_WARMUP_SEC` / `_MIN_FREE_MB` | 20 / 3000 | Speed judge karne se pehle wait / extra file ke liye free disk |
+| `UPLOAD_STALL_SEC` / `UPLOAD_STALL_RETRIES` | 240 / 2 | Upload me itni der koi naya byte na jaye to wo cancel hoke dobara chalta hai (helper hang ho to main bot se). Pehle ye 0% par hamesha atak sakta tha |
+
+## SPEED_PROFILE (ek switch, sabse tez settings ke liye)
+| Profile | Upload streams | HLS fragments | aria2 cache | Parallel downloads |
+|---|---|---|---|---|
+| `max` | 16 | 64 | 128 MB | haan (3 tak) |
+| `balanced` | 6 | 48 | 64 MB | haan (3 tak) |
+| `low` | 4 | 16 | 16 MB | nahi |
+`auto` (default): RAM > 1 GB → `max`, warna `low` (Koyeb free 512 MB par `max` bot ko OOM-kill kar sakta hai). Koi bhi alag variable set karoge to wahi chalega. `/stats` me chalta hua profile dikhta hai.
+
+## 4-5 Premium users ek saath (Koyeb sizing, docs May 2026)
+| Plan | vCPU / RAM / Disk | Price/mahina | Kitne users |
+|---|---|---|---|
+| Free | 0.1 / 512 MB / 2 GB | $0 | 1-2 halke users, choti files |
+| `eco-medium` | 1 / 2 GB / 16 GB | $10.71 | 4-5 users (profile auto → `balanced`: 6 jobs) |
+| `eco-large` | 2 / 4 GB / 20 GB | $21.43 | 5+ users comfortable (profile auto → `max`: 10 jobs) |
+Eco plans Washington D.C., Frankfurt aur **Singapore** me milte hain (aapka bot DC5 = Singapore). Free sirf Frankfurt / Washington me.
+Bot khud: har user ka apna download slot + apni upload line (ek ka lamba TXT baaki ko nahi rokta), auto-parallel sirf tab jab koi aur user wait na kar raha ho, RAM `MEMORY_START_LIMIT_PCT` (85%) se upar ho to naya job ruk jata hai, disk kam ho to job wait karta hai.
+
+## Badi files, lambe jobs, log channel
+| Setting | Default | Matlab |
+|---|---|---|
+| `MAX_FILE_GB` | 4 | Sabse badi file. Usse badi ho to download se pehle ya beech me hi "File too big" |
+| `SPLIT_SIZE_MB` | 1950 | Is size se badi file parts me tootti hai (4 GB = 3 parts). Download ke dauran "Will be split: N parts" dikhta hai, split ke waqt % + speed + ETA |
+| `LONG_JOB_RELEASE` / `LONG_JOB_MIN` / `LONG_JOB_MAX_PARALLEL` | true / 10 / 3 | Ek file 10 min se zyada (download/split ya upload) le to agli file bhi shuru ho jaati hai |
+| `LOG_MIRROR` / `LOG_MIRROR_INTERVAL_SEC` | true / 15 | Log channel me har job ka live status (user wala hi) ek edited message me |
+
+## Cancel (v7.1)
+Running job ko cancel karte hi uske saare child processes (aria2c, ffmpeg, gallery-dl) kill ho jaate hain, "Cancelling..." turant dikhta hai, aur agar download ka thread 15 sec me na ruke to bot uska intezaar chhod deta hai. Kill hone se aaya error "Failed" nahi, "Cancelled" ginta hai.
+
+## MKV -> MP4 (v7.2)
+Telegram app ke andar sirf MP4 chalta hai, isliye MKV/AVI jaisi video MP4 me badli jaati hai (sirf container badalta hai, quality same). MP4 conversion me sirf PEHLA audio track bachta hai, isliye **1 se zyada audio track wali file (Hin+Tam+Mal) convert nahi hoti, original MKV jaati hai (/settings ke Video/Document ke hisaab se)** (`KEEP_MULTI_TRACK_ORIGINAL=true`). `/settings` me "Document" chuna ho to bhi conversion skip hota hai (time bachta hai).
+| `CONVERT_TO_MP4` | true | `false` = MKV/AVI kabhi MP4 nahi banti, original jaati hai (/settings me Video ho to video ki tarah, Document ho to document) (saare audio tracks + subtitles bachte hain) |
+
+## Direct link: server connection tod de (v7.3)
+aria2 ka ladder: 16 conn (force flags) -> 4 conn -> 1 conn (keep-alive band, aggressive flags band), har try ke beech 3/6 sec ruk kar, aadhi file **delete nahi hoti** (resume). Jo host kam connection par chala use 1 ghante yaad rakhta hai. Aakhir me plain HTTP fallback ab retry + Range-resume karta hai. "TLS connection was non-properly terminated" / "RemoteDisconnected" = server parallel connections ya IP rate-limit se connection band kar raha hai.

@@ -29,7 +29,7 @@ delcode - Admin: redeem code hatao
 userstats - Admin: kisi user ka usage dekho
 topusers - Admin: sabse zyada use karne wale users
 stats - Admin: bot stats (CPU, RAM, disk, jobs)
-speedtest - Admin: upload speed test
+speedtest - Admin: upload speed test (wzgram)
 helpers - Admin: helper bots ka status
 testlog - Admin: log channel test
 cleanup - Admin: disk safai
@@ -40,3 +40,6 @@ stoptxt - Premium Plus: TXT task rok do
 addplus - Admin: user ko Premium Plus (TXT upload) do
 removeplus - Admin: user ka Premium Plus hatao
 pluslist - Admin: Premium Plus users ki list
+setcookies - Admin: cookies.txt set karo (file + caption)
+cookies - Admin: cookies status
+delcookies - Admin: cookies hatao

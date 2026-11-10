@@ -10,9 +10,38 @@ def env_int(name, default):
 
 def env_bool(name, default):
     value = os.getenv(name)
-    if value is None:
+    if value is None or not value.strip():
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---- speed profile: ONE switch that sets the speed-related defaults (any variable you set yourself still wins) ----
+def _memory_limit_mb():
+    """RAM this container may use (cgroup limit, e.g. Koyeb free = 512 MB); falls back to the machine's RAM."""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = open(path, encoding="utf-8").read().strip()
+            if raw.isdigit() and int(raw) < 1 << 50:
+                return int(raw) // (1024 * 1024)
+        except OSError:
+            pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+MEMORY_MB = _memory_limit_mb()
+_requested = os.getenv("SPEED_PROFILE", "auto").strip().lower()
+SPEED_PROFILE = _requested if _requested in ("max", "balanced", "low") else (
+    "low" if 0 < MEMORY_MB <= 1024 else "balanced" if 0 < MEMORY_MB <= 3072 else "max")
+_PROFILES = {
+    # upload streams, aria2 connections, HLS fragments, aria2 disk cache MB, FORCE_SPEED, AUTO_PARALLEL, AUTO_PARALLEL_MAX, jobs at once (all users)
+    "max":      dict(tx=16, conn=16, frag=64, cache=128, force=True, par=True,  parmax=3, jobs=10),
+    "balanced": dict(tx=6,  conn=16, frag=48, cache=64,  force=True, par=True,  parmax=3, jobs=6),
+    "low":      dict(tx=4,  conn=16, frag=16, cache=16,  force=True, par=False, parmax=1, jobs=2),   # small RAM / CPU / disk (Koyeb free)
+}
+_P = _PROFILES[SPEED_PROFILE]
 
 
 def _norm_channel(value):
@@ -49,13 +78,10 @@ AUTO_DELETE_AFTER_UPLOAD = True
 PORT = env_int("PORT", 8080)
 
 # ---- speed / limits ----
-ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", 16)))      # connections per download
-CONCURRENT_FRAGMENTS = max(1, min(32, env_int("CONCURRENT_FRAGMENTS", 32))) # HLS/DASH fragments in parallel
-UPLOAD_CONNECTIONS = max(1, min(16, env_int("UPLOAD_CONNECTIONS", 8)))               # MTProto connections per uploaded file (big files)
-UPLOAD_ADAPTIVE = env_bool("UPLOAD_ADAPTIVE", True)      # small/medium files use fewer connections (less handshake cost)
-UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, env_int("UPLOAD_WORKERS_PER_CONNECTION", 4)))  # parts (512 KB) in flight per connection
-MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", 10)))   # global cap: jobs running at once (all users)
-MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", 6)))  # Pyrogram upload streams
+ARIA2_CONNECTIONS = max(1, min(16, env_int("ARIA2_CONNECTIONS", _P["conn"])))      # connections per download
+CONCURRENT_FRAGMENTS = max(1, min(64, env_int("CONCURRENT_FRAGMENTS", _P["frag"]))) # HLS/DASH fragments in parallel
+MAX_CONCURRENT_JOBS = max(1, min(32, env_int("MAX_CONCURRENT_JOBS", _P["jobs"])))   # global cap: jobs running at once (all users)
+MAX_CONCURRENT_TRANSMISSIONS = max(1, min(32, env_int("MAX_CONCURRENT_TRANSMISSIONS", _P["tx"])))  # Pyrogram upload streams
 SPLIT_SIZE_MB = max(100, min(1990, env_int("SPLIT_SIZE_MB", 1950)))         # Telegram bot limit is 2 GB
 MAX_RUNNING_PER_USER = max(1, env_int("MAX_RUNNING_PER_USER", 1))          # per user: jobs running at the same time
 MAX_WAITING_PER_USER = max(0, env_int("MAX_WAITING_PER_USER", 50))        # per user: jobs waiting (format already chosen)
@@ -76,7 +102,7 @@ EDIT_TIMEOUT = max(5, env_int("EDIT_TIMEOUT", 15))          # a progress edit th
 HELPER_BOT_TOKENS = [t for t in os.getenv("HELPER_BOT_TOKENS", "").replace(",", " ").split() if ":" in t]
 
 # ---- download tuning ----
-ARIA2_DISK_CACHE_MB = max(0, min(512, env_int("ARIA2_DISK_CACHE_MB", 64)))
+ARIA2_DISK_CACHE_MB = max(0, min(512, env_int("ARIA2_DISK_CACHE_MB", _P["cache"])))
 
 # ---- MongoDB (persistence across redeploys) ----
 # MONGO_URI e.g. mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/   (Atlas free M0 is enough).
@@ -93,9 +119,6 @@ QUEUE_RESTORE_MAX_AGE_H = max(1, env_int("QUEUE_RESTORE_MAX_AGE_H", 24))   # que
 CACHE_ENABLED = env_bool("CACHE_ENABLED", True)
 CACHE_TTL_DAYS = max(1, env_int("CACHE_TTL_DAYS", 30))
 
-# ---- upload auto-tune (lowers connections on timeouts, raises them again when stable) ----
-AUTOTUNE = env_bool("AUTOTUNE", True)
-SESSION_REUSE = env_bool("SESSION_REUSE", True)               # keep upload connections warm between files
 
 # ---- safety ----
 SSRF_PROTECTION = env_bool("SSRF_PROTECTION", True)           # refuse localhost / private-network / cloud-metadata links
@@ -131,3 +154,48 @@ DISK_CLEAN_PERCENT = max(50, min(99, env_int("DISK_CLEAN_PERCENT", 90)))
 TXT_MAX_URLS = max(1, min(10000, env_int("TXT_MAX_URLS", 2000)))                 # links read from one .txt file
 TXT_MAX_FILE_KB = max(10, min(5120, env_int("TXT_MAX_FILE_KB", 2048)))           # biggest .txt file accepted
 TXT_RESTORE_MAX_AGE_H = max(1, env_int("TXT_RESTORE_MAX_AGE_H", 168))            # a TXT task older than this is dropped after a restart
+
+# ---- gallery-dl (fallback downloader) ----
+GALLERYDL_ENABLED = env_bool("GALLERYDL_ENABLED", True)
+GALLERY_MAX_FILES = max(1, min(200, env_int("GALLERY_MAX_FILES", 30)))              # files taken from one gallery link
+GALLERY_PROBE_TIMEOUT = max(10, min(300, env_int("GALLERY_PROBE_TIMEOUT", 60)))     # seconds
+HELPER_FIRST = env_bool("HELPER_FIRST", True)                                       # helper bots upload first when they are ready
+
+# ---- download speed ----
+FORCE_SPEED = env_bool("FORCE_SPEED", _P["force"])     # aggressive aria2 / yt-dlp options (adaptive mirrors, drops slow connections, bigger buffers)
+
+# ---- video without sound: how hard to look for the audio (candidates are probed remotely first, no re-download) ----
+AUDIO_SEARCH_MAX_SEC = max(10, min(1800, env_int("AUDIO_SEARCH_MAX_SEC", 240)))
+AUDIO_SEARCH_MAX_CANDIDATES = max(1, min(20, env_int("AUDIO_SEARCH_MAX_CANDIDATES", 6)))
+
+# ---- AUTO_PARALLEL: slow sites (< ~3 MB/s per file) -> start one more download of the same user to reach the target total speed ----
+AUTO_PARALLEL = env_bool("AUTO_PARALLEL", _P["par"])
+AUTO_PARALLEL_MAX = max(1, min(6, env_int("AUTO_PARALLEL_MAX", _P["parmax"])))                  # most downloads of ONE user at once
+AUTO_PARALLEL_TARGET_MBPS = max(1, env_int("AUTO_PARALLEL_TARGET_MBPS", 10))         # stop adding downloads above this total
+AUTO_PARALLEL_SLOW_MBPS = max(1, env_int("AUTO_PARALLEL_SLOW_MBPS", 3))              # a download faster than this is never joined
+AUTO_PARALLEL_WARMUP_SEC = max(5, env_int("AUTO_PARALLEL_WARMUP_SEC", 20))           # judge the speed only after this many seconds
+AUTO_PARALLEL_MIN_FREE_MB = max(500, env_int("AUTO_PARALLEL_MIN_FREE_MB", 3000))     # free disk needed before another file starts
+
+# ---- upload watchdog: an upload with no new byte for this long is cancelled and retried / handed to another uploader ----
+UPLOAD_STALL_SEC = max(30, env_int("UPLOAD_STALL_SEC", 240))          # keep above the longest normal FloodWait pause of one upload
+UPLOAD_STALL_RETRIES = max(0, min(5, env_int("UPLOAD_STALL_RETRIES", 2)))
+
+# ---- RAM guard: no NEW job starts while the container uses more than this % of its memory (running jobs are never touched) ----
+MEMORY_START_LIMIT_PCT = max(50, min(98, env_int("MEMORY_START_LIMIT_PCT", 85)))
+
+# ---- big files: biggest file accepted; it is split into SPLIT_SIZE_MB parts (1.95 GB) for Telegram ----
+MAX_FILE_GB = max(1, min(20, env_int("MAX_FILE_GB", 4)))
+
+# ---- a file that takes very long must not block the next one ----
+LONG_JOB_RELEASE = env_bool("LONG_JOB_RELEASE", True)
+LONG_JOB_MIN = max(1, env_int("LONG_JOB_MIN", 10))                              # minutes in the same stage (download / upload)
+LONG_JOB_MAX_PARALLEL = max(2, min(6, env_int("LONG_JOB_MAX_PARALLEL", 3)))     # most files of ONE user in the same stage then
+
+# ---- log channel: the progress the user sees is mirrored live (one message per job, edited) ----
+LOG_MIRROR = env_bool("LOG_MIRROR", True)
+LOG_MIRROR_INTERVAL_SEC = max(5, env_int("LOG_MIRROR_INTERVAL_SEC", 15))
+
+# ---- MKV / AVI ... -> MP4 (Telegram only plays MP4 inside the app). MP4 keeps just the first audio track, so a file with
+# several audio tracks (Hindi + Tamil + Malayalam ...) is sent as the original file instead, nothing is lost ----
+KEEP_MULTI_TRACK_ORIGINAL = env_bool("KEEP_MULTI_TRACK_ORIGINAL", True)
+CONVERT_TO_MP4 = env_bool("CONVERT_TO_MP4", True)     # false = MKV / AVI ... are never converted: sent as the original file (all tracks kept)
