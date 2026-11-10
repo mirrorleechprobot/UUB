@@ -1122,8 +1122,8 @@ def prepare_upload(path, cancel=None, progress=None, keep_original=False):
     multi_audio = meta.get("audio_count", 0) > 1
     keep_original = keep_original or not config.CONVERT_TO_MP4
     if kind == "video" and ext != ".mp4" and HAVE_FFMPEG and (keep_original or (multi_audio and config.KEEP_MULTI_TRACK_ORIGINAL)):
-        # MP4 conversion keeps only the FIRST audio track: files with several audio languages stay as they are (sent as a file)
-        kind = "document"
+        # MP4 conversion keeps only the FIRST audio track: files with several audio languages stay as they are.
+        # The file is NOT converted but keeps kind="video": the user's /settings (Video / Document) decides how it is sent
         note = "original" if keep_original else f"{meta['audio_count']} audio tracks kept (no MP4 conversion)"
         log.info("%s: not converted to mp4 (%s)", path.name, note)
     elif kind == "video" and ext != ".mp4" and HAVE_FFMPEG:
