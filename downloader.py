@@ -6,6 +6,7 @@
                     gallery-dl as the FALLBACK (image galleries / posts that yt-dlp cannot handle)
 - prepare_upload(): ffprobe metadata, thumbnail, remux to mp4, split files > 2 GB
 """
+import contextlib
 import http.cookiejar
 import importlib.util
 import json
@@ -476,7 +477,12 @@ def aria_force_args(torrent=False):
     return [a for a in wanted if _aria_supports(a)]
 
 
-def _aria2(url, target, progress, cancel, expected_size, connections=None, force=True, keepalive=True):
+def _origin(url):
+    u = urlparse(url)
+    return f"{u.scheme}://{u.netloc}/"
+
+
+def _aria2(url, target, progress, cancel, expected_size, connections=None, force=True, keepalive=True, referer=False):
     n = connections or config.ARIA2_CONNECTIONS
     cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", f"--enable-http-keep-alive={'true' if keepalive else 'false'}",
@@ -487,6 +493,8 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None, force
            "--user-agent=" + config.DIRECT_USER_AGENT, "-d", str(target.parent), "-o", target.name] + (aria_force_args() if force else [])
     if config.DIRECT_REFERER:
         cmd.append("--referer=" + config.DIRECT_REFERER)
+    elif referer:
+        cmd.append("--referer=" + _origin(url))             # hotlink protection: ask for the file "from the site itself"
     cp = cookie_path()
     if _cookies_usable(cp):
         cmd.append("--load-cookies=" + str(cp))
@@ -600,52 +608,85 @@ def _sleep_cancel(cancel, seconds):
         time.sleep(0.5)
 
 
-def _requests_download(url, target, progress, cancel):
-    """Plain HTTP download with RETRIES and RESUME (Range): a dropped connection continues where it stopped."""
-    s = _session()
-    attempts = config.MAX_RETRIES + 3
-    current, total = 0, 0
-    last_bytes, last_time = 0, time.monotonic()
+def _has_module(name):
     try:
-        for attempt in range(attempts):
-            headers = {"Range": f"bytes={current}-"} if current > 0 else {}
-            try:
-                with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60), headers=headers) as r:
-                    if r.status_code == 416 and total and current >= total:
-                        break                                         # nothing left to fetch
-                    r.raise_for_status()
-                    resumed = current > 0 and r.status_code == 206
-                    if current > 0 and not resumed:
-                        current = 0                                   # the server ignores Range: start again from the beginning
-                    clen = int(r.headers.get("Content-Length") or 0)
-                    m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range", ""))
-                    total = int(m.group(1)) if m else (current + clen if clen else total)
-                    with target.open("ab" if resumed else "wb") as out:
-                        for chunk in r.iter_content(chunk_size=4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024):
-                            if cancel.is_set():
-                                raise Cancelled()
-                            if not chunk:
-                                continue
-                            out.write(chunk)
-                            current += len(chunk)
-                            now = time.monotonic()
-                            if now - last_time >= 1:
-                                speed = (current - last_bytes) / (now - last_time)
-                                last_bytes, last_time = current, now
-                                progress.update({"status": "downloading", "current": current, "total": total,
-                                                 "speed": speed, "eta": (total - current) / speed if total and speed else None})
-                if total and current < total:
-                    raise ConnectionError(f"connection closed early at {current}/{total} bytes")
-                break
-            except Cancelled:
+        return importlib.util.find_spec(name) is not None
+    except (ValueError, ImportError):
+        return name in sys.modules
+
+
+HAVE_CURL_CFFI = _has_module("curl_cffi")
+HTTP_PROFILES = ("plain", "referer") + (("browser-tls",) if HAVE_CURL_CFFI else ())
+
+
+def _http_open(profile, url, headers):
+    """Open a streaming GET. Profiles: plain (python requests) | referer (+ the site's own Referer) | browser-tls (curl_cffi:
+    Chrome's TLS / HTTP2 fingerprint - servers that cut every non-browser client mid-transfer accept it)."""
+    if profile == "browser-tls":
+        from curl_cffi import requests as creq
+        h = dict(headers)
+        h.setdefault("Referer", config.DIRECT_REFERER or _origin(url))
+        return contextlib.closing(creq.get(url, stream=True, impersonate="chrome", headers=h, timeout=60, allow_redirects=True))
+    s = _session()
+    h = dict(headers)
+    if profile == "referer":
+        h.setdefault("Referer", config.DIRECT_REFERER or _origin(url))
+        h.setdefault("Accept-Language", "en-US,en;q=0.9")
+
+    @contextlib.contextmanager
+    def opened():
+        try:
+            with s.get(url, stream=True, allow_redirects=True, timeout=(20, 60), headers=h) as r:
+                yield r
+        finally:
+            s.close()
+    return opened()
+
+
+def _requests_download(url, target, progress, cancel, profile="plain", attempts=None, resume=False):
+    """Plain HTTP download with RETRIES and RESUME (Range): a dropped connection continues where it stopped."""
+    attempts = attempts or config.MAX_RETRIES + 3
+    current = target.stat().st_size if (resume and target.is_file()) else 0
+    total = 0
+    last_bytes, last_time = current, time.monotonic()
+    for attempt in range(attempts):
+        headers = {"Range": f"bytes={current}-"} if current > 0 else {}
+        try:
+            with _http_open(profile, url, headers) as r:
+                if r.status_code == 416 and total and current >= total:
+                    break                                         # nothing left to fetch
+                if r.status_code >= 400:
+                    raise ConnectionError(f"HTTP {r.status_code}")
+                resumed = current > 0 and r.status_code == 206
+                if current > 0 and not resumed:
+                    current = 0                                   # the server ignores Range: start again from the beginning
+                clen = int(r.headers.get("Content-Length") or 0)
+                m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range", "") or "")
+                total = int(m.group(1)) if m else (current + clen if clen else total)
+                with target.open("ab" if resumed else "wb") as out:
+                    for chunk in r.iter_content(chunk_size=4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024):
+                        if cancel.is_set():
+                            raise Cancelled()
+                        if not chunk:
+                            continue
+                        out.write(chunk)
+                        current += len(chunk)
+                        now = time.monotonic()
+                        if now - last_time >= 1:
+                            speed = (current - last_bytes) / (now - last_time)
+                            last_bytes, last_time = current, now
+                            progress.update({"status": "downloading", "current": current, "total": total,
+                                             "speed": speed, "eta": (total - current) / speed if total and speed else None})
+            if total and current < total:
+                raise ConnectionError(f"connection closed early at {current}/{total} bytes")
+            return
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= attempts - 1:
                 raise
-            except Exception as exc:  # noqa: BLE001
-                if attempt >= attempts - 1:
-                    raise
-                log.warning("direct download interrupted (%s) at %s bytes; retry %s/%s", type(exc).__name__, current, attempt + 1, attempts - 1)
-                _sleep_cancel(cancel, min(20, 3 * (attempt + 1)))
-    finally:
-        s.close()
+            log.warning("direct download [%s] interrupted (%s) at %s bytes; retry %s/%s", profile, type(exc).__name__, current, attempt + 1, attempts - 1)
+            _sleep_cancel(cancel, min(20, 3 * (attempt + 1)))
 
 
 def _looks_like_html(path):
@@ -676,14 +717,14 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
         # aggressive options, with a pause between the tries. The partial file is KEPT (aria2 resumes it). A host that needed a
         # lower rung is remembered for an hour, so the next file from it starts there.
         n = config.ARIA2_CONNECTIONS
-        rungs = [(n, True, True)] + ([(4, False, False)] if n > 4 else []) + [(1, False, False)]
+        rungs = [(n, True, True, False)] + ([(4, False, False, True)] if n > 4 else []) + [(1, False, False, True)]
         start = _HOST_RUNG.get(host, (0, 0))
         first = start[0] if time.time() - start[1] < 3600 else 0
-        for i, (conns, force, keepalive) in enumerate(rungs):
+        for i, (conns, force, keepalive, referer) in enumerate(rungs):
             if i < first:
                 continue
             try:
-                _aria2(url, target, progress, cancel, size, conns, force, keepalive)
+                _aria2(url, target, progress, cancel, size, conns, force, keepalive, referer)
                 aria_done = True
                 if i > 0:
                     _HOST_RUNG[host] = (i, time.time())
@@ -695,19 +736,32 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
                 log.warning("aria2c (%s conn) failed (%s)", conns, str(exc)[:120])
                 if i < len(rungs) - 1:
                     _sleep_cancel(cancel, 3 * (i + 1))
-    if not aria_done:                                    # aria2 gave up (or is not installed): plain HTTP with retries + resume
+    if not aria_done:                                    # aria2 gave up (or is not installed): plain HTTP, several "identities"
         target.unlink(missing_ok=True)               # aria2's half-written file may be sparse: not resumable by size
         Path(str(target) + ".aria2").unlink(missing_ok=True)
-        try:
-            _requests_download(url, target, progress, cancel)
-        except Cancelled:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
+        angry = any(k in " ".join(errors).lower() for k in ("tls", "failed to receive", "connection", "reset", "refused"))
+        if angry:
+            progress.update({"status": "downloading", "speed": 0, "eta": None})
+            _sleep_cancel(cancel, 25)                # the server may have blocked us for a moment (too many connections): cool down
+        done = False
+        for k, profile in enumerate(HTTP_PROFILES):
+            try:
+                _requests_download(url, target, progress, cancel, profile, attempts=3 if k < len(HTTP_PROFILES) - 1 else None, resume=k > 0)
+                done = True
+                if profile != "plain":
+                    log.info("direct download worked with profile %s", profile)
+                break
+            except Cancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"[{profile}] {exc}")
+        if not done:
             hint = ""
-            if any(k in " ".join(errors).lower() for k in ("tls", "remotedisconnected", "connection aborted", "reset by peer", "failed to receive")):
-                hint = " (The server keeps closing the connection: it limits parallel connections or is rate-limiting this server's IP. Try again later.)"
-            raise RuntimeError("Download failed: " + " | ".join(e[:160] for e in errors[-3:]) + hint) from exc
+            if any(k in " ".join(errors).lower() for k in ("tls", "remotedisconnected", "connection aborted", "reset by peer", "failed to receive", "closed early",
+                                                   "incompleteread", "connection broken", "chunkedencoding")):
+                hint = (" (The server keeps cutting the connection: it blocks this server's IP or needs a login / special header."
+                        " If another tool downloads it, tell the Admin: cookies can be added with /setcookies.)")
+            raise RuntimeError("Download failed: " + " | ".join(e[:140] for e in errors[-3:]) + hint)
     if not target.is_file() or target.stat().st_size == 0:
         raise RuntimeError("The server returned an empty file.")
     if _looks_like_html(target) and target.suffix.lower() not in (".html", ".htm", ".txt"):

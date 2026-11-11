@@ -552,3 +552,6 @@ Telegram app ke andar sirf MP4 chalta hai, isliye MKV/AVI jaisi video MP4 me bad
 
 ## Direct link: server connection tod de (v7.3)
 aria2 ka ladder: 16 conn (force flags) -> 4 conn -> 1 conn (keep-alive band, aggressive flags band), har try ke beech 3/6 sec ruk kar, aadhi file **delete nahi hoti** (resume). Jo host kam connection par chala use 1 ghante yaad rakhta hai. Aakhir me plain HTTP fallback ab retry + Range-resume karta hai. "TLS connection was non-properly terminated" / "RemoteDisconnected" = server parallel connections ya IP rate-limit se connection band kar raha hai.
+
+## Server body kaat deta hai (probe pass, download fail) — v7.4
+Download ka order: aria2 (16 conn) -> aria2 4 conn + site ka Referer -> aria2 1 conn -> 25 sec cool-down -> plain HTTP -> plain HTTP + Referer -> **browser TLS (curl_cffi, Chrome fingerprint)**. Har step retry + resume. Agar phir bhi fail ho to ya to server is IP ko block kar raha hai, ya login/cookies chahiye (`/setcookies`).
