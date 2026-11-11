@@ -199,3 +199,8 @@ LOG_MIRROR_INTERVAL_SEC = max(5, env_int("LOG_MIRROR_INTERVAL_SEC", 15))
 # several audio tracks (Hindi + Tamil + Malayalam ...) is sent as the original file instead, nothing is lost ----
 KEEP_MULTI_TRACK_ORIGINAL = env_bool("KEEP_MULTI_TRACK_ORIGINAL", True)
 CONVERT_TO_MP4 = env_bool("CONVERT_TO_MP4", True)     # false = MKV / AVI ... are never converted: sent as the original file (all tracks kept)
+
+# ---- proxy (for servers that block this server's IP: datacenter IPs are often blocked) ----
+PROXY_URL = os.getenv("PROXY_URL", "").strip()          # http://user:pass@host:port  or  socks5://user:pass@host:port
+PROXY_HOSTS = {h.strip().lower().lstrip(".") for h in os.getenv("PROXY_HOSTS", "").split(",") if h.strip()}   # ALWAYS through the proxy
+PROXY_FALLBACK = env_bool("PROXY_FALLBACK", True)       # a failed direct download is retried through PROXY_URL

@@ -1816,6 +1816,7 @@ async def start_handler(_, message):
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
                  "/addplus <code>id [days]</code>  /removeplus <code>id</code>  /pluslist  (TXT upload)\n"
                  "/setcookies  /cookies  /delcookies  (login cookies for yt-dlp + gallery-dl)\n"
+                 "/nettest <code>link</code>  (what the link's server answers: IP block? proxy?)\n"
                  "/gencode <code>30d [count]</code>  /codes  /delcode\n"
                  "/stats  /userstats <code>id</code>  /topusers  /clearlinks\n"
                  "/cleanup  /testlog  /helpers  /speedtest <code>[MB]</code>\n/update (yt-dlp)  /restart")
@@ -2660,6 +2661,28 @@ async def cookies_from_document(message, doc_message):
     buf = await doc_message.download(in_memory=True)
     raw = buf.getvalue() if hasattr(buf, "getvalue") else Path(buf).read_bytes()
     await apply_cookies_text(message, _decode_text(raw))
+
+
+@app.on_message(PRIVATE & filters.command("nettest"))
+@admin_only
+async def nettest_cmd(_, message):
+    """/nettest <link> - what does the SERVER of this link answer to the bot (plain / Referer / browser TLS), directly and via the proxy?"""
+    parts = (message.text or "").split(None, 1)
+    found = URL_RE.findall(parts[1]) if len(parts) > 1 else []
+    if not found:
+        return await message.reply_text("Usage: /nettest <code>https://link</code>\nShows what the server answers to this bot (and to the proxy), "
+                                        "and the IP address the server sees.")
+    url = found[0].rstrip(URL_TRAIL)
+    note = await message.reply_text("🔬 Testing the link from this server...")
+    try:
+        ip, lines = await asyncio.get_running_loop().run_in_executor(POOL, dl.net_diagnose, url)
+    except Exception as exc:  # noqa: BLE001
+        return await edit_safely(note, f"❌ Test failed: {esc(str(exc)[:300])}")
+    verdict = ("\n\n✅ At least one way works: the bot will use it where possible." if any(x.startswith("✅") for x in lines) else
+               "\n\n❌ Nothing works from this server. Typical cause: the site blocks this server's IP (datacenter). "
+               + ("Check PROXY_URL." if config.PROXY_URL else "Set PROXY_URL (a proxy on another network) and try again."))
+    await edit_safely(note, f"🔬 <b>Net test</b>\n🔗 {esc(url[:150])}\n🌐 Server IP: <code>{esc(ip)}</code>"
+                            f"{'  •  proxy: on' if config.PROXY_URL else '  •  proxy: not set'}\n\n" + "\n".join(esc(x) for x in lines) + verdict)
 
 
 @app.on_message(PRIVATE & filters.command("setcookies"))

@@ -116,8 +116,22 @@ def _cookies_usable(path):
     return False
 
 
-def _session():
+def proxy_for_host(url):
+    """PROXY_URL when the link's host is listed in PROXY_HOSTS (those hosts are ALWAYS fetched through the proxy)."""
+    if not config.PROXY_URL or not config.PROXY_HOSTS:
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    return config.PROXY_URL if any(host == h or host.endswith("." + h) for h in config.PROXY_HOSTS) else None
+
+
+def _is_socks(proxy):
+    return bool(proxy) and proxy.lower().startswith("socks")
+
+
+def _session(proxy=None):
     s = requests.Session()
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
     s.headers.update({"User-Agent": config.DIRECT_USER_AGENT, "Accept": "*/*",
                       "Accept-Encoding": "identity", "Connection": "keep-alive"})
     if config.DIRECT_REFERER:
@@ -164,9 +178,9 @@ def _is_media_manifest(content_type):
     return "mpegurl" in content_type or "dash+xml" in content_type
 
 
-def _probe_http(url):
+def _probe_http(url, proxy=None):
     """Look at the response headers only. Returns dict(status, content_type, filename, size)."""
-    s = _session()
+    s = _session(proxy or proxy_for_host(url))
     try:
         with s.get(url, stream=True, allow_redirects=True, timeout=(10, 20)) as r:
             ctype = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -224,7 +238,7 @@ def _build_options(info):
     return options
 
 
-def ytdlp_base_opts():
+def ytdlp_base_opts(url=None, proxy=None):
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
             "retries": config.MAX_RETRIES, "fragment_retries": config.MAX_RETRIES,
             "extractor_retries": config.MAX_RETRIES, "windowsfilenames": True,
@@ -236,6 +250,9 @@ def ytdlp_base_opts():
         opts["cookiefile"] = str(cp.resolve())
     if config.DIRECT_REFERER:
         opts["http_headers"]["Referer"] = config.DIRECT_REFERER
+    proxy = proxy or (proxy_for_host(url) if url else None)
+    if proxy:
+        opts["proxy"] = proxy
     return opts
 
 
@@ -271,7 +288,7 @@ def probe(url):
         name = safe_filename(Path(urlparse(url).path).name)
         return {"kind": "direct", "title": name, "filename": name, "size": 0}
 
-    opts = ytdlp_base_opts()
+    opts = ytdlp_base_opts(url)
     opts.update({"skip_download": True, "extract_flat": "in_playlist", "socket_timeout": 20})
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -311,6 +328,36 @@ def probe(url):
         raise ProbeError("No downloadable format found.")
     return {"kind": "media", "title": info.get("title") or url, "duration": info.get("duration") or 0,
             "uploader": info.get("uploader") or "", "options": options}
+
+
+def net_diagnose(url):
+    """What does this server answer to each of our "identities", directly and through the proxy? (Admin /nettest)
+    Returns (egress_ip, [lines]). Reads at most 64 KB per test."""
+    ip = "?"
+    try:
+        s = _session()
+        ip = s.get("https://api.ipify.org", timeout=8).text.strip()[:60]
+        s.close()
+    except Exception as exc:  # noqa: BLE001
+        ip = f"unknown ({type(exc).__name__})"
+    modes = [("direct", None)] + ([("proxy", config.PROXY_URL)] if config.PROXY_URL else [])
+    lines = []
+    for label, proxy in modes:
+        for profile in HTTP_PROFILES:
+            t0 = time.monotonic()
+            try:
+                with _http_open(profile, url, {"Range": "bytes=0-65535"}, proxy) as r:
+                    got, first = 0, b""
+                    for chunk in r.iter_content(chunk_size=65536):
+                        got, first = len(chunk), chunk[:12]
+                        break
+                    ctype = (r.headers.get("Content-Type") or "?").split(";")[0]
+                    ok = r.status_code < 400 and got > 0
+                    lines.append(f"{'✅' if ok else '⚠️'} {label} / {profile}: HTTP {r.status_code} • {ctype} • "
+                                 f"{got} B in {time.monotonic() - t0:.1f}s" + ("" if ok else " (no data)"))
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"❌ {label} / {profile}: {type(exc).__name__}: {str(exc)[:110]}")
+    return ip, lines
 
 
 # --------------------------------------------------------------------------- gallery-dl (FALLBACK when yt-dlp cannot handle a link)
@@ -482,7 +529,7 @@ def _origin(url):
     return f"{u.scheme}://{u.netloc}/"
 
 
-def _aria2(url, target, progress, cancel, expected_size, connections=None, force=True, keepalive=True, referer=False):
+def _aria2(url, target, progress, cancel, expected_size, connections=None, force=True, keepalive=True, referer=False, proxy=None):
     n = connections or config.ARIA2_CONNECTIONS
     cmd = ["aria2c", f"-x{n}", f"-s{n}", "-k1M", "-j1",
            f"--disk-cache={config.ARIA2_DISK_CACHE_MB}M", f"--enable-http-keep-alive={'true' if keepalive else 'false'}",
@@ -495,6 +542,8 @@ def _aria2(url, target, progress, cancel, expected_size, connections=None, force
         cmd.append("--referer=" + config.DIRECT_REFERER)
     elif referer:
         cmd.append("--referer=" + _origin(url))             # hotlink protection: ask for the file "from the site itself"
+    if proxy and not _is_socks(proxy):                      # aria2 speaks http(s) proxies only; socks goes through curl_cffi
+        cmd.append("--all-proxy=" + proxy)
     cp = cookie_path()
     if _cookies_usable(cp):
         cmd.append("--load-cookies=" + str(cp))
@@ -619,15 +668,16 @@ HAVE_CURL_CFFI = _has_module("curl_cffi")
 HTTP_PROFILES = ("plain", "referer") + (("browser-tls",) if HAVE_CURL_CFFI else ())
 
 
-def _http_open(profile, url, headers):
+def _http_open(profile, url, headers, proxy=None):
     """Open a streaming GET. Profiles: plain (python requests) | referer (+ the site's own Referer) | browser-tls (curl_cffi:
     Chrome's TLS / HTTP2 fingerprint - servers that cut every non-browser client mid-transfer accept it)."""
     if profile == "browser-tls":
         from curl_cffi import requests as creq
         h = dict(headers)
         h.setdefault("Referer", config.DIRECT_REFERER or _origin(url))
-        return contextlib.closing(creq.get(url, stream=True, impersonate="chrome", headers=h, timeout=60, allow_redirects=True))
-    s = _session()
+        extra = {"proxies": {"http": proxy, "https": proxy}} if proxy else {}
+        return contextlib.closing(creq.get(url, stream=True, impersonate="chrome", headers=h, timeout=60, allow_redirects=True, **extra))
+    s = _session(proxy)
     h = dict(headers)
     if profile == "referer":
         h.setdefault("Referer", config.DIRECT_REFERER or _origin(url))
@@ -643,7 +693,7 @@ def _http_open(profile, url, headers):
     return opened()
 
 
-def _requests_download(url, target, progress, cancel, profile="plain", attempts=None, resume=False):
+def _requests_download(url, target, progress, cancel, profile="plain", attempts=None, resume=False, proxy=None):
     """Plain HTTP download with RETRIES and RESUME (Range): a dropped connection continues where it stopped."""
     attempts = attempts or config.MAX_RETRIES + 3
     current = target.stat().st_size if (resume and target.is_file()) else 0
@@ -652,7 +702,7 @@ def _requests_download(url, target, progress, cancel, profile="plain", attempts=
     for attempt in range(attempts):
         headers = {"Range": f"bytes={current}-"} if current > 0 else {}
         try:
-            with _http_open(profile, url, headers) as r:
+            with _http_open(profile, url, headers, proxy) as r:
                 if r.status_code == 416 and total and current >= total:
                     break                                         # nothing left to fetch
                 if r.status_code >= 400:
@@ -702,17 +752,12 @@ def _looks_like_html(path):
 _HOST_RUNG = {}        # host -> (aria2 rung that worked, time): servers that cannot take 16 connections
 
 
-def download_direct(url, workdir, progress, cancel, filename=None, size=0):
-    if not filename:
-        info = _probe_http(url)
-        filename = info["filename"]
-        size = info["size"]
-    target = workdir / safe_filename(filename)
-    progress.update({"status": "downloading", "current": 0, "total": size, "speed": 0, "eta": None})
+def _direct_try(url, target, progress, cancel, size, proxy=None):
+    """One complete attempt (aria2 ladder, then plain HTTP identities), directly or through `proxy`. Raises RuntimeError."""
     errors = []
     aria_done = False
-    host = urlparse(url).netloc.lower()
-    if HAVE_ARIA2:
+    host = urlparse(url).netloc.lower() + ('|proxy' if proxy else '')
+    if HAVE_ARIA2 and not _is_socks(proxy):
         # Servers that drop connections (TLS "non-properly terminated", 403/429 ...) get fewer connections, keep-alive off and no
         # aggressive options, with a pause between the tries. The partial file is KEPT (aria2 resumes it). A host that needed a
         # lower rung is remembered for an hour, so the next file from it starts there.
@@ -724,7 +769,7 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
             if i < first:
                 continue
             try:
-                _aria2(url, target, progress, cancel, size, conns, force, keepalive, referer)
+                _aria2(url, target, progress, cancel, size, conns, force, keepalive, referer, proxy)
                 aria_done = True
                 if i > 0:
                     _HOST_RUNG[host] = (i, time.time())
@@ -746,7 +791,7 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
         done = False
         for k, profile in enumerate(HTTP_PROFILES):
             try:
-                _requests_download(url, target, progress, cancel, profile, attempts=3 if k < len(HTTP_PROFILES) - 1 else None, resume=k > 0)
+                _requests_download(url, target, progress, cancel, profile, attempts=3 if k < len(HTTP_PROFILES) - 1 else None, resume=k > 0, proxy=proxy)
                 done = True
                 if profile != "plain":
                     log.info("direct download worked with profile %s", profile)
@@ -762,6 +807,37 @@ def download_direct(url, workdir, progress, cancel, filename=None, size=0):
                 hint = (" (The server keeps cutting the connection: it blocks this server's IP or needs a login / special header."
                         " If another tool downloads it, tell the Admin: cookies can be added with /setcookies.)")
             raise RuntimeError("Download failed: " + " | ".join(e[:140] for e in errors[-3:]) + hint)
+
+
+def download_direct(url, workdir, progress, cancel, filename=None, size=0):
+    if not filename:
+        info = _probe_http(url)
+        filename = info["filename"]
+        size = info["size"]
+    target = workdir / safe_filename(filename)
+    progress.update({"status": "downloading", "current": 0, "total": size, "speed": 0, "eta": None})
+    # Direct first. A host in PROXY_HOSTS goes through the proxy only; with PROXY_URL set a failed direct download is retried through it.
+    host_proxy = proxy_for_host(url)
+    modes = [host_proxy] if host_proxy else ([None, config.PROXY_URL] if config.PROXY_URL and config.PROXY_FALLBACK else [None])
+    last = None
+    for i, proxy in enumerate(modes):
+        try:
+            _direct_try(url, target, progress, cancel, size, proxy)
+            last = None
+            if proxy:
+                log.info("direct download worked through the proxy")
+            break
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            target.unlink(missing_ok=True)
+            Path(str(target) + ".aria2").unlink(missing_ok=True)
+            if i < len(modes) - 1:
+                log.warning("direct download failed (%s): trying through the proxy", str(exc)[:120])
+                progress.update({"status": "downloading", "current": 0, "speed": 0, "eta": None})
+    if last is not None:
+        raise last
     if not target.is_file() or target.stat().st_size == 0:
         raise RuntimeError("The server returned an empty file.")
     if _looks_like_html(target) and target.suffix.lower() not in (".html", ".htm", ".txt"):
@@ -784,7 +860,7 @@ def _audio_only_formats(info):
 
 def _fetch_format(url, workdir, fmt, tag):
     """Download ONE yt-dlp format selector into workdir as '<id>.<tag>.<ext>'; returns the files."""
-    opts = ytdlp_base_opts()
+    opts = ytdlp_base_opts(url)
     opts.update({"outtmpl": str(workdir / f"%(id)s.{tag}.%(ext)s"), "format": fmt, "overwrites": True,
                  "file_access_retries": config.MAX_RETRIES, "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENTS})
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -902,7 +978,7 @@ def _ensure_audio(url, result, info, workdir, progress, cancel):
     return result
 
 
-def download_media(url, option, workdir, progress, cancel):
+def download_media(url, option, workdir, progress, cancel, proxy=None):
     def hook(d):
         if cancel.is_set():
             raise Cancelled()
@@ -915,7 +991,7 @@ def download_media(url, option, workdir, progress, cancel):
             progress["status"] = "processing"
 
     def run(use_aria):
-        opts = ytdlp_base_opts()
+        opts = ytdlp_base_opts(url, proxy)
         opts.update({
             "outtmpl": str(workdir / "%(title).150B [%(id)s].%(ext)s"),
             "continuedl": True, "overwrites": False, "buffersize": 4 * 1024 * 1024 if config.FORCE_SPEED else 1024 * 1024, "file_access_retries": config.MAX_RETRIES,
@@ -993,6 +1069,16 @@ def download(job, workdir):
     except Cancelled:
         raise
     except Exception as exc:  # noqa: BLE001
+        if config.PROXY_URL and config.PROXY_FALLBACK and not proxy_for_host(job.url) and not job.cancel.is_set():
+            log.info("yt-dlp failed (%s); retrying through the proxy", type(exc).__name__)
+            for leftover in workdir.iterdir():
+                shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+            try:
+                return download_media(job.url, job.option, workdir, job.progress, job.cancel, config.PROXY_URL)
+            except Cancelled:
+                raise
+            except Exception as pexc:  # noqa: BLE001
+                log.info("proxy retry failed too: %s", str(pexc)[:150])
         if job.cancel.is_set() or not gallery_enabled():
             raise
         log.info("yt-dlp failed (%s); trying gallery-dl", type(exc).__name__)

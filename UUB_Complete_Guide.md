@@ -555,3 +555,6 @@ aria2 ka ladder: 16 conn (force flags) -> 4 conn -> 1 conn (keep-alive band, agg
 
 ## Server body kaat deta hai (probe pass, download fail) — v7.4
 Download ka order: aria2 (16 conn) -> aria2 4 conn + site ka Referer -> aria2 1 conn -> 25 sec cool-down -> plain HTTP -> plain HTTP + Referer -> **browser TLS (curl_cffi, Chrome fingerprint)**. Har step retry + resume. Agar phir bhi fail ho to ya to server is IP ko block kar raha hai, ya login/cookies chahiye (`/setcookies`).
+
+## Proxy + /nettest (v7.5)
+Agar server bot ke IP ko block kare (log: `RemoteDisconnected`, TLS "non-properly terminated", HTTP/2 PROTOCOL_ERROR; baki tools doosre IP se chalte hon), to `PROXY_URL=http://user:pass@host:port` (ya `socks5://...`) set karo. `PROXY_HOSTS=vstreamer.store` = us host ke liye hamesha proxy; `PROXY_FALLBACK=true` = direct fail hone par proxy se retry. Admin `/nettest <link>` bot ke server se link ko plain / Referer / browser-TLS se, direct aur proxy dono tarah test karke batata hai (server ka IP bhi).
