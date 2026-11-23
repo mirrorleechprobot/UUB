@@ -11,9 +11,16 @@ RUN pip install --no-cache-dir -U pip && pip install --no-cache-dir -r requireme
 # and never overwrites wzgram (default). Build without it: --build-arg INSTALL_CBGRAM=false
 ARG INSTALL_CBGRAM=true
 COPY requirements-cbgram.txt .
+# cbcrypto is a Rust extension: no prebuilt wheel for this image, so Rust + a C compiler are installed only for this step
+# and removed again in the same layer (image stays small).
 RUN mkdir -p /app/engines/cbgram && if [ "$INSTALL_CBGRAM" = "true" ]; then \
-      pip install --no-cache-dir --target /app/engines/cbgram -r requirements-cbgram.txt \
-      || echo "WARNING: cbgram could not be installed - UPLOAD_MODE=cbgram will fall back to wzgram"; fi
+      apt-get update && apt-get install -y --no-install-recommends build-essential curl pkg-config libssl-dev \
+      && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+      && . "$HOME/.cargo/env" \
+      && pip install --no-cache-dir --target /app/engines/cbgram -r requirements-cbgram.txt \
+      ; rm -rf "$HOME/.cargo" "$HOME/.rustup" /var/lib/apt/lists/* \
+      && apt-get purge -y --auto-remove build-essential curl pkg-config libssl-dev || true; fi \
+    && ls /app/engines/cbgram | head
 COPY . .
 RUN mkdir -p /app/downloads /app/data
 EXPOSE 8080
