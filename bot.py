@@ -1,6 +1,9 @@
 import asyncio
+import gc
 import hashlib
+import inspect
 import html
+import io
 import itertools
 import logging
 import os
@@ -50,7 +53,7 @@ def run_with_update():
         _EARLY_SERVER = ThreadingHTTPServer(("0.0.0.0", config.PORT), _Starting)
         Thread(target=_EARLY_SERVER.serve_forever, daemon=True, name="early-health").start()
         subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "-q", "--disable-pip-version-check",
-                        "yt-dlp[default,curl-cffi]"], timeout=150, check=False,
+                        "yt-dlp[default,curl-cffi]", "gallery-dl"], timeout=150, check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001  (offline / read-only: the version baked into the image is used)
         pass
@@ -60,6 +63,8 @@ run_with_update()
 
 import requests
 import yt_dlp
+import engine                        # picks the Telegram library BEFORE pyrogram is imported (UPLOAD_MODE: wzgram = default | cbgram)
+pyrogram = engine.load()             # wzgram and cbgram both expose the module name `pyrogram`, so the rest of this file is unchanged
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
@@ -67,7 +72,6 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
 import downloader as dl
-import fastupload
 import safety
 import store
 import codes
@@ -84,7 +88,8 @@ Path(config.DATA_DIR).mkdir(parents=True, exist_ok=True)
 POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="uub")          # downloads / ffmpeg (one thread per running job)
 API_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="uub-api")   # Bot API calls: never starved by long downloads
 state = {"ready": False, "bot_id": 0, "log_ok": False, "shutting_down": False, "started": time.time()}
-URL_RE = re.compile(r"(?:https?://|magnet:\?)[^\s<>\"']+", re.I)
+URL_RE = re.compile(r"(?:https?://|magnet:\?)[^\s<>\"“”]+", re.I)     # an apostrophe is valid inside a URL (Tom.Clancy's.Jack.Ryan...)
+URL_TRAIL = ".,;:!?)]}'’‘"                                           # punctuation / closing quote stuck to the end of a link
 PENDING_TTL = 30 * 60
 
 
@@ -124,11 +129,49 @@ def progress_text(job, stage, title, current, total, speed, eta, elapsed):
     bar = "█" * filled + "░" * (20 - filled)
     icon = "📥" if stage == "Downloading" else "📤"
     extra = f" ({job.part_label})" if stage == "Uploading" and job.part_label else ""
-    return (f"{icon} <b>{stage}</b>{extra}  •  #{job.id}\n\n🎬 {esc(title[:130])}\n\n"
+    plan = split_plan_line(job.est_size or total) if stage == "Downloading" else ""
+    return (f"{icon} <b>{stage}</b>{extra}  •  #{job.id}\n\n🎬 {esc(title[:130])}\n"
+            + (plan + "\n" if plan else "") + "\n"
             f"<code>{bar}</code> {percent:.1f}%\n"
             f"📦 {size_text(current)} / {size_text(total) if total else '?'}\n"
             f"⚡ Speed: {size_text(speed)}/s\n⏳ ETA: {time_text(eta)}\n"
             f"🕒 Elapsed: {time_text(elapsed)}")
+
+
+def split_plan_line(size):
+    """'✂️ Will be split: 3 parts' when the file is bigger than the Telegram part size (SPLIT_SIZE_MB, default 1950 MB)."""
+    limit = config.SPLIT_SIZE_MB * 1024 * 1024
+    if size and size > limit:
+        n = -(-size // limit)
+        return f"✂️ <b>Will be split:</b> {n} parts (each up to {config.SPLIT_SIZE_MB} MB)"
+    return ""
+
+
+def processing_text(job, size, p, elapsed):
+    """Remux / split stage with percent, speed and ETA (p = job.progress written by downloader.prepare_upload)."""
+    p = p or {}
+    stage = p.get("stage") or "Processing"
+    lines = [f"✂️ <b>{esc(stage)}</b>  •  #{job.id}" if "plit" in stage else f"⚙️ <b>{esc(stage)}</b>  •  #{job.id}",
+             "", f"🎬 {esc(job.title[:130])}", f"📦 {size_text(size)}"]
+    plan = split_plan_line(size)
+    if plan:
+        lines.append(plan)
+    if "MP4" in stage:
+        lines.append("ℹ️ Telegram plays only MP4 inside the app. Only the container changes: the video is copied, no quality loss.")
+    total = p.get("ptotal") or 0
+    if total:
+        cur = p.get("pcur") or 0
+        pct = min(100.0, cur * 100.0 / total)
+        bar = "█" * max(0, min(20, int(pct / 5))) + "░" * (20 - max(0, min(20, int(pct / 5))))
+        lines += ["", f"<code>{bar}</code> {pct:.1f}%"]
+        if p.get("punit") == "B":
+            lines.append(f"📦 {size_text(cur)} / {size_text(total)}")
+            lines.append(f"⚡ Speed: {size_text(p.get('pspeed') or 0)}/s")
+        else:
+            lines.append(f"⚡ Speed: {(p.get('pspeed') or 0):.1f}x")
+        lines.append(f"⏳ ETA: {time_text(p.get('peta'))}")
+    lines.append(f"🕒 Elapsed: {time_text(elapsed)}")
+    return "\n".join(lines)
 
 
 def cancel_markup(job):
@@ -183,6 +226,14 @@ async def edit_final(message, text, markup=None):
             await asyncio.sleep(min(wait, 60))
         if await _try_edit(message, text, markup):
             return
+
+
+async def delete_quiet(message):
+    try:
+        if message is not None:
+            await message.delete()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # =============================================================================== health server
@@ -342,6 +393,37 @@ def explain_log_error(description):
     return description or "unknown error"
 
 
+def log_head(job):
+    return f"\n\n👤 {esc(job.user_label)}\n🔗 {esc(job.url[:300])}"
+
+
+async def log_mirror(job, text, force=False):
+    """The same live status the user sees (download / processing / upload / result) as ONE edited message in the log channel."""
+    if not config.LOG_MIRROR or not config.LOG_CHANNEL_ID:
+        return
+    if not force and time.monotonic() - job.log_last < config.LOG_MIRROR_INTERVAL_SEC:
+        return
+    async with job.log_lock:
+        job.log_last = time.monotonic()
+        body = (text + log_head(job))[:4000]
+        chat = str(config.LOG_CHANNEL_ID)
+        if not job.log_mid:
+            r = await _log_call("sendMessage", chat_id=chat, text=body, parse_mode="HTML", disable_web_page_preview="true")
+            if r.get("ok"):
+                job.log_mid = r["result"]["message_id"]
+        else:
+            r = await _log_call("editMessageText", chat_id=chat, message_id=str(job.log_mid), text=body, parse_mode="HTML",
+                                disable_web_page_preview="true")
+            if not r.get("ok") and "not found" in (r.get("description") or "").lower():
+                job.log_mid = 0                       # the message was deleted: the next update sends a new one
+
+
+async def job_edit(job, text, markup=None):
+    """Edit the user's status message AND mirror it in the log channel."""
+    bg(log_mirror(job, text, force=not job.log_mid))
+    await edit_safely(job.status_msg, text, markup)
+
+
 async def send_log(text):
     if not config.LOG_CHANNEL_ID:
         return False
@@ -388,6 +470,7 @@ async def check_log_channel():
     if not r.get("ok"):
         return False, explain_log_error(r.get("description"))
     title = r["result"].get("title", "?")
+    state["log_username"] = r["result"].get("username") or ""
     m = await bot_api("getChatMember", chat_id=str(config.LOG_CHANNEL_ID), user_id=str(state["bot_id"]))
     res = m.get("result") or {}
     if res.get("status") not in ("administrator", "creator"):
@@ -435,7 +518,7 @@ class Job:
         name = " ".join(x for x in (self.first_name, self.last_name) if x) or "User"
         self.user_label = f"{name}" + (f" (@{self.username})" if self.username else "") + f" [{user.id}]"
         self.url = url
-        self.mode = mode                      # "direct" | "media" | "torrent"
+        self.mode = mode                      # "direct" | "media" | "torrent" | "gallery" (gallery-dl)
         self.title = title
         self.option = option or {"kind": "video", "height": 0, "label": "Best"}
         self.direct_name = direct_name
@@ -461,6 +544,20 @@ class Job:
         self.channel = None                   # {"id","title","username"} while delivering to a channel
         self.channel_msg_id = 0               # first message in the channel (for the link)
         self.channel_note = ""                # why the channel could not be used (fallback to the chat)
+        self.workdir = None                   # this job's download folder (its child processes are found by this path)
+        self.cancel_since = 0.0               # monotonic time the cancel was requested
+        self.log_mid = 0                      # message id of this job's live mirror in the log channel
+        self.log_last = 0.0                   # monotonic time of the last mirror edit
+        self.log_lock = asyncio.Lock()
+        self.upload_started = 0.0             # monotonic time this job got its upload turn
+        self.too_big = False                  # stopped because the file is bigger than MAX_FILE_GB
+        self.dl_started = 0.0                 # monotonic time the download slot was given (warm-up for the adaptive slot)
+        self.speed_ema = 0.0                  # smoothed download speed, bytes/s
+        self.multi = False                    # the link gave several files (gallery): they are sent as "File i/n"
+        self.txt = None                       # TxtTask this job belongs to (Premium Plus TXT upload), else None
+        self.txt_idx = -1                     # position of this link inside the TXT file
+        self.txt_counted = False              # the task has already counted this job's result
+        self.error = ""                       # short failure reason (shown in the TXT task summary)
 
     @property
     def est_size(self):
@@ -494,6 +591,7 @@ pending = {}                   # token -> quality-selection session (NOT counted
 probe_sem = asyncio.Semaphore(config.PROBE_CONCURRENCY)
 upload_line = {}               # uid -> [jobs that finished downloading and wait for their upload turn]
 uploading_now = {}             # uid -> the job uploading right now
+uploading_extra = {}           # uid -> more jobs uploading at the same time (only when the running upload is > LONG_JOB_MIN minutes old)
 
 
 def user_jobs(uid):
@@ -504,12 +602,48 @@ def running_count(uid):
     return sum(1 for j in running_jobs if j.user_id == uid)
 
 
+def download_slot_jobs(uid):
+    stages = ("downloading", "processing", "ready") + (() if config.PIPELINE else ("uploading",))
+    return [j for j in running_jobs if j.user_id == uid and j.state in stages]
+
+
 def busy_download(uid):
     """Jobs of this user occupying the DOWNLOAD slot. With PIPELINE a job that already uploads frees the slot, so the
     next file downloads while the previous one is still uploading (a downloaded file waiting for its turn keeps the slot:
     at most 2 files per user on disk)."""
-    stages = ("downloading", "processing", "ready") + (() if config.PIPELINE else ("uploading",))
-    return sum(1 for j in running_jobs if j.user_id == uid and j.state in stages)
+    return len(download_slot_jobs(uid))
+
+
+def user_download_limit(uid):
+    """Normally MAX_RUNNING_PER_USER. AUTO_PARALLEL: when the running download(s) of this user are SLOW (sites that give
+    < 1-3 MB/s per file), one more file may start so the total gets near AUTO_PARALLEL_TARGET_MBPS. Fast downloads are never
+    touched. Needs: every running download warmed up and still downloading, none of them fast, the total below the target,
+    fewer than AUTO_PARALLEL_MAX, and enough free disk for another file."""
+    base = config.MAX_RUNNING_PER_USER
+    if any(j.user_id != uid for j in waiting):
+        return base                                                # fairness: another user is waiting for a slot - he goes first
+    active = download_slot_jobs(uid)
+    now, mb = time.monotonic(), 1024 * 1024
+    # LONG_JOB_RELEASE: every running file of this user is busy for more than LONG_JOB_MIN minutes -> the next file may start too
+    if (config.LONG_JOB_RELEASE and len(active) >= base and len(active) < config.LONG_JOB_MAX_PARALLEL
+            and all(j.state in ("downloading", "processing") and j.dl_started
+                    and now - j.dl_started > config.LONG_JOB_MIN * 60 for j in active)
+            and safety.free_bytes() >= config.AUTO_PARALLEL_MIN_FREE_MB * mb):
+        return len(active) + 1
+    if not config.AUTO_PARALLEL:
+        return base
+    if len(active) < base or len(active) >= config.AUTO_PARALLEL_MAX:
+        return base
+    for j in active:
+        if j.state != "downloading" or not j.dl_started or now - j.dl_started < config.AUTO_PARALLEL_WARMUP_SEC:
+            return base
+        if j.speed_ema >= config.AUTO_PARALLEL_SLOW_MBPS * mb:
+            return base                                            # a fast download is on its own: leave it alone
+    if sum(j.speed_ema for j in active) >= config.AUTO_PARALLEL_TARGET_MBPS * mb:
+        return base
+    if safety.free_bytes() < config.AUTO_PARALLEL_MIN_FREE_MB * mb:
+        return base
+    return len(active) + 1
 
 
 def waiting_count(uid):
@@ -518,6 +652,8 @@ def waiting_count(uid):
 
 # --------------------------------------------------------------------------- queue persistence (MongoDB)
 def persist_job(job):
+    if job.txt is not None:               # a TXT task keeps its own resume point (see TxtTask)
+        return
     db.put("queue", job.key, job.to_doc())
 
 
@@ -596,7 +732,7 @@ async def serve_from_cache(job, status_msg):
     job.file_name = doc.get("file_name") or job.title
     try:
         for i, fid in enumerate(parts, 1):
-            cap = user_caption(job, f"Part {i}/{len(parts)}" if len(parts) > 1 else "")
+            cap = user_caption(job, f"{'File' if doc.get('multi') else 'Part'} {i}/{len(parts)}" if len(parts) > 1 else "")
             try:
                 sent = await app.send_cached_media(job.target_chat, fid, caption=cap)
             except Exception as exc:  # noqa: BLE001
@@ -634,7 +770,7 @@ def cache_store(job, items):
     fids = [fid for _, fid in sorted(job.delivered)]
     if len(fids) != len(items) or not all(fids):
         return
-    db.put("cache", cache_key(job), {"parts": fids, "title": job.title, "size": job.size_bytes, "file_name": job.file_name,
+    db.put("cache", cache_key(job), {"parts": fids, "multi": job.multi, "title": job.title, "size": job.size_bytes, "file_name": job.file_name,
                                      "url": job.url[:300], "ts": time.time()}, ttl=config.CACHE_TTL_DAYS * 86400)
 
 
@@ -678,6 +814,11 @@ async def enqueue(job, status_msg, batch=None):
                                       f"{config.MAX_WAITING_PER_USER} waiting. Wait for some jobs to finish or cancel them with /queue "
                                       "(or /clear), then send the link again.")
         return False
+    if job.est_size and job.est_size > config.MAX_FILE_GB * 1024 ** 3:
+        job.error = f"file bigger than {config.MAX_FILE_GB} GB"
+        await edit_safely(status_msg, f"❌ <b>File too big</b>: {size_text(job.est_size)}.\n"
+                                      f"The maximum file size is {config.MAX_FILE_GB} GB (files over {config.SPLIT_SIZE_MB} MB are split into parts).")
+        return False
     job.status_msg = status_msg
     if batch is not None:
         job.batch = batch
@@ -699,15 +840,47 @@ async def enqueue(job, status_msg, batch=None):
     return True
 
 
+def kill_job_processes(job):
+    """Kill every child process that works on this job's folder (aria2c, ffmpeg, gallery-dl ...): blocking code that never
+    looks at the cancel flag (a merge, a split, yt-dlp's own aria2c) stops at once instead of running to the end."""
+    wd = getattr(job, "workdir", None)
+    if not wd:
+        return 0
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    key, killed = str(wd), 0
+    try:
+        children = psutil.Process(os.getpid()).children(recursive=True)
+    except Exception:  # noqa: BLE001
+        return 0
+    for ch in children:
+        try:
+            if key in " ".join(ch.cmdline()):
+                ch.kill()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return killed
+
+
 async def cancel_job(job):
-    """Cancel a job; a job still waiting is removed at once and frees its waiting slot."""
+    """Cancel a job; a job still waiting is removed at once and frees its waiting slot. A running job is stopped
+    right now (its child processes are killed) and the user sees 'Cancelling...' immediately."""
+    if not job.cancel.is_set():
+        job.cancel_since = time.monotonic()
     job.cancel.set()
+    if job not in waiting and job.state in ("downloading", "processing", "ready", "uploading"):
+        kill_job_processes(job)
+        bg(edit_safely(job.status_msg, f"🚫 <b>Cancelling...</b>  •  #{job.id}\nStopping now, one moment."))
     if job in waiting:
         waiting.remove(job)
         jobs.pop(job.id, None)
         job.state = "done"
         job.outcome = "cancelled"
         forget_job(job)
+        txt_job_done(job)
         if job.batch:
             job.batch.job_finished("cancelled")
             bg(batch_update(job.batch))
@@ -743,20 +916,47 @@ def make_job_from_probe(user, chat_id, url, pr, option=None, custom_name=None):
                    custom_name=custom_name)
     if pr["kind"] == "torrent":
         return Job(user, chat_id, url, "torrent", pr["title"], custom_name=custom_name)
+    if pr["kind"] == "gallery":
+        return Job(user, chat_id, url, "gallery", pr["title"], custom_name=custom_name)
     return Job(user, chat_id, url, "media", pr["title"], option=option, custom_name=custom_name)
 
 
 # --------------------------------------------------------------------------- upload turns (per user, strictly in queue order)
+def _txt_waits_for_earlier(j):
+    """TXT task: file N must not upload before file N-1 of the same task (parallel downloads may finish out of order)."""
+    return j.txt is not None and any(k is not j and k.txt is j.txt and k.txt_idx < j.txt_idx
+                                     and k.state in ("downloading", "processing", "ready") for k in running_jobs)
+
+
+def _upload_slot_free(uid):
+    """One upload per user at a time - unless every running upload of this user already takes more than LONG_JOB_MIN minutes."""
+    cur = uploading_now.get(uid)
+    if cur is None:
+        return True
+    if not config.LONG_JOB_RELEASE:
+        return False
+    running = [cur] + uploading_extra.get(uid, [])
+    if len(running) >= config.LONG_JOB_MAX_PARALLEL:
+        return False
+    now = time.monotonic()
+    return all(j.upload_started and now - j.upload_started > config.LONG_JOB_MIN * 60 for j in running)
+
+
 def _advance_uploads(uid):
-    if uploading_now.get(uid) is None:
-        line = upload_line.get(uid) or []
-        while line:
-            j = line.pop(0)
-            if not j.cancel.is_set():
+    line = upload_line.get(uid) or []
+    for j in list(line):
+        if uploading_now.get(uid) is not None and not _upload_slot_free(uid):
+            break
+        if not j.cancel.is_set() and _txt_waits_for_earlier(j):
+            continue                          # keep the order of the TXT file; this one goes after the earlier file
+        line.remove(j)
+        if not j.cancel.is_set():
+            j.upload_started = time.monotonic()
+            if uploading_now.get(uid) is None:
                 uploading_now[uid] = j
-            j.upload_go.set()                 # a cancelled job is woken too and raises Cancelled itself
-            if uploading_now.get(uid) is j:
-                break
+            else:
+                uploading_extra.setdefault(uid, []).append(j)
+        j.upload_go.set()                     # a cancelled job is woken too and raises Cancelled itself
     if not upload_line.get(uid):
         upload_line.pop(uid, None)
 
@@ -786,6 +986,13 @@ def release_upload_turn(job):
     uid = job.user_id
     if uploading_now.get(uid) is job:
         uploading_now.pop(uid, None)
+        extra = uploading_extra.get(uid)
+        if extra:
+            uploading_now[uid] = extra.pop(0)           # a parallel upload becomes the main one
+    elif job in uploading_extra.get(uid, []):
+        uploading_extra[uid].remove(job)
+    if not uploading_extra.get(uid):
+        uploading_extra.pop(uid, None)
     line = upload_line.get(uid)
     if line and job in line:
         line.remove(job)
@@ -812,6 +1019,8 @@ class UploadClient:
         self.ok = True               # False = disabled (bad token / not admin / cannot reach the channel)
         self.note = ""
         self.flood_until = 0.0       # monotonic time until which this bot is in a FloodWait
+        self.fails = 0               # consecutive failed uploads (3 in a row = rest for a few minutes)
+        self.idx = 0                 # helper number (to rebuild its client if it could not start)
 
     @property
     def usable(self):
@@ -821,11 +1030,16 @@ class UploadClient:
 uploaders = []                       # filled after the Telegram clients exist (main_uc first)
 
 
+def part_word(job):
+    return "File" if getattr(job, "multi", False) else "Part"
+
+
 def pick_uploader(exclude=(), helpers_only=False):
     cands = [u for u in uploaders if u.usable and u not in exclude and not (helpers_only and u.is_main)]
     if not cands:
         return None if helpers_only else main_uc
-    return min(cands, key=lambda u: (u.active, 0 if u.is_main else 1))      # least busy; main wins ties (no copy needed)
+    # least busy first; on a tie the helpers go first (HELPER_FIRST, default) so they really are used, then the one that delivered least
+    return min(cands, key=lambda u: (u.active, (1 if u.is_main else 0) if config.HELPER_FIRST else (0 if u.is_main else 1), u.uploaded))
 
 
 def ready_helpers():
@@ -851,7 +1065,7 @@ async def flood_retry(job, uc, factory, what):
                 raise RuntimeError(f"Telegram FloodWait: {fw.value}s required ({what}). Please try again later.") from fw
             uc.flood_until = time.monotonic() + wait
             log.warning("[%s] FloodWait %ss during %s (job #%s)", uc.name, wait, what, job.id)
-            await edit_safely(job.status_msg, f"⏳ <b>Telegram FloodWait</b>  •  #{job.id}\n"
+            await job_edit(job, f"⏳ <b>Telegram FloodWait</b>  •  #{job.id}\n"
                                               f"Resuming automatically in {time_text(wait)}...", cancel_markup(job))
             await sleep_cancellable(job, wait)
 
@@ -886,8 +1100,26 @@ async def send_item(uc, chat_id, job, item, caption, cb):
     return await flood_retry(job, uc, attempt, "upload")
 
 
+class UploadStalled(Exception):
+    """The upload made no progress for UPLOAD_STALL_SEC seconds (hung connection / dead media session)."""
+
+
+async def reset_media_sessions(uc):
+    """Drop the client's cached upload sessions: the next upload opens fresh ones (a hung session would hang again)."""
+    sessions = getattr(uc.client, "media_sessions", None)
+    if isinstance(sessions, dict):
+        for sess in list(sessions.values()):
+            try:
+                await asyncio.wait_for(sess.stop(), 10)
+            except Exception:  # noqa: BLE001
+                pass
+        sessions.clear()
+
+
 async def upload_one(job, uc, item, slot, chat_id, caption):
-    """Upload one file with one client into chat_id. Progress goes into job.up_cur[slot]."""
+    """Upload one file with one client into chat_id. Progress goes into job.up_cur[slot].
+    Watchdog: no new byte for UPLOAD_STALL_SEC seconds -> the attempt is cancelled and UploadStalled is raised
+    (the caller falls back to another uploader / retries) instead of hanging for ever at 0%."""
     size = Path(item["path"]).stat().st_size
 
     def callback(current, total_bytes):
@@ -896,20 +1128,69 @@ async def upload_one(job, uc, item, slot, chat_id, caption):
         job.up_cur[slot] = current
 
     job.up_cur[slot] = 0
-    sent = await send_item(uc, chat_id, job, item, caption, callback)
+    task = asyncio.ensure_future(send_item(uc, chat_id, job, item, caption, callback))
+    last_bytes, last_move = 0, time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=5)
+            if done:
+                break
+            now, cur = time.monotonic(), job.up_cur.get(slot, 0)
+            if cur != last_bytes:
+                last_bytes, last_move = cur, now
+            # all bytes sent but Telegram is still finishing the message: allow more time before calling it a stall
+            limit = config.UPLOAD_STALL_SEC * (2 if size and cur >= size else 1)
+            if job.cancel.is_set():
+                limit = min(limit, 30)                       # a cancelled upload must not linger
+            if now - last_move > limit:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                if job.cancel.is_set():
+                    raise dl.Cancelled()
+                raise UploadStalled(f"no upload progress for {int(now - last_move)}s at {last_bytes}/{size} bytes")
+        sent = task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
     if sent is None or job.cancel.is_set():
         raise dl.Cancelled()
     job.up_cur[slot] = size
     return sent
 
 
+async def upload_main_with_retry(job, item, slot, chat_id, caption):
+    """The main bot's upload; a stalled upload is restarted (fresh sessions) up to UPLOAD_STALL_RETRIES times."""
+    for attempt in range(config.UPLOAD_STALL_RETRIES + 1):
+        try:
+            return await upload_one(job, main_uc, item, slot, chat_id, caption)
+        except UploadStalled as exc:
+            log.warning("[main] upload stalled (attempt %s/%s): %s", attempt + 1, config.UPLOAD_STALL_RETRIES + 1, exc)
+            if attempt >= config.UPLOAD_STALL_RETRIES:
+                raise RuntimeError("Upload stalled several times (Telegram connection hung). Please try again later.") from exc
+            await reset_media_sessions(main_uc)
+            job.up_cur[slot] = 0
+
+
 def note_helper_failure(uc, exc):
     name = type(exc).__name__
     log.warning("[%s] upload via helper failed: %s: %s", uc.name, name, str(exc)[:200])
-    if name in PERMANENT_HELPER_ERRORS or "Peer id invalid" in str(exc):
+    uc.fails += 1
+    if isinstance(exc, UploadStalled):
+        uc.flood_until = time.monotonic() + 600           # a hung helper: rest 10 minutes, the main bot takes over now
+        uc.fails = 0
+        uc.note = "resting 10 min: its upload hung"
+        bg(reset_media_sessions(uc))
+        log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) upload hung ({exc}). The main bot delivered instead; the helper rests 10 minutes.")
+    elif name in PERMANENT_HELPER_ERRORS or "Peer id invalid" in str(exc):
         uc.ok = False
-        uc.note = f"disabled: {name} (check admin rights in the storage channel, then /helpers)"
-        log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) disabled: {name}. Make sure it is Admin (Post Messages) of this channel, then run /helpers.")
+        uc.note = f"disabled: {name} (check admin rights in the storage channel; it is re-checked automatically)"
+        log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) disabled: {name}. Make sure it is Admin (Post Messages) of this channel. "
+               "It is re-checked automatically every few minutes (or run /helpers).")
+    elif uc.fails >= 3:
+        uc.flood_until = time.monotonic() + 300          # rest 5 minutes, the main bot / other helpers take over
+        uc.fails = 0
+        uc.note = f"resting 5 min after 3 failed uploads ({name})"
+        log_bg(f"⚠️ Helper {uc.name} (@{uc.username}) failed 3 uploads in a row ({name}: {str(exc)[:120]}). Resting 5 minutes.")
 
 
 async def deliver_item(job, item, uc, slot, label):
@@ -922,6 +1203,8 @@ async def deliver_item(job, item, uc, slot, label):
             mid = await copy_with_fallback(job, stored, caption)
             note_channel_message(job, mid)
             uc.uploaded += 1
+            uc.fails = 0
+            uc.note = ""
             if mid and cache_eligible(job):
                 fid = await fetch_file_id(job.target_chat, mid)
                 if fid:
@@ -938,7 +1221,7 @@ async def deliver_item(job, item, uc, slot, label):
     main_uc.active += 1
     try:
         try:
-            sent = await upload_one(job, main_uc, item, slot, job.target_chat, caption)
+            sent = await upload_main_with_retry(job, item, slot, job.target_chat, caption)
         except dl.Cancelled:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -947,7 +1230,7 @@ async def deliver_item(job, item, uc, slot, label):
             if job.target_chat == job.chat_id or not channel_unusable(exc):
                 raise
             channel_fallback(job, exc)                 # the channel does not accept our posts: deliver to the chat instead
-            sent = await upload_one(job, main_uc, item, slot, job.chat_id, caption)
+            sent = await upload_main_with_retry(job, item, slot, job.chat_id, caption)
         main_uc.uploaded += 1
         note_channel_message(job, sent.id)
         fid = msg_file_id(sent)
@@ -972,7 +1255,7 @@ async def upload_parts_parallel(job, items, helpers):
                     raise RuntimeError("All helper bots failed while uploading the parts.")
                 uc.active += 1
                 try:
-                    stored = await upload_one(job, uc, item, i, config.LOG_CHANNEL_ID, log_caption(job, f"Part {i}/{n}"))
+                    stored = await upload_one(job, uc, item, i, config.LOG_CHANNEL_ID, log_caption(job, f"{part_word(job)} {i}/{n}"))
                     uc.uploaded += 1
                     return stored
                 except dl.Cancelled:
@@ -989,8 +1272,8 @@ async def upload_parts_parallel(job, items, helpers):
     try:
         for i, task in enumerate(tasks, 1):
             stored = await task
-            job.part_label = f"Part {i}/{n}"
-            mid = await copy_with_fallback(job, stored, user_caption(job, f"Part {i}/{n}"))
+            job.part_label = f"{part_word(job)} {i}/{n}"
+            mid = await copy_with_fallback(job, stored, user_caption(job, f"{part_word(job)} {i}/{n}"))
             note_channel_message(job, mid)
             if mid and cache_eligible(job):
                 fid = await fetch_file_id(job.target_chat, mid)
@@ -1011,8 +1294,8 @@ async def upload_reporter(job, started, stop):
             inst = max(0, cur - prev_b) / (now - prev_t)
             speed = inst if speed == 0 else 0.6 * speed + 0.4 * inst
             prev_b, prev_t = cur, now
-        if now - last >= config.PROGRESS_UPDATE_INTERVAL:
-            await edit_safely(job.status_msg, progress_text(
+        if now - last >= config.PROGRESS_UPDATE_INTERVAL and not job.cancel.is_set():
+            await job_edit(job, progress_text(
                 job, "Uploading", job.title, cur, job.up_total, speed,
                 (job.up_total - cur) / speed if speed > 0 else None, now - started), cancel_markup(job))
             last = now
@@ -1032,11 +1315,11 @@ async def upload_all(job, items, started):
     try:
         helpers = ready_helpers()
         if n > 1 and helpers:
-            job.part_label = f"{n} parts"
+            job.part_label = f"{n} {part_word(job).lower()}s"
             await upload_parts_parallel(job, items, helpers)
             return
         for i, item in enumerate(items, 1):
-            label = f"Part {i}/{n}" if n > 1 else ""
+            label = f"{part_word(job)} {i}/{n}" if n > 1 else ""
             job.part_label = label
             sent, in_log = await deliver_item(job, item, pick_uploader(), i, label)
             if not in_log:
@@ -1061,7 +1344,7 @@ async def wait_for_disk(job):
             bg(alert_admin("disk", f"💾 <b>Low disk space</b>: {esc(msg)}"))
             raise RuntimeError(msg)
         if waited % 30 == 0:
-            await edit_safely(job.status_msg, f"⏳ <b>Waiting for free disk space</b>  •  #{job.id}\n"
+            await job_edit(job, f"⏳ <b>Waiting for free disk space</b>  •  #{job.id}\n"
                                               "Other files are still being processed; this job starts automatically.", cancel_markup(job))
         await sleep_cancellable(job, 5)
         waited += 5
@@ -1104,7 +1387,7 @@ async def run_job(job):
     loop = asyncio.get_running_loop()
     started = time.monotonic()
     workdir = DOWNLOAD_DIR / f"job{job.id}_{int(time.time())}"
-    log_bg(f"🆕 Job #{job.id} start\n👤 {job.user_label}\n🔗 {job.url}\n🎞 {job.option.get('label', job.mode)}")
+    job.workdir = workdir
     final_text = None
     try:
         ok_q, why = store.quota_check(job.user_id, extra_files=1)     # the day may have rolled over while the job waited
@@ -1113,45 +1396,81 @@ async def run_job(job):
         await wait_for_disk(job)
 
         # ---- download
-        await edit_safely(job.status_msg, progress_text(job, "Downloading", job.title, 0, job.est_size, 0, None, 0),
+        await job_edit(job, progress_text(job, "Downloading", job.title, 0, job.est_size, 0, None, 0),
                           cancel_markup(job))
         fut = loop.run_in_executor(POOL, dl.download, job, workdir)
         last = last_disk = time.monotonic()
         while not fut.done():
             await asyncio.wait({fut}, timeout=1)
             now = time.monotonic()
+            if job.cancel.is_set():
+                kill_job_processes(job)                       # aria2c / ffmpeg of this job
+                if now - (job.cancel_since or now) > 15:      # a thread stuck in a blocked network read: do not wait for it
+                    log.warning("job #%s: cancelled, the download thread did not stop within 15 s - abandoned", job.id)
+                    raise dl.Cancelled()
+            sp = float(job.progress.get("speed") or 0)
+            job.speed_ema = sp if not job.speed_ema else 0.7 * job.speed_ema + 0.3 * sp
+            if not job.too_big and (job.progress.get("current") or 0) > config.MAX_FILE_GB * 1024 ** 3:
+                job.too_big = True                                   # size was unknown before: stop as soon as it is over the limit
+                job.cancel.set()
             if now - last_disk >= 3:
                 last_disk = now
                 if safety.disk_low() and not job.disk_full:      # the disk is filling up: stop before everything breaks
                     job.disk_full = True
                     job.cancel.set()
-            if now - last >= config.PROGRESS_UPDATE_INTERVAL and not fut.done():
+            if now - last >= config.PROGRESS_UPDATE_INTERVAL and not fut.done() and not job.cancel.is_set():
                 p = job.progress
-                await edit_safely(job.status_msg, progress_text(
+                await job_edit(job, progress_text(
                     job, "Downloading", job.title, p["current"], p["total"], p["speed"], p["eta"], now - started),
                     cancel_markup(job))
                 last = now
         result = await fut
+        dl_seconds = max(0.001, time.monotonic() - started)
         job.title = result["title"] or job.title
-        apply_custom_name(job, result)
+        paths = [Path(p) for p in (result.get("paths") or [])]
+        job.multi = len(paths) > 1                 # gallery-dl: several files from one link
+        if job.multi:
+            job.file_name = job.title
+        else:
+            apply_custom_name(job, result)
+            paths = [Path(result["path"])]
         job.silent = bool(result.get("silent"))
         job.title = result["title"] or job.title
-        size = Path(result["path"]).stat().st_size
+        size = sum(p.stat().st_size for p in paths)
         job.size_bytes = size
-        log_bg(f"✅ Download complete #{job.id}\n🎬 {job.title}\n📦 {size_text(size)}")
+        if size > config.MAX_FILE_GB * 1024 ** 3:
+            job.too_big = True
+            raise RuntimeError(f"This file is {size_text(size)}. The maximum file size is {config.MAX_FILE_GB} GB.")
 
         # ---- post-process (remux to mp4, thumbnail, split >2GB)
         job.state = "processing"
-        await edit_safely(job.status_msg, f"⚙️ <b>Processing</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
-                                          f"📦 {size_text(size)}", cancel_markup(job))
-        items = await loop.run_in_executor(POOL, dl.prepare_upload, result["path"])
+        proc_started = time.monotonic()
+        job.progress.pop("stage", None)
+        job.progress.pop("ptotal", None)
+        await job_edit(job, processing_text(job, size, None, 0), cancel_markup(job))
+        items = []
+        for one in paths:
+            pfut = loop.run_in_executor(POOL, dl.prepare_upload, one, job.cancel, job.progress,
+                                        job.settings.get("send_as") == "document")
+            last_p = time.monotonic()
+            while not pfut.done():
+                await asyncio.wait({pfut}, timeout=1)
+                now = time.monotonic()
+                if job.cancel.is_set():
+                    kill_job_processes(job)
+                    if now - (job.cancel_since or now) > 15:
+                        raise dl.Cancelled()
+                if now - last_p >= config.PROGRESS_UPDATE_INTERVAL and not pfut.done() and not job.cancel.is_set():
+                    await job_edit(job, processing_text(job, size, job.progress, now - proc_started), cancel_markup(job))
+                    last_p = now
+            items += await pfut
         if job.cancel.is_set():
             raise dl.Cancelled()
         await apply_user_settings(job, items, workdir)
 
         # ---- wait for our upload turn (the previous file of this user may still be uploading), then upload
         if job.state != "uploading":
-            await edit_safely(job.status_msg, f"📤 <b>Ready – waiting for the previous upload</b>  •  #{job.id}\n"
+            await job_edit(job, f"📤 <b>Ready – waiting for the previous upload</b>  •  #{job.id}\n"
                                               f"🎬 {esc(job.title[:130])}", cancel_markup(job))
         await acquire_upload_turn(job)
         await upload_all(job, items, started)
@@ -1162,17 +1481,26 @@ async def run_job(job):
         cache_store(job, items)
         elapsed = time.monotonic() - started
         final_text = (f"✅ <b>Completed</b>  •  #{job.id}\n\n🎬 {esc(job.title[:130])}\n📦 {size_text(size)}"
-                      + (f"\n📚 {len(items)} parts (Telegram 2GB limit)" if len(items) > 1 else "")
+                      + (f"\n🖼 {len(items)} files" if job.multi else f"\n✂️ Split into {len(items)} parts (each up to {config.SPLIT_SIZE_MB} MB)" if len(items) > 1 else "")
                       + (f"\n🔇 <b>No audio in the source:</b> the site delivered this video without sound "
                          f"(Instagram/Facebook do this when not logged in, or the music was removed). The admin can add login cookies."
                          if job.silent else "")
+                      + (f"\n🎧 <b>{esc(items[0]['note'])}</b>: sent as the original file, so no audio language is lost."
+                         if items and items[0].get("note") and items[0]["note"] != "original" else "")
                       + channel_text_line(job)
+                      + (f"\n⚡ Download speed: {size_text(size / dl_seconds)}/s (avg)" if size and dl_seconds > 3 else "")
                       + f"\n🕒 Total time: {time_text(elapsed)}")
         notify_channel_delivery(job)
-        log_bg(f"✅ Delivered #{job.id}\n👤 {job.user_label}\n🎬 {job.title}\n📦 {size_text(size)}\n🕒 {time_text(elapsed)}")
     except dl.Cancelled:
-        if job.disk_full:
+        if job.too_big:
             job.outcome = "failed"
+            job.error = f"file bigger than {config.MAX_FILE_GB} GB"
+            store.bump("errors")
+            final_text = (f"❌ <b>File too big</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
+                          f"The maximum file size is {config.MAX_FILE_GB} GB (it is split into {config.SPLIT_SIZE_MB} MB parts for Telegram).")
+        elif job.disk_full:
+            job.outcome = "failed"
+            job.error = "server disk was full"
             store.bump("errors")
             final_text = (f"❌ <b>Server disk is full</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}\n"
                           "The download was stopped to protect the server. Try again in a few minutes.")
@@ -1185,19 +1513,28 @@ async def run_job(job):
         else:
             job.outcome = "cancelled"
             final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
-            log_bg(f"🚫 Job #{job.id} cancelled by user\n👤 {job.user_label}")
     except Exception as exc:  # noqa: BLE001
-        log.exception("Job #%s failed", job.id)
-        job.outcome = "failed"
-        store.bump("errors")
-        note_failure(job, exc)
-        final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
-        log_bg(f"❌ Job #{job.id} failed\n👤 {job.user_label}\n🔗 {job.url}\n⚠️ {str(exc)[:700]}")
+        if job.cancel.is_set() and not (job.disk_full or job.too_big or state["shutting_down"]):
+            job.outcome = "cancelled"            # the process died because /cancel killed it: that is a cancel, not a failure
+            final_text = f"🚫 <b>Cancelled</b>  •  #{job.id}\n🎬 {esc(job.title[:130])}"
+        else:
+            log.exception("Job #%s failed", job.id)
+            job.outcome = "failed"
+            job.error = str(exc)[:200]
+            store.bump("errors")
+            note_failure(job, exc)
+            final_text = (f"❌ <b>Job failed</b>  •  #{job.id}\n🔗 {esc(job.url[:300])}\n⚠️ {esc(str(exc)[:700])}")
     finally:
         release_upload_turn(job)
         shutil.rmtree(workdir, ignore_errors=True)   # always clean: failed jobs must not fill the disk
+        if job.txt is not None:
+            gc.collect()                             # TXT tasks run for hours: give the memory back after every file
     if final_text:
-        await edit_final(job.status_msg, final_text)
+        bg(log_mirror(job, final_text, force=True))      # the log channel keeps the result of every job
+        if job.txt is not None and (job.outcome == "ok" or state["shutting_down"]):
+            await delete_quiet(job.status_msg)       # keep the chat clean: the delivered file is the proof (summary shows the rest)
+        else:
+            await edit_final(job.status_msg, final_text)
 
 
 async def run_wrapper(job):
@@ -1215,6 +1552,7 @@ async def run_wrapper(job):
         jobs.pop(job.id, None)
         release_upload_turn(job)
         forget_job(job)
+        txt_job_done(job)
         if job.batch:
             job.batch.job_finished(job.outcome, job.size_bytes)
             bg(batch_update(job.batch))
@@ -1227,15 +1565,29 @@ async def dispatcher():
         await wake.wait()
         wake.clear()
         while len(running_jobs) < config.MAX_CONCURRENT_JOBS and not state["shutting_down"]:
-            job = next((j for j in waiting if busy_download(j.user_id) < config.MAX_RUNNING_PER_USER), None)
+            if running_jobs and safety.memory_percent() > config.MEMORY_START_LIMIT_PCT:
+                break                                              # RAM nearly full: wait for a running job to finish (checked every 5 s)
+            job = next((j for j in waiting if busy_download(j.user_id) < user_download_limit(j.user_id)), None)
             if job is None:
                 break
             waiting.remove(job)
             running_jobs.add(job)
             job.state = "downloading"
+            job.dl_started = time.monotonic()
+            job.speed_ema = 0.0
             job.attempts += 1
             persist_job(job)                       # attempts counter: a job that keeps crashing the bot is dropped after 3 tries
             asyncio.create_task(run_wrapper(job))
+
+
+async def adaptive_slot_loop():
+    """Wake the dispatcher every 5 s while jobs wait: a slow download may now deserve one more parallel slot."""
+    while True:
+        await asyncio.sleep(5)
+        if waiting:                                                # speeds / RAM change without any event: look again
+            wake.set()
+        for uid in list(upload_line):                              # a long upload may now allow the next file to upload too
+            _advance_uploads(uid)
 
 
 async def restore_queue():
@@ -1280,8 +1632,8 @@ async def restore_queue():
 
 # =============================================================================== Telegram app
 
-fastupload.install()      # multi-connection uploads (stock Pyrogram is single-connection, ~5-6 MB/s)
-_kwargs = dict(name="url_uploader_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
+# Uploads use the engine chosen by UPLOAD_MODE (wzgram by default, or cbgram) - both are drop-in Pyrogram forks (see engine.py).
+_kwargs = dict(name=engine.session_name(), api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN,
                workers=16, workdir=config.DATA_DIR, parse_mode=ParseMode.HTML, sleep_threshold=config.FLOOD_SLEEP_THRESHOLD)
 try:
     app = Client(**_kwargs, max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS)
@@ -1320,7 +1672,15 @@ async def helper_knows_channel(uc):
         return True
     except Exception as exc:  # noqa: BLE001
         log.info("[%s] cannot address the channel yet: %s", uc.name, type(exc).__name__)
-        return False
+    uname = state.get("log_username")
+    if uname:                                    # a public channel can be resolved by its @username: teaches the helper the access hash
+        try:
+            await uc.client.get_chat("@" + uname)
+            await uc.client.get_chat(config.LOG_CHANNEL_ID)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.info("[%s] cannot resolve @%s either: %s", uc.name, uname, type(exc).__name__)
+    return False
 
 
 async def check_helpers(retry_wait=12):
@@ -1340,8 +1700,40 @@ async def check_helpers(retry_wait=12):
                 break
         for uc in unknown:
             uc.ok = False
-            uc.note = "cannot address the log channel (post any message there, then /helpers)"
+            uc.note = "cannot address the log channel (post any message in the channel, then /helpers)"
+    for uc in helpers:
+        if uc.ok:
+            bg(save_helper_peers(uc))
     return [(uc, uc.ok, uc.note) for uc in helpers]
+
+
+def _helper_conn(uc):
+    return getattr(getattr(uc.client, "storage", None), "conn", None)
+
+
+async def save_helper_peers(uc):
+    """Keep what the helper knows (the channel's access hash) in the database: after a restart it can use the channel at once."""
+    conn = _helper_conn(uc)
+    if conn is None or not config.PERSIST_SESSION:
+        return
+    try:
+        blob = await _export_conn_peers_async(conn)
+        if blob:
+            await db.put_blob(f"peers_helper_{uc.id}", blob)
+    except Exception as exc:  # noqa: BLE001
+        log.info("[%s] could not save its peer cache: %s", uc.name, type(exc).__name__)
+
+
+async def load_helper_peers(uc):
+    conn = _helper_conn(uc)
+    if conn is None or not config.PERSIST_SESSION:
+        return
+    try:
+        blob = await db.get_blob(f"peers_helper_{uc.id}")
+        if blob:
+            await _import_conn_peers(conn, blob)
+    except Exception as exc:  # noqa: BLE001
+        log.info("[%s] could not restore its peer cache: %s", uc.name, type(exc).__name__)
 
 
 async def start_helpers():
@@ -1352,10 +1744,12 @@ async def start_helpers():
 
     async def boot(idx, token):
         uc = UploadClient(make_helper_client(token, idx), f"helper{idx}", False, token)
+        uc.idx = idx
         try:
             await uc.client.start()
             me = await uc.client.get_me()
             uc.id, uc.username = me.id, me.username or str(me.id)
+            await load_helper_peers(uc)
         except Exception as exc:  # noqa: BLE001
             uc.ok, uc.note = False, f"start failed: {type(exc).__name__}"
             log.error("[%s] could not start: %s", uc.name, type(exc).__name__)
@@ -1415,12 +1809,18 @@ async def start_handler(_, message):
             f"Up to {config.MAX_WAITING_PER_USER} can wait in line. Same link again = instant resend ⚡\n\n"
             "📋 /queue  /clear  /top  /move  /cancel\n⚙️ /settings  /caption  /setthumb  /delthumb\n"
             "📊 /mystats  /myplan  /id")
+    if store.has_plus(message.from_user.id):
+        text += ("\n\n➕ <b>Premium Plus:</b> send a <b>.txt file</b> (one link per line). All links are downloaded in "
+                 "<b>Best quality</b>, one by one. If the bot restarts it continues automatically. /stoptxt = stop")
     if store.is_admin(message.from_user.id):
         text += ("\n\n👑 <b>Admin:</b>\n/addpremium <code>id [days]</code> (or reply to a user's message)\n"
                  "/removepremium <code>id</code>  /premiumlist  /setquota <code>id gb [files]</code>\n"
+                 "/addplus <code>id [days]</code>  /removeplus <code>id</code>  /pluslist  (TXT upload)\n"
+                 "/setcookies  /cookies  /delcookies  (login cookies for yt-dlp + gallery-dl)\n"
+                 "/nettest <code>link</code>  (what the link's server answers: IP block? proxy?)\n"
                  "/gencode <code>30d [count]</code>  /codes  /delcode\n"
                  "/stats  /userstats <code>id</code>  /topusers  /clearlinks\n"
-                 "/cleanup  /testlog  /helpers  /speedtest <code>[MB] [conns] [workers]</code>\n/update (yt-dlp)  /restart")
+                 "/cleanup  /testlog  /helpers  /speedtest <code>[MB]</code>\n/update (yt-dlp)  /restart")
     await message.reply_text(text)
 
 
@@ -1440,7 +1840,9 @@ async def myplan_handler(_, message):
     if store.is_admin(uid):
         return await message.reply_text("👑 You are the <b>Admin</b>: unlimited access.")
     rec = store.premium_info(uid)
-    await message.reply_text(f"💎 <b>Premium active</b>\n📅 Expiry: {date_text(rec.get('expires'))}\n\n{usage_text(uid)}")
+    plus = store.plus_info(uid)
+    plus_line = f"\n➕ <b>Premium Plus (TXT upload)</b>: {date_text(plus.get('expires'))}" if plus else ""
+    await message.reply_text(f"💎 <b>Premium active</b>\n📅 Expiry: {date_text(rec.get('expires'))}{plus_line}\n\n{usage_text(uid)}")
 
 
 @app.on_message(PRIVATE & filters.command("mystats"))
@@ -1467,7 +1869,10 @@ def queue_text(uid):
     active = [j for j in user_jobs(uid) if j not in waiting]
     wl = [j for j in waiting if j.user_id == uid]
     lines = [f"📋 <b>Your queue</b> • Active: {len(active)} • Waiting: {len(wl)}/{config.MAX_WAITING_PER_USER}"]
-    if not active and not wl:
+    tt = user_txt_task(uid)
+    if tt:
+        lines.append(f"\n📄 TXT task #{tt.id}: {tt.finished_count}/{tt.total} done • /stoptxt to stop")
+    if not active and not wl and not tt:
         lines.append("\nYou have no active jobs.")
     for j in active:
         lines.append(f"\n▶️ #{j.id} • {esc(j.state)} • {esc(j.title[:60])}")
@@ -1488,10 +1893,14 @@ async def status_handler(_, message):
 @app.on_message(PRIVATE & filters.command("cancel"))
 @allowed_only
 async def cancel_cmd(_, message):
-    mine = user_jobs(message.from_user.id)
+    uid = message.from_user.id
+    task = user_txt_task(uid)
+    if task:
+        await cancel_txt_task(task, "Stopped by you.")      # first: no new link of the TXT task may start
+    mine = user_jobs(uid)
     for j in mine:
         await cancel_job(j)
-    await message.reply_text(f"🚫 Cancelling {len(mine)} job(s)." if mine else "No active jobs.")
+    await message.reply_text(f"🚫 Cancelling {len(mine)} job(s)." + (" TXT task stopped." if task else "") if (mine or task) else "No active jobs.")
 
 
 @app.on_message(PRIVATE & filters.command("clear"))
@@ -1500,6 +1909,8 @@ async def clear_cmd(_, message):
     """/clear = remove everything that is still WAITING (running jobs continue). /clear all = cancel running ones too."""
     uid = message.from_user.id
     everything = len(message.command) > 1 and message.command[1].lower() == "all"
+    if everything and user_txt_task(uid):
+        await cancel_txt_task(user_txt_task(uid), "Stopped by you.")
     targets = user_jobs(uid) if everything else [j for j in waiting if j.user_id == uid]
     for j in targets:
         await cancel_job(j)
@@ -2185,6 +2596,8 @@ async def removepremium_handler(_, message):
     if uid is None:
         return await message.reply_text("Usage: /removepremium <code>user_id</code>")
     if store.remove_premium(uid):
+        if user_txt_task(uid):
+            await cancel_txt_task(user_txt_task(uid), "Premium was removed by the Admin.")
         for j in user_jobs(uid):
             await cancel_job(j)
         await message.reply_text(f"🗑 Premium removed for <code>{uid}</code>.")
@@ -2199,6 +2612,156 @@ async def premiumlist_handler(_, message):
     if not users:
         return await message.reply_text("There are no premium users yet.")
     lines = [f"💎 <b>Premium users ({len(users)})</b>"] + [
+        f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
+    await message.reply_text("\n".join(lines))
+
+
+# ------------------------------------------------------------------- admin: cookies (yt-dlp + gallery-dl + aria2 + direct links)
+async def load_cookies():
+    doc = await db.get("kv", "cookies")
+    if doc and doc.get("text"):
+        dl.set_runtime_cookies(doc["text"])
+        log.info("Cookies loaded from the database: %s cookie(s)", doc.get("count", "?"))
+
+
+def cookie_source_info():
+    """(source, count, domains) of the cookies that are used right now. Never returns cookie values."""
+    if dl.runtime_cookies():
+        src, text = "database (/setcookies)", dl.runtime_cookies()
+    elif config.COOKIES_TEXT.strip():
+        src, text = "COOKIES_TEXT environment variable", config.COOKIES_TEXT
+    else:
+        try:
+            fp = Path(config.COOKIE_FILE).expanduser()
+            src, text = f"file {fp.name}", (fp.read_text(encoding="utf-8", errors="ignore") if fp.is_file() else "")
+        except OSError:
+            src, text = "file", ""
+    _, n, domains = dl.normalize_cookies(text)
+    return (src if n else "none"), n, domains
+
+
+async def apply_cookies_text(message, raw_text):
+    clean, n, domains = dl.normalize_cookies(raw_text)
+    if not n:
+        return await message.reply_text(
+            "❌ No valid cookies found.\nExport them in <b>Netscape cookies.txt</b> format (browser extension "
+            "<i>Get cookies.txt LOCALLY</i>) while you are logged in, then send that file here with the caption /setcookies.")
+    dl.set_runtime_cookies(clean)
+    db.put("kv", "cookies", {"text": clean, "count": n, "domains": domains[:200], "ts": time.time(), "by": message.from_user.id})
+    await delete_quiet(message)                      # the message holds login secrets: do not leave it in the chat
+    await app.send_message(message.chat.id, f"🍪 <b>Cookies saved</b>: {n} cookie(s) for {len(domains)} site(s)\n"
+                                            + ", ".join(esc(d) for d in domains[:15]) + (" …" if len(domains) > 15 else "")
+                                            + "\n\nUsed by yt-dlp, gallery-dl, aria2 and direct links. Stored in the database "
+                                              "(survives redeploys). Your original message was deleted.")
+
+
+async def cookies_from_document(message, doc_message):
+    doc = doc_message.document
+    if (doc.file_size or 0) > 2 * 1024 * 1024:
+        return await message.reply_text("❌ File too big for a cookies file (max 2 MB).")
+    buf = await doc_message.download(in_memory=True)
+    raw = buf.getvalue() if hasattr(buf, "getvalue") else Path(buf).read_bytes()
+    await apply_cookies_text(message, _decode_text(raw))
+
+
+@app.on_message(PRIVATE & filters.command("nettest"))
+@admin_only
+async def nettest_cmd(_, message):
+    """/nettest <link> - what does the SERVER of this link answer to the bot (plain / Referer / browser TLS), directly and via the proxy?"""
+    parts = (message.text or "").split(None, 1)
+    found = URL_RE.findall(parts[1]) if len(parts) > 1 else []
+    if not found:
+        return await message.reply_text("Usage: /nettest <code>https://link</code>\nShows what the server answers to this bot (and to the proxy), "
+                                        "and the IP address the server sees.")
+    url = found[0].rstrip(URL_TRAIL)
+    note = await message.reply_text("🔬 Testing the link from this server...")
+    try:
+        ip, lines = await asyncio.get_running_loop().run_in_executor(POOL, dl.net_diagnose, url)
+    except Exception as exc:  # noqa: BLE001
+        return await edit_safely(note, f"❌ Test failed: {esc(str(exc)[:300])}")
+    verdict = ("\n\n✅ At least one way works: the bot will use it where possible." if any(x.startswith("✅") for x in lines) else
+               "\n\n❌ Nothing works from this server. Typical cause: the site blocks this server's IP (datacenter). "
+               + ("Check PROXY_URL." if config.PROXY_URL else "Set PROXY_URL (a proxy on another network) and try again."))
+    await edit_safely(note, f"🔬 <b>Net test</b>\n🔗 {esc(url[:150])}\n🌐 Server IP: <code>{esc(ip)}</code>"
+                            f"{'  •  proxy: on' if config.PROXY_URL else '  •  proxy: not set'}\n\n" + "\n".join(esc(x) for x in lines) + verdict)
+
+
+@app.on_message(PRIVATE & filters.command("setcookies"))
+@admin_only
+async def setcookies_cmd(_, message):
+    """Reply to / send a cookies.txt file with /setcookies, or paste the cookies after the command."""
+    target = message.reply_to_message if message.reply_to_message and message.reply_to_message.document else None
+    if target is not None:
+        return await cookies_from_document(message, target)
+    parts = (message.text or "").split(None, 1)
+    if len(parts) > 1:
+        return await apply_cookies_text(message, parts[1])
+    await message.reply_text("🍪 <b>Set cookies</b>\nSend your <b>cookies.txt</b> (Netscape format) as a file with the caption /setcookies, "
+                             "or reply to that file with /setcookies.\n/cookies = status • /delcookies = remove")
+
+
+@app.on_message(PRIVATE & filters.command("cookies"))
+@admin_only
+async def cookies_cmd(_, message):
+    src, n, domains = cookie_source_info()
+    if not n:
+        return await message.reply_text("🍪 No cookies are set.\nSend a cookies.txt file with the caption /setcookies.")
+    await message.reply_text(f"🍪 <b>Cookies active</b>\n📦 Source: {esc(src)}\n🔢 {n} cookie(s) • {len(domains)} site(s)\n"
+                             + ", ".join(esc(d) for d in domains[:25]) + (" …" if len(domains) > 25 else ""))
+
+
+@app.on_message(PRIVATE & filters.command("delcookies"))
+@admin_only
+async def delcookies_cmd(_, message):
+    had = bool(dl.runtime_cookies())
+    dl.set_runtime_cookies("")
+    db.delete("kv", "cookies")
+    left = cookie_source_info()[1]
+    text = "🗑 Cookies removed from the database." if had else "No cookies were saved with /setcookies."
+    if left:
+        text += f"\nℹ️ {left} cookie(s) from COOKIES_TEXT / cookies.txt are still used."
+    await message.reply_text(text)
+
+
+@app.on_message(PRIVATE & filters.command(["addplus", "addpremiumplus"]))
+@admin_only
+async def addplus_handler(_, message):
+    uid, rest = parse_target(message)
+    if uid is None:
+        return await message.reply_text("Usage: /addplus <code>user_id [days]</code>\nLeave days out for Lifetime. "
+                                        "Or reply to a user's message with /addplus <code>[days]</code>")
+    days = int(rest[0]) if rest and rest[0].isdigit() and int(rest[0]) > 0 else None
+    expires = store.add_plus(uid, days, by=message.from_user.id)
+    warn = "" if store.is_allowed(uid) else "\n⚠️ This user has no Premium yet: give it with /addpremium too."
+    await message.reply_text(f"✅ Premium Plus (TXT upload) granted to <code>{uid}</code>.\n📅 Expiry: {date_text(expires)}{warn}")
+    try:
+        await app.send_message(uid, f"🎉 You now have <b>Premium Plus</b>!\n📅 Expiry: {date_text(expires)}\n\n"
+                                    "Send a <b>.txt file</b> with one link per line. Everything is downloaded in Best quality.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.on_message(PRIVATE & filters.command(["removeplus", "delplus"]))
+@admin_only
+async def removeplus_handler(_, message):
+    uid, _ = parse_target(message)
+    if uid is None:
+        return await message.reply_text("Usage: /removeplus <code>user_id</code>")
+    if store.remove_plus(uid):
+        if user_txt_task(uid):
+            await cancel_txt_task(user_txt_task(uid), "Premium Plus was removed by the Admin.")
+        await message.reply_text(f"🗑 Premium Plus removed for <code>{uid}</code> (normal Premium is unchanged).")
+    else:
+        await message.reply_text("This user does not have Premium Plus.")
+
+
+@app.on_message(PRIVATE & filters.command(["pluslist", "plusers"]))
+@admin_only
+async def pluslist_handler(_, message):
+    users = store.list_plus()
+    if not users:
+        return await message.reply_text("There are no Premium Plus users yet.")
+    lines = [f"➕ <b>Premium Plus users ({len(users)})</b>"] + [
         f"• <code>{uid}</code> — {date_text(exp)}" for uid, exp in sorted(users)]
     await message.reply_text("\n".join(lines))
 
@@ -2227,6 +2790,11 @@ async def helpers_handler(_, message):
         state_txt = "🟢 ready" if u.usable else ("🟡 FloodWait" if u.ok else "🔴 " + esc(u.note or "disabled"))
         who = "main" if u.is_main else f"{u.name} @{esc(u.username)}"
         lines.append(f"• {who}: {state_txt} • active {u.active} • delivered {u.uploaded}")
+        if u.ok and u.note:
+            lines.append(f"   ⚠️ {esc(u.note)}")
+    lines.append("")
+    lines.append("Order: " + ("helpers first, then the main bot (HELPER_FIRST=true)" if config.HELPER_FIRST
+                              else "the main bot first, helpers when it is busy (HELPER_FIRST=false)"))
     await edit_safely(note, "\n".join(lines))
 
 
@@ -2239,21 +2807,14 @@ def _make_test_file(path, mb):
 @app.on_message(PRIVATE & filters.command("speedtest"))
 @admin_only
 async def speedtest_handler(_, message):
-    """/speedtest [MB] [connections] [workers] - uploads random data to this chat and reports the real speed."""
-    args = [int(a) for a in message.command[1:4] if a.isdigit()]
+    """/speedtest [MB] - uploads random data to this chat (active engine) and reports the real speed."""
+    args = [int(a) for a in message.command[1:2] if a.isdigit()]
     mb = max(10, min(500, args[0] if args else 200))
-    old = (config.UPLOAD_CONNECTIONS, config.UPLOAD_WORKERS_PER_CONNECTION, config.UPLOAD_ADAPTIVE)
-    if len(args) > 1:
-        config.UPLOAD_CONNECTIONS = max(1, min(16, args[1]))
-        config.UPLOAD_ADAPTIVE = False               # test exactly the requested number of connections
-    if len(args) > 2:
-        config.UPLOAD_WORKERS_PER_CONNECTION = max(1, min(8, args[2]))
     note = await message.reply_text(f"⏳ Creating a {mb} MB test file...")
     path = DOWNLOAD_DIR / f"speedtest_{int(time.time())}.bin"
     try:
         await asyncio.get_running_loop().run_in_executor(POOL, _make_test_file, path, mb)
-        conns = f"{config.UPLOAD_CONNECTIONS} x {config.UPLOAD_WORKERS_PER_CONNECTION}"
-        await edit_safely(note, f"📤 Uploading {mb} MB ({conns} connections x workers)...")
+        await edit_safely(note, f"📤 Uploading {mb} MB ({engine.INFO['active']})...")
         t0 = time.monotonic()
         sent = await app.send_document(message.chat.id, str(path), caption="speedtest", force_document=True)
         took = max(0.001, time.monotonic() - t0)
@@ -2262,14 +2823,18 @@ async def speedtest_handler(_, message):
         except Exception:  # noqa: BLE001
             pass
         await edit_final(note, f"⚡ <b>Upload speed test</b>\n📦 {mb} MB in {took:.1f}s\n🚀 <b>{mb / took:.1f} MB/s</b> "
-                               f"({mb * 8 / took:.0f} Mbit/s)\n🔧 {conns} (connections x workers)\n\n"
-                               "Try: <code>/speedtest 400 12 4</code> and compare (use 400+ MB so all connections are used).")
+                               f"({mb * 8 / took:.0f} Mbit/s)\n🔧 Engine: {esc(_wzgram_version())}\n\n"
+                               "Tip: use 200+ MB for a realistic number.")
     except Exception as exc:  # noqa: BLE001
         log.exception("speedtest failed")
         await edit_final(note, f"❌ Speed test failed: {esc(str(exc)[:300])}")
     finally:
-        config.UPLOAD_CONNECTIONS, config.UPLOAD_WORKERS_PER_CONNECTION, config.UPLOAD_ADAPTIVE = old
         path.unlink(missing_ok=True)
+
+
+def _wzgram_version():
+    """Label of the ACTIVE engine ('wzgram x.y' or 'cbgram x.y'). Name kept so older call sites still work."""
+    return engine.label()
 
 
 # ------------------------------------------------------------------- admin: stats / quota / maintenance
@@ -2309,11 +2874,14 @@ def stats_text():
         f"🗄 Database: {esc(db.label)}" + (f"  ⚠️ {esc(db.error)}" if db.error else ""),
         keepalive_text(),
         "",
-        f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now)} uploading",
+        f"📋 Jobs now: {len(running_jobs)} running • {len(waiting)} waiting • {len(uploading_now) + sum(len(v) for v in uploading_extra.values())} uploading",
         f"🤖 Uploaders: " + " • ".join(f"{'main' if u.is_main else u.name}:{'🟢' if u.usable else '🔴'}{u.active}" for u in uploaders),
-        "🔌 Upload sessions: {live} live • {busy} in use • {pooled} warm".format(**fastupload.session_stats()),
-        f"🚀 Upload connections: {fastupload.tuner.limit}/{config.UPLOAD_CONNECTIONS} (auto-tune {'on' if config.AUTOTUNE else 'off'}, "
-        f"last {fastupload.tuner.last_speed / 1048576:.1f} MB/s)",
+        f"🧠 RAM in use: {safety.memory_percent():.0f}% of {config.MEMORY_MB} MB • max {config.MAX_CONCURRENT_JOBS} jobs at once "
+        f"(new jobs pause above {config.MEMORY_START_LIMIT_PCT}% RAM)",
+        f"🔌 Upload mode: {engine.mode_text()}",
+        f"🚀 Upload engine: {esc(_wzgram_version())} • {config.MAX_CONCURRENT_TRANSMISSIONS} streams",
+        f"⚙️ Speed profile: <b>{config.SPEED_PROFILE}</b> (RAM {config.MEMORY_MB} MB) • aria2 {config.ARIA2_CONNECTIONS} conn • "
+        f"{config.CONCURRENT_FRAGMENTS} fragments • auto-parallel {'on' if config.AUTO_PARALLEL else 'off'}",
         "",
         f"📅 <b>Today</b>: {today.get('jobs', 0)} jobs • {today.get('files', 0)} files • {size_text(today.get('bytes', 0))} • "
         f"❌ {today.get('errors', 0)} errors • ⚡ {today.get('cache_hits', 0)} cache hits",
@@ -2568,7 +3136,7 @@ async def _handle_url(message, url, prev_done, name=None, batch=None):
         await edit_safely(status, f"❌ Link check fail: {esc(str(exc)[:400])}")
         return False
 
-    if pr["kind"] in ("direct", "torrent") or (pr["kind"] == "media" and len(pr["options"]) == 1):
+    if pr["kind"] in ("direct", "torrent", "gallery") or (pr["kind"] == "media" and len(pr["options"]) == 1):
         if prev_done is not None:
             await prev_done                         # wait until the link before this one has taken its place in the queue
         option = pr["options"][0] if pr["kind"] == "media" else None
@@ -2595,10 +3163,10 @@ def parse_links(text):
     """[(url, custom_name|None)] in the order sent. A line 'link | new name.ext' renames that file."""
     out, seen = [], set()
     for line in (text or "").splitlines():
-        found = [u.rstrip(".,;:!?)]}") for u in URL_RE.findall(line)]
+        found = [u.rstrip(URL_TRAIL) for u in URL_RE.findall(line)]
         name = None
         if len(found) == 1:
-            rest = line.split(URL_RE.findall(line)[0], 1)[1].strip()
+            rest = line.split(URL_RE.findall(line)[0], 1)[1].lstrip("\"'”’").strip()
             if rest.startswith("|"):
                 name = rest[1:].strip()[:150] or None
         for u in found:
@@ -2606,6 +3174,422 @@ def parse_links(text):
                 seen.add(u)
                 out.append((u, name if len(found) == 1 else None))
     return out
+
+
+# =============================================================================== Premium Plus: TXT file upload
+# A .txt file (one link per line) is turned into ONE task. The task feeds its links into the normal queue one after
+# the other, always with the BEST quality:   1 download + 1 upload at a time (the next file downloads while the
+# previous one uploads), the disk is cleaned after every file, and the progress is stored in the database, so after a
+# restart / redeploy the task continues from the first unfinished link.
+
+txt_tasks = {}                 # id -> TxtTask (running)
+txt_runners = set()            # asyncio tasks of the running TxtTasks
+def txt_window():
+    """Links of one task alive at once: 2 (one downloading/uploading + the next waiting); more when AUTO_PARALLEL may start extra downloads."""
+    return config.AUTO_PARALLEL_MAX + 1 if config.AUTO_PARALLEL else 2
+
+
+class TxtTask:
+    _ids = itertools.count(1)
+
+    def __init__(self, user, chat_id, filename, entries):
+        self.id = next(TxtTask._ids)
+        self.key = secrets.token_hex(8)
+        self.user = SimpleNamespace(id=user.id, first_name=getattr(user, "first_name", None),
+                                    last_name=getattr(user, "last_name", None), username=getattr(user, "username", None))
+        self.chat_id = chat_id
+        self.filename = (filename or "links.txt")[:80]
+        self.entries = entries                # [[url, custom_name|None], ...]   (a playlist link is expanded in place)
+        self.created = time.time()
+        self.started = time.time()
+        self.attempts = 0
+        self.next = 0                         # index of the next link to start
+        self.pos = 0                          # resume point: every link before it is finished
+        self.done = set()                     # finished indexes (may be ahead of pos for a moment)
+        self.ok = self.failed = self.skipped = 0
+        self.expanded = 0                     # playlist links that were replaced by their videos (not counted in the total)
+        self.bytes = 0
+        self.fails = []                       # [[url, reason]]  failed + skipped (capped)
+        self.jobs = {}                        # idx -> Job (alive)
+        self.current = ""
+        self.cancelled = False
+        self.stop_reason = ""
+        self.msg = None
+        self.last_edit = 0.0
+
+    # ---- state
+    @property
+    def total(self):
+        return len(self.entries) - self.expanded
+
+    @property
+    def finished_count(self):
+        return self.ok + self.failed + self.skipped
+
+    def text(self, final=False):
+        left = max(0, self.total - self.finished_count)
+        head = "✅ <b>TXT task finished</b>" if final else "📄 <b>TXT task running</b>"
+        if final and self.stop_reason:
+            head = "🛑 <b>TXT task stopped</b>"
+        lines = [f"{head}  •  #{self.id}", f"🗂 {esc(self.filename)}",
+                 f"📊 <b>{self.finished_count}/{self.total}</b>  •  ✅ {self.ok}  ❌ {self.failed}  🚫 {self.skipped}"]
+        if not final:
+            if self.current:
+                lines.append(f"▶️ {esc(self.current[:90])}")
+            lines.append(f"⏳ Remaining: {left}")
+        lines.append(f"📦 Uploaded: {size_text(self.bytes)}")
+        lines.append(f"🕒 {'Time' if final else 'Running'}: {time_text(time.time() - self.started)}")
+        if final and self.stop_reason:
+            lines.append(f"⚠️ {esc(self.stop_reason)}")
+        return "\n".join(lines)
+
+    def markup(self):
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop TXT task", callback_data=f"tx:{self.id}")]])
+
+    # ---- persistence
+    def to_doc(self):
+        sm = self.msg
+        return {"user_id": self.user.id, "first_name": self.user.first_name, "last_name": self.user.last_name,
+                "username": self.user.username, "chat_id": self.chat_id, "filename": self.filename,
+                "created": self.created, "attempts": self.attempts, "pos": self.pos, "ok": self.ok,
+                "failed": self.failed, "skipped": self.skipped, "expanded": self.expanded, "bytes": self.bytes, "fails": self.fails[-300:],
+                "status_chat": _chat_of(sm) if sm else 0, "status_id": getattr(sm, "id", 0) if sm else 0}
+
+    @classmethod
+    def from_doc(cls, d, entries):
+        user = SimpleNamespace(id=d["user_id"], first_name=d.get("first_name"), last_name=d.get("last_name"),
+                               username=d.get("username"))
+        t = cls(user, d["chat_id"], d.get("filename"), entries)
+        t.key = str(d["_id"])
+        t.created, t.attempts = d.get("created", t.created), d.get("attempts", 0)
+        t.pos = t.next = min(int(d.get("pos", 0)), len(entries))
+        t.done = set(range(t.pos))
+        t.ok, t.failed, t.skipped = d.get("ok", 0), d.get("failed", 0), d.get("skipped", 0)
+        t.expanded = d.get("expanded", 0)
+        t.bytes, t.fails = d.get("bytes", 0), d.get("fails", [])
+        return t
+
+
+def user_txt_task(uid):
+    return next((t for t in txt_tasks.values() if t.user.id == uid), None)
+
+
+def persist_txt(task):
+    db.put("txttask", task.key, task.to_doc())
+
+
+async def txt_update(task, force=False):
+    """One summary message per task (edited, never re-sent)."""
+    if task.msg is None:
+        return
+    if not force and time.monotonic() - task.last_edit < 5:
+        return
+    task.last_edit = time.monotonic()
+    await edit_safely(task.msg, task.text(), task.markup())
+
+
+def _txt_finish_idx(task, idx):
+    task.done.add(idx)
+    while task.pos in task.done:
+        task.pos += 1
+    task.attempts = 0                         # progress was made: reset the crash-loop guard
+    persist_txt(task)
+    bg(txt_update(task))
+
+
+def txt_job_done(job):
+    """Called when a job of a TXT task ends (finished / failed / cancelled / served from cache). Safe to call twice."""
+    task = job.txt
+    if task is None or job.txt_counted:
+        return
+    if state["shutting_down"] and job.outcome != "ok":
+        return                                # interrupted by a restart: the link is done again after the restart
+    job.txt_counted = True
+    task.jobs.pop(job.txt_idx, None)
+    if job.outcome == "ok":
+        task.ok += 1
+        task.bytes += job.size_bytes
+    elif job.outcome == "cancelled":
+        task.skipped += 1
+        task.fails.append([job.url, "cancelled"])
+    else:
+        task.failed += 1
+        task.fails.append([job.url, job.error or "failed"])
+    _txt_finish_idx(task, job.txt_idx)
+
+
+def _txt_fail_entry(task, idx, url, reason):
+    task.failed += 1
+    task.fails.append([url, reason[:200]])
+    _txt_finish_idx(task, idx)
+
+
+async def txt_process_entry(task, idx, url, name):
+    """Analyse one link and put it into the normal queue with the BEST quality."""
+    loop = asyncio.get_running_loop()
+    try:
+        async with probe_sem:
+            pr = await loop.run_in_executor(POOL, dl.probe, url)
+    except dl.ProbeError as exc:
+        return _txt_fail_entry(task, idx, url, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("txt probe failed")
+        return _txt_fail_entry(task, idx, url, f"link check failed: {type(exc).__name__}")
+
+    if pr["kind"] == "playlist":              # playlist link inside the TXT: its videos (Best quality) take its place
+        new = [[e["url"], None] for e in pr["entries"][:config.PLAYLIST_LIMIT]]
+        task.entries[idx + 1:idx + 1] = new
+        task.expanded += 1
+        await db.put_wait("txtlist", task.key, {"entries": task.entries})
+        task.done.add(idx)
+        while task.pos in task.done:
+            task.pos += 1
+        persist_txt(task)
+        return
+
+    option = pr["options"][0] if pr["kind"] == "media" else None      # options[0] is always "Best" (see downloader._build_options)
+    job = make_job_from_probe(task.user, task.chat_id, url, pr, option, custom_name=name)
+    job.txt, job.txt_idx = task, idx
+    task.jobs[idx] = job
+    task.current = job.title
+    try:
+        status = await app.send_message(task.chat_id, f"⏳ {idx + 1}/{task.total} • {esc(job.title[:100])}")
+    except Exception as exc:  # noqa: BLE001
+        task.jobs.pop(idx, None)
+        return _txt_fail_entry(task, idx, url, f"could not send status message: {type(exc).__name__}")
+    queued = await enqueue(job, status, None)
+    if not queued:
+        task.jobs.pop(idx, None)
+        await delete_quiet(status)
+        return _txt_fail_entry(task, idx, url, "queue limit / daily limit")
+    if job.id not in jobs and not job.txt_counted:   # served instantly from the URL cache
+        txt_job_done(job)
+        if job.outcome == "ok":
+            await delete_quiet(status)
+
+
+async def run_txt_task(task):
+    uid = task.user.id
+    try:
+        task.attempts += 1
+        persist_txt(task)
+        await txt_update(task, force=True)
+        while task.next < len(task.entries):
+            if state["shutting_down"] or task.cancelled:
+                break
+            if not (store.is_allowed(uid) and store.has_plus(uid)):
+                task.stop_reason = "Premium / Premium Plus is no longer active."
+                break
+            while len(task.jobs) >= txt_window() and not (state["shutting_down"] or task.cancelled):
+                await asyncio.sleep(1)
+            if state["shutting_down"] or task.cancelled:
+                break
+            ok_q, why = store.quota_check(uid, extra_files=1 + len(user_jobs(uid)))
+            if not ok_q:
+                task.stop_reason = f"{why} (resets at 00:00 UTC)"
+                break
+            idx = task.next
+            url, name = task.entries[idx]
+            task.next += 1
+            await txt_process_entry(task, idx, url, name)
+            await txt_update(task)
+        while task.jobs and not state["shutting_down"]:       # let the last links finish (or finish cancelling)
+            await asyncio.sleep(1)
+        if state["shutting_down"]:
+            return                                            # progress stays in the database -> resumes after the restart
+        if task.cancelled and not task.stop_reason:
+            task.stop_reason = "Stopped by you."
+        await txt_finish(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.exception("TXT task #%s crashed", task.id)
+        task.stop_reason = f"Internal error: {type(exc).__name__}"
+        for job in list(task.jobs.values()):
+            await cancel_job(job)
+        try:
+            await txt_finish(task)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        if not state["shutting_down"]:
+            txt_tasks.pop(task.id, None)
+
+
+def _links_file(rows, name):
+    bio = io.BytesIO("\n".join(rows).encode("utf-8"))
+    bio.name = name
+    return bio
+
+
+async def txt_finish(task):
+    remaining = [e[0] if not e[1] else f"{e[0]} | {e[1]}" for e in task.entries[task.next:]]
+    failed = [u for u, _ in task.fails]
+    final = task.text(final=True)
+    if task.fails:
+        final += "\n\n❌ <b>Not delivered:</b>\n" + "\n".join(
+            f"• {esc(u[:70])}\n   ⚠️ {esc(r[:90])}" for u, r in task.fails[:8])
+        if len(task.fails) > 8:
+            final += f"\n… and {len(task.fails) - 8} more (see the file below)"
+    if task.msg is not None:
+        await edit_final(task.msg, task.text(final=True))
+    try:
+        await app.send_message(task.chat_id, "🔔 " + final, disable_web_page_preview=True)
+        if failed:
+            await app.send_document(task.chat_id, _links_file(failed, "failed_links.txt"), file_name="failed_links.txt",
+                                    caption="❌ Failed / skipped links. Upload this file again to retry them.")
+        if remaining:
+            await app.send_document(task.chat_id, _links_file(remaining, "remaining_links.txt"), file_name="remaining_links.txt",
+                                    caption=f"📋 {len(remaining)} link(s) were not started. Upload this file again to continue.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("TXT summary could not be sent: %s", type(exc).__name__)
+    db.delete("txttask", task.key)
+    db.delete("txtlist", task.key)
+    log_bg(f"📄 TXT task #{task.id} finished\n👤 {task.user.id}\n✅ {task.ok} ❌ {task.failed} 🚫 {task.skipped} • {size_text(task.bytes)}")
+
+
+def spawn_txt(task):
+    txt_tasks[task.id] = task
+    t = asyncio.create_task(run_txt_task(task))
+    txt_runners.add(t)
+    t.add_done_callback(txt_runners.discard)
+
+
+async def cancel_txt_task(task, reason=""):
+    """Stop the task: no new link is started and the running / waiting ones of this task are cancelled."""
+    task.cancelled = True
+    if reason:
+        task.stop_reason = reason
+    for job in list(task.jobs.values()):
+        await cancel_job(job)
+
+
+async def restore_txt_tasks():
+    """After a restart / redeploy: unfinished TXT tasks continue from the first unfinished link."""
+    docs = await db.all("txttask")
+    now, max_age = time.time(), config.TXT_RESTORE_MAX_AGE_H * 3600
+    for d in docs:
+        key = d["_id"]
+        try:
+            lst = await db.get("txtlist", key)
+            entries = (lst or {}).get("entries") or []
+            uid = d["user_id"]
+            if (not entries or now - d.get("created", now) > max_age or d.get("attempts", 0) >= 5
+                    or not (store.is_allowed(uid) and store.has_plus(uid)) or d.get("pos", 0) >= len(entries)):
+                db.delete("txttask", key)
+                db.delete("txtlist", key)
+                continue
+            task = TxtTask.from_doc(d, entries)
+            msg = None
+            if d.get("status_id") and d.get("status_chat"):
+                try:
+                    msg = await app.get_messages(d["status_chat"], d["status_id"])
+                except Exception:  # noqa: BLE001
+                    msg = None
+            if msg is None or getattr(msg, "empty", False):
+                msg = await app.send_message(task.chat_id, "♻️ Restoring your TXT task...")
+            task.msg = msg
+            spawn_txt(task)
+            try:
+                await app.send_message(task.chat_id, f"♻️ <b>The bot restarted.</b> Your TXT task <b>{esc(task.filename)}</b> "
+                                                     f"continues from link {task.pos + 1}/{task.total}.")
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not restore TXT task %s: %s", key, type(exc).__name__)
+            db.delete("txttask", key)
+            db.delete("txtlist", key)
+    if txt_tasks:
+        log.info("TXT tasks restored: %s", len(txt_tasks))
+
+
+def _decode_text(raw):
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+@app.on_message(PRIVATE & filters.document)
+async def txt_upload_handler(_, message):
+    doc = message.document
+    name = (getattr(doc, "file_name", "") or "")
+    is_cookie_upload = (message.caption or "").strip().lower().startswith("/setcookies")
+    if not message.from_user or not (is_cookie_upload or name.lower().endswith(".txt") or (getattr(doc, "mime_type", "") or "") == "text/plain"):
+        return                                                    # not a TXT file: ignore (same as before)
+    uid = message.from_user.id
+    if (message.caption or "").strip().lower().startswith("/setcookies"):
+        if not store.is_admin(uid):
+            return await message.reply_text("🔒 Only the Admin can set cookies.")
+        return await cookies_from_document(message, message)
+    if not store.is_allowed(uid):
+        return await deny(message)
+    store.touch_user(uid, message.from_user.first_name or "")
+    if not store.has_plus(uid):
+        return await message.reply_text("🔒 <b>TXT upload is a Premium Plus feature.</b>\n\n"
+                                        f"Your Telegram ID: <code>{uid}</code>\nAsk the Admin for Premium Plus.")
+    if user_txt_task(uid):
+        return await message.reply_text("⚠️ A TXT task of yours is already running. Wait until it finishes, or stop it with "
+                                        "/stoptxt, then send the new file.")
+    if (doc.file_size or 0) > config.TXT_MAX_FILE_KB * 1024:
+        return await message.reply_text(f"❌ File too big (max {config.TXT_MAX_FILE_KB} KB).")
+    wait = await message.reply_text("📄 Reading your file...", quote=True)
+    try:
+        buf = await message.download(in_memory=True)             # kept in memory only, nothing is written to disk
+        if isinstance(buf, (str, Path)):                         # (older Pyrogram: path) -> read and delete it
+            raw = Path(buf).read_bytes()
+            Path(buf).unlink(missing_ok=True)
+        else:
+            raw = buf.getvalue()
+        del buf
+    except Exception as exc:  # noqa: BLE001
+        log.warning("TXT download failed: %s", type(exc).__name__)
+        return await edit_safely(wait, "❌ Could not read the file. Please send it again.")
+    text = _decode_text(raw)
+    del raw
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    links = parse_links(text)
+    if not links:
+        return await edit_safely(wait, "❌ No valid link found in this file. Put one link per line (http/https"
+                                       + (", magnet" if config.TORRENT_ENABLED else "") + ").")
+    note = ""
+    if len(links) > config.TXT_MAX_URLS:
+        note += f"\n⚠️ Only the first {config.TXT_MAX_URLS} links are used."
+        links = links[:config.TXT_MAX_URLS]
+    ignored = max(0, len(lines) - len(links))
+    if ignored and not note:
+        note += f"\nℹ️ {ignored} line(s) were ignored (no link / duplicate)."
+    task = TxtTask(message.from_user, message.chat.id, name, [[u, n] for u, n in links])
+    await db.put_wait("txtlist", task.key, {"entries": task.entries})
+    await delete_quiet(wait)
+    task.msg = await message.reply_text(
+        f"📄 <b>TXT task started</b>  •  #{task.id}\n🗂 {esc(task.filename)}\n🔗 {task.total} link(s) • 🏆 Best quality\n"
+        f"📤 One download + one upload at a time. If the bot restarts, it continues from where it stopped.{note}",
+        quote=True, reply_markup=task.markup())
+    spawn_txt(task)
+
+
+@app.on_message(PRIVATE & filters.command("stoptxt"))
+@allowed_only
+async def stoptxt_cmd(_, message):
+    task = user_txt_task(message.from_user.id)
+    if not task:
+        return await message.reply_text("You have no running TXT task.")
+    await cancel_txt_task(task, "Stopped by you.")
+    await message.reply_text("🛑 Stopping your TXT task...")
+
+
+@app.on_callback_query(filters.regex(r"^tx:"))
+async def txt_callback(_, cq):
+    task = txt_tasks.get(int(cq.data.split(":", 1)[1]))
+    if not task:
+        return await cq.answer("This TXT task has already finished.")
+    if cq.from_user.id != task.user.id and not store.is_admin(cq.from_user.id):
+        return await cq.answer("This is not your task.", show_alert=True)
+    await cq.answer("🛑 Stopping...")
+    await cancel_txt_task(task, "Stopped by you.")
 
 
 @app.on_message(PRIVATE & filters.text & ~filters.regex(r"^/"))
@@ -2730,48 +3714,79 @@ async def cleanup_cmd(_, message):
 
 
 # =============================================================================== background tasks
-SESSION_FILE = Path(config.DATA_DIR) / "url_uploader_bot.session"
+SESSION_FILE = Path(config.DATA_DIR) / f"{engine.session_name()}.session"
+
+
+def _export_conn_peers(con):
+    import gzip
+    import json
+    import sqlite3
+    out = {}
+    for table in ("peers", "usernames"):
+        try:
+            cur = con.execute(f"SELECT * FROM {table}")
+        except sqlite3.Error:
+            continue
+        out[table] = {"columns": [c[0] for c in cur.description], "rows": cur.fetchall()}
+    return gzip.compress(json.dumps(out).encode()) if out else None
 
 
 def _export_peers_sync():
-    """Dump Pyrogram's peer cache (who the bot can message: users + channels + their access hashes) as gzip-JSON."""
-    import gzip
-    import json
+    """Dump the peer cache (who the bot can message: users + channels + their access hashes) as gzip-JSON."""
     import sqlite3
     if not SESSION_FILE.is_file():
         return None
     con = sqlite3.connect(str(SESSION_FILE), timeout=5)
     try:
-        out = {}
-        for table in ("peers", "usernames"):
-            try:
-                cur = con.execute(f"SELECT * FROM {table}")
-            except sqlite3.Error:
-                continue
-            out[table] = {"columns": [c[0] for c in cur.description], "rows": cur.fetchall()}
+        return _export_conn_peers(con)
     finally:
         con.close()
+
+
+async def _db(x):
+    """wzgram's storage is async (aiosqlite), stock Pyrogram's is sync: accept both."""
+    return await x if inspect.isawaitable(x) else x
+
+
+async def _export_conn_peers_async(con):
+    import gzip
+    import json
+    out = {}
+    for table in ("peers", "usernames"):
+        try:
+            cur = await _db(con.execute(f"SELECT * FROM {table}"))
+            cols = [c[0] for c in cur.description]
+            out[table] = {"columns": cols, "rows": [list(r) for r in await _db(cur.fetchall())]}
+        except Exception:  # noqa: BLE001  (table missing in this storage format)
+            continue
     return gzip.compress(json.dumps(out).encode()) if out else None
 
 
-def _import_peers_sync(blob):
+async def _import_conn_peers(conn, blob):
+    """Insert saved peers into a storage connection (sync sqlite3 or async aiosqlite). Returns the number of rows."""
     import gzip
     import json
-    conn = getattr(app.storage, "conn", None)
-    if conn is None:
-        return 0
     data, n = json.loads(gzip.decompress(blob)), 0
     for table, d in data.items():
-        have = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        try:
+            cur = await _db(conn.execute(f"PRAGMA table_info({table})"))
+            have = [r[1] for r in await _db(cur.fetchall())]
+        except Exception:  # noqa: BLE001
+            continue
         cols = [c for c in d["columns"] if c in have]
         if not cols:
             continue
         idx = [d["columns"].index(c) for c in cols]
-        conn.executemany(f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                         [[row[i] for i in idx] for row in d["rows"]])
+        await _db(conn.executemany(f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                                   [[row[i] for i in idx] for row in d["rows"]]))
         n += len(d["rows"])
-    conn.commit()
+    await _db(conn.commit())
     return n
+
+
+async def _import_peers(blob):
+    conn = getattr(app.storage, "conn", None)
+    return 0 if conn is None else await _import_conn_peers(conn, blob)
 
 
 async def save_peers(force=False):
@@ -2798,7 +3813,7 @@ async def load_peers():
     blob = await db.get_blob("peers")
     if blob:
         try:
-            log.info("Peer cache restored: %s entries", _import_peers_sync(blob))
+            log.info("Peer cache restored: %s entries", await _import_peers(blob))
         except Exception as exc:  # noqa: BLE001
             log.warning("peer cache restore failed: %s", type(exc).__name__)
 
@@ -2855,6 +3870,34 @@ async def ytdlp_update_loop():
         await asyncio.sleep(config.YTDLP_UPDATE_HOURS * 3600)
 
 
+async def helper_watchdog_loop():
+    """A helper that was disabled (channel not reachable yet, bad start, lost admin rights ...) is re-checked every 5 minutes
+    and comes back by itself - the Admin does not have to run /helpers."""
+    await asyncio.sleep(180)
+    while True:
+        try:
+            bad = [u for u in uploaders if not u.is_main and not u.ok]
+            if bad and state.get("log_ok"):
+                for uc in bad:
+                    if uc.note.startswith("start failed"):          # its Telegram client never started: build a new one
+                        try:
+                            uc.client = make_helper_client(uc.token, uc.idx)
+                            await uc.client.start()
+                            me = await uc.client.get_me()
+                            uc.id, uc.username = me.id, me.username or str(me.id)
+                            await load_helper_peers(uc)
+                            uc.ok, uc.note = True, ""
+                        except Exception as exc:  # noqa: BLE001
+                            uc.note = f"start failed: {type(exc).__name__}"
+                await check_helpers(retry_wait=4)
+                for uc in bad:
+                    if uc.ok:
+                        log_bg(f"✅ Helper {uc.name} (@{uc.username}) is working again.")
+        except Exception:  # noqa: BLE001
+            log.exception("helper watchdog")
+        await asyncio.sleep(300)
+
+
 async def telegram_watchdog_loop():
     """If the MAIN Telegram connection silently dies (Pyrogram swallows send errors on a closed transport) the bot would
     stay 'online' but deaf. Every 2 min: a cheap get_me(); 3 failures in a row -> alert + graceful restart (queue is saved)."""
@@ -2879,7 +3922,6 @@ async def health_loop():
     while True:
         await asyncio.sleep(60)
         try:
-            await fastupload.reap_orphans()
             store.flush_stats()
             clean_pending()
             tick = state.get("health_tick", 0) + 1
@@ -2921,8 +3963,7 @@ async def main():
 
     await db.start()                       # MongoDB (or local JSON fallback)
     await store.init()
-    fastupload.tuner.restore(((await db.get("kv", "tuner")) or {}).get("limit"))
-    fastupload.tuner.on_change = lambda limit: db.put("kv", "tuner", {"limit": limit})
+    await load_cookies()
     for leftover in DOWNLOAD_DIR.iterdir():          # files of jobs that were running when the previous instance died
         shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
 
@@ -2948,13 +3989,13 @@ async def main():
     if ok:
         await send_log(f"🟢 Bot @{me.username} online (DC{dc})\n⚙️ aria2c: {dl.HAVE_ARIA2} • ffmpeg: {dl.HAVE_FFMPEG} • "
                        f"yt-dlp {yt_dlp.version.__version__}\n🗄 Database: {db.label}\n🤖 Helper bots ready: {n_help}/{len(config.HELPER_BOT_TOKENS)}\n"
-                       f"🚀 Upload: up to {fastupload.tuner.limit} conn x {config.UPLOAD_WORKERS_PER_CONNECTION} workers "
-                       f"(auto-tune {'on' if config.AUTOTUNE else 'off'})")
+                       f"🔌 Upload mode: {engine.INFO['active'].upper()}" + (f" (requested {engine.INFO['requested']}: {engine.INFO['note']})" if engine.INFO["requested"] != engine.INFO["active"] else "") + f"\n🚀 Upload engine: {_wzgram_version()} • speed profile {config.SPEED_PROFILE} (RAM {config.MEMORY_MB} MB)")
     state["ready"] = True
     log.info("Started as @%s | yt-dlp %s | aria2c=%s | ffmpeg=%s | db=%s", me.username, yt_dlp.version.__version__,
              dl.HAVE_ARIA2, dl.HAVE_FFMPEG, db.label)
-    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop(), telegram_watchdog_loop())]
+    workers = [asyncio.create_task(c) for c in (dispatcher(), peers_loop(), reminder_loop(), ytdlp_update_loop(), health_loop(), keepalive_loop(), telegram_watchdog_loop(), helper_watchdog_loop(), adaptive_slot_loop())]
     await restore_queue()
+    await restore_txt_tasks()
     if config.MONGO_URI and not db.mongo:
         bg(alert_admin("db", f"🗄 <b>MongoDB connection failed at startup.</b> Using local files (data is lost on redeploy).\n"
                              f"<code>{esc(db.error)}</code>", every=6 * 3600))
@@ -2963,15 +4004,14 @@ async def main():
     finally:
         state["ready"] = False
         state["shutting_down"] = True       # running jobs stay in the database and are restored by the next instance
-        for w in workers:
+        for w in list(workers) + list(txt_runners):
             w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*workers, *list(txt_runners), return_exceptions=True)
         try:
             await save_peers(force=True)
         except Exception:  # noqa: BLE001
             pass
         store.flush_stats()
-        await fastupload.close_pool()
         for u in uploaders:
             if not u.is_main:
                 try:

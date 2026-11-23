@@ -67,6 +67,24 @@ def free_bytes(path=None):
         return 1 << 62
 
 
+def memory_percent():
+    """% of the container's memory in use (cgroup v2 / v1, else the machine's RAM). 0.0 if unknown."""
+    for used_p, limit_p in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+                            ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+        try:
+            used = int(Path(used_p).read_text().strip())
+            raw = Path(limit_p).read_text().strip()
+            if raw.isdigit() and int(raw) < 1 << 50:
+                return used * 100.0 / int(raw)
+        except (OSError, ValueError):
+            continue
+    try:
+        import psutil
+        return float(psutil.virtual_memory().percent)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def needed_bytes(size):
     """Disk a job of `size` bytes needs: the file itself + remux/split copies (>2 GB files are copied into parts)."""
     if size <= 0:

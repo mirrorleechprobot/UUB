@@ -17,6 +17,7 @@ from db import db
 log = logging.getLogger("uub.store")
 _lock = threading.RLock()
 _premium = {}          # str(uid) -> {"added", "expires", "by", "quota_gb", "quota_files", "reminded": [days]}
+_plus = {}             # str(uid) -> {"added", "expires", "by"}   Premium Plus (TXT file upload); separate from _premium on purpose
 _users = {}            # str(uid) -> {"name", "first_seen", "last_seen", "settings": {...}, "usage": {...}}
 _stats = {}            # "YYYY-MM-DD" -> {"files", "bytes", "errors", "cache_hits", "jobs"}
 _stats_saved = 0.0
@@ -33,9 +34,11 @@ def today():
 async def init():
     global _stats
     with _lock:
-        _premium.clear(); _users.clear(); _stats.clear()
+        _premium.clear(); _users.clear(); _stats.clear(); _plus.clear()
         for d in await db.all("premium"):
             _premium[str(d["_id"])] = {k: v for k, v in d.items() if k != "_id"}
+        for d in await db.all("plus"):
+            _plus[str(d["_id"])] = {k: v for k, v in d.items() if k != "_id"}
         for d in await db.all("users"):
             _users[str(d["_id"])] = {k: v for k, v in d.items() if k != "_id"}
         for d in await db.all("stats"):
@@ -121,6 +124,49 @@ def list_premium():
     now = time.time()
     with _lock:
         return [(int(uid), rec.get("expires")) for uid, rec in _premium.items()
+                if not rec.get("expires") or rec["expires"] >= now]
+
+
+# --------------------------------------------------------------------------- Premium Plus (TXT upload)
+def plus_info(user_id):
+    """Premium Plus record if active (not expired), else None."""
+    with _lock:
+        rec = _plus.get(str(user_id))
+    if not rec:
+        return None
+    expires = rec.get("expires")
+    if expires and expires < time.time():
+        return None
+    return rec
+
+
+def has_plus(user_id):
+    """Admins always have it. Everybody else needs an active Premium Plus record (set by the admin with /addplus)."""
+    return is_admin(user_id) or plus_info(user_id) is not None
+
+
+def add_plus(user_id, days=None, by=None):
+    """days=None -> lifetime. Returns the expiry timestamp (or None)."""
+    with _lock:
+        expires = time.time() + days * 86400 if days else None
+        rec = {"added": time.time(), "expires": expires, "by": by}
+        _plus[str(user_id)] = rec
+    db.put("plus", user_id, rec)
+    return expires
+
+
+def remove_plus(user_id):
+    with _lock:
+        existed = _plus.pop(str(user_id), None) is not None
+    if existed:
+        db.delete("plus", user_id)
+    return existed
+
+
+def list_plus():
+    now = time.time()
+    with _lock:
+        return [(int(uid), rec.get("expires")) for uid, rec in _plus.items()
                 if not rec.get("expires") or rec["expires"] >= now]
 
 
