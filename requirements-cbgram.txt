@@ -1,5 +1,5 @@
-# Optional second Telegram engine (UPLOAD_MODE=cbgram). Do NOT `pip install -r` this into the normal environment
-# (cbgram and wzgram both provide the module name `pyrogram` and would overwrite each other). Install it into its own folder:
-#     pip install --target engines/cbgram -r requirements-cbgram.txt
-# (the Dockerfile does exactly this into /app/engines/cbgram; ENGINE_DIR can point somewhere else)
-cbgram
+# Optional second Telegram engine (UPLOAD_MODE=cbgram). cbgram is NOT on PyPI - it is installed from GitHub.
+# Do NOT `pip install -r` this into the normal environment (cbgram and wzgram both provide `pyrogram`).
+# Install into its own folder:   pip install --target engines/cbgram -r requirements-cbgram.txt
+git+https://github.com/abhiadi23/cbcrypto.git
+git+https://github.com/abhiadi23/cbgram.git@main

@@ -59,7 +59,10 @@ def _install_cbgram(notes):
     try:
         os.makedirs(target, exist_ok=True)
         r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check",
-                            "--target", target, "cbgram"], capture_output=True, text=True, timeout=300)
+                            "--target", target,
+                            "git+https://github.com/abhiadi23/cbcrypto.git",
+                            "git+https://github.com/abhiadi23/cbgram.git@main"],
+                           capture_output=True, text=True, timeout=600)
         if r.returncode == 0 and _cb_dir():
             log.warning("cbgram was not in the image: installed it at start-up into %s", target)
             return target
