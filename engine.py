@@ -51,6 +51,25 @@ def _cb_dir():
     return d if os.path.isdir(os.path.join(d, "pyrogram")) or os.path.isdir(os.path.join(d, "cbgram")) else None
 
 
+def _install_cbgram(notes):
+    """pip install cbgram into ENGINE_DIR/cbgram at start-up (own folder: never touches wzgram). Returns the folder or None;
+    the real pip error is added to `notes`, so /stats and the logs show WHY it failed."""
+    import subprocess
+    target = os.path.join(config.ENGINE_DIR, "cbgram")
+    try:
+        os.makedirs(target, exist_ok=True)
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check",
+                            "--target", target, "cbgram"], capture_output=True, text=True, timeout=300)
+        if r.returncode == 0 and _cb_dir():
+            log.warning("cbgram was not in the image: installed it at start-up into %s", target)
+            return target
+        tail = " ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])[:300]
+        notes.append(f"auto-install of cbgram failed: {tail or 'pip exit ' + str(r.returncode)}")
+    except Exception as exc:  # noqa: BLE001  (no network / read-only disk / timeout)
+        notes.append(f"auto-install of cbgram failed: {type(exc).__name__}: {str(exc)[:150]}")
+    return None
+
+
 def load():
     """Select the engine, import and return the `pyrogram` module. Safe to call more than once."""
     global _module
@@ -69,6 +88,8 @@ def load():
 
     if want == "cbgram":
         d = _cb_dir()
+        if not d and config.UPLOAD_AUTO_INSTALL:
+            d = _install_cbgram(notes)                  # image has no cbgram (build step skipped / failed): install it now
         if d:
             sys.path.insert(0, d)
             added = d

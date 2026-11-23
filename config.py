@@ -214,3 +214,4 @@ _UPLOAD_MODE_RAW = os.getenv("UPLOAD_MODE", "wzgram").strip().lower() or "wzgram
 UPLOAD_MODE = _UPLOAD_MODE_RAW if _UPLOAD_MODE_RAW in ("wzgram", "cbgram") else "wzgram"
 UPLOAD_MODE_INVALID = _UPLOAD_MODE_RAW if _UPLOAD_MODE_RAW not in ("wzgram", "cbgram") else ""
 ENGINE_DIR = os.getenv("ENGINE_DIR", "").strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines")
+UPLOAD_AUTO_INSTALL = env_bool("UPLOAD_AUTO_INSTALL", True)   # UPLOAD_MODE=cbgram but not installed -> pip install it at start-up (own folder)
